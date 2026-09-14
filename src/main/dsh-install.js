@@ -10,7 +10,7 @@ const os = require('node:os');
 const { DSH_PACKAGE } = require('./dsh-detect');
 const { createInstallProgress } = require('./progress');
 const { createLineSplitter, terminate } = require('./process-tree');
-const { IS_WINDOWS } = require('./shell-env');
+const { IS_WINDOWS, shellCommandFor } = require('./shell-env');
 
 /** npm flags that give us a progress signal without drowning the log. */
 const NPM_FLAGS = ['--no-fund', '--no-audit', '--loglevel=http'];
@@ -83,8 +83,9 @@ function installDsh(options) {
   const promise = new Promise((resolve) => {
     let spawned;
     try {
-      // A `.cmd` shim on Windows must go through the shell to be executable.
-      spawned = spawn(npmCommand, args, {
+      // A `.cmd` shim on Windows must go through the shell to be executable,
+      // and the shim path may contain spaces (C:\Program Files\nodejs\npm.cmd).
+      spawned = spawn(shellCommandFor(npmCommand), args, {
         cwd,
         env,
         shell: IS_WINDOWS,

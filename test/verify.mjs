@@ -11,7 +11,7 @@
  */
 
 import { createRequire } from 'node:module';
-import { chmodSync } from 'node:fs';
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -43,6 +43,20 @@ function check(name, condition, detail = '') {
 
 function section(title) {
   console.log(`\n${title}`);
+}
+
+/** Load `dsh-detect` under a faked win32 platform and resolve `name` on PATH. */
+function findExecutableOnPath(winShellEnv, name, pathValue) {
+  const originalPlatform = process.platform;
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  try {
+    const file = require.resolve('../src/main/dsh-detect.js');
+    delete require.cache[file];
+    const winDetect = require('../src/main/dsh-detect.js');
+    return winDetect.findExecutable(name, { PATH: pathValue });
+  } finally {
+    Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+  }
 }
 
 /** Wait for one emitted event, or fail after `timeoutMs`. */
@@ -317,6 +331,71 @@ section('8. 端到端流程：未安装 → 安装 → 启动 → 运行 (fixtur
   check('retry 在已安装时重新启动 dsh', afterRetry.phase === 'running' && installCalls.length === installsBefore, afterRetry.phase);
 
   await flow.dispose();
+}
+
+section('9. Windows 代码路径（模拟 process.platform = win32）');
+{
+  // The Windows branches cannot be executed here, but the pure decisions can:
+  // re-require the module with a faked platform to get its win32 view.
+  const originalPlatform = process.platform;
+  const reload = () => {
+    const file = require.resolve('../src/main/shell-env.js');
+    delete require.cache[file];
+    return require('../src/main/shell-env.js');
+  };
+
+  const posixEnv = reload();
+  check('posix 下 .cmd 不需要 shell', posixEnv.needsShell('/usr/local/bin/npm') === false);
+  check('posix 下不改写命令', posixEnv.shellCommandFor('/usr/local/bin/npm') === '/usr/local/bin/npm');
+
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  let winEnv;
+  try {
+    winEnv = reload();
+  } finally {
+    Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+  }
+
+  check('Windows 下识别 .cmd 需要 shell', winEnv.needsShell('C:\\nodejs\\npm.cmd') === true);
+  check('Windows 下识别 .bat 需要 shell', winEnv.needsShell('C:\\tools\\dsh.bat') === true);
+  check('Windows 下 .exe 不需要 shell', winEnv.needsShell('C:\\nodejs\\node.exe') === false);
+  check(
+    'Windows 下带空格的路径会加引号',
+    winEnv.shellCommandFor('C:\\Program Files\\nodejs\\npm.cmd') === '"C:\\Program Files\\nodejs\\npm.cmd"',
+    winEnv.shellCommandFor('C:\\Program Files\\nodejs\\npm.cmd'),
+  );
+  check(
+    'Windows 下无空格路径保持原样',
+    winEnv.shellCommandFor('C:\\nodejs\\npm.cmd') === 'C:\\nodejs\\npm.cmd',
+  );
+  check('Windows 下 PATH 分隔符为分号', winEnv.PATH_SEPARATOR === ';');
+  check(
+    'Windows 下会搜索 npm 全局目录与 nodejs 安装目录',
+    winEnv.guessDirs('C:\\Users\\me').some((dir) => dir.includes('Roaming') && dir.endsWith('npm')),
+    winEnv.guessDirs('C:\\Users\\me').join(' | '),
+  );
+
+  // PATH scanning with the win32 separator and PATHEXT resolution.
+  const binDir = path.join(here, '.tmp-win-bin');
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(path.join(binDir, 'dsh.cmd'), '@echo off\r\n');
+  const previousPathext = process.env.PATHEXT;
+  process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
+  try {
+    const found = winEnv === undefined ? null : require('../src/main/dsh-detect.js');
+    const fromWinPath = findExecutableOnPath(found, 'dsh', `${binDir};/usr/bin`);
+    // PATHEXT is tried in cmd.exe order (.COM;.EXE;.BAT;.CMD) and Windows paths
+    // are case-insensitive, so compare case-insensitively.
+    check(
+      'Windows 下能按 PATHEXT 解析 dsh.cmd',
+      String(fromWinPath).toLowerCase() === path.join(binDir, 'dsh.cmd').toLowerCase(),
+      String(fromWinPath),
+    );
+  } finally {
+    if (previousPathext === undefined) delete process.env.PATHEXT;
+    else process.env.PATHEXT = previousPathext;
+    rmSync(binDir, { recursive: true, force: true });
+  }
 }
 
 // --------------------------------------------------------------------- summary

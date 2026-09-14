@@ -29,14 +29,18 @@ const PATH_SEPARATOR = IS_WINDOWS ? ';' : ':';
  */
 function runCapture(command, args, options = {}) {
   const { env = process.env, cwd, timeoutMs = 10_000 } = options;
+  // Since Node 18.20/20.12 a `.cmd`/`.bat` shim cannot be spawned without a
+  // shell on Windows, so npm/dsh probes must go through cmd.exe there.
+  const shell = needsShell(command);
   return new Promise((resolve) => {
     try {
       execFile(
-        command,
+        shell ? shellCommandFor(command) : command,
         args,
         {
           env,
           cwd,
+          shell,
           timeout: timeoutMs,
           killSignal: 'SIGKILL',
           maxBuffer: 8 * 1024 * 1024,
@@ -83,6 +87,23 @@ function dedupe(entries) {
     result.push(entry);
   }
   return result;
+}
+
+/** True for the Windows shim types that cannot be spawned without a shell. */
+function needsShell(command) {
+  return IS_WINDOWS && /\.(cmd|bat)$/i.test(String(command));
+}
+
+/**
+ * Quote a command for `shell: true` on Windows.
+ *
+ * Node joins `file` and `args` with spaces before handing the line to
+ * `cmd.exe /d /s /c`, so an unquoted `C:\\Program Files\\nodejs\\npm.cmd`
+ * would be split at the space.
+ */
+function shellCommandFor(command) {
+  if (!IS_WINDOWS) return command;
+  return /\s/.test(String(command)) ? `"${command}"` : command;
 }
 
 /** Existing directories only: keeps the spawned child's PATH clean. */
@@ -245,8 +266,10 @@ module.exports = {
   dedupe,
   existingDirs,
   guessDirs,
+  needsShell,
   npmGlobalBinDir,
   resolveShellEnv,
   runCapture,
+  shellCommandFor,
   splitPath,
 };

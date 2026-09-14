@@ -11,6 +11,7 @@ files:
   - src/**/*
   - assets/icon.png
   - assets/icon.icns
+  - assets/icon.ico
   - package.json
 
 asar: true
@@ -28,9 +29,14 @@ mac:
     - zip
 
 win:
-  icon: assets/icon.png
+  # A pre-built .ico avoids electron-builder downloading its icons tool
+  # bundle from GitHub Releases (see scripts/make-ico.mjs).
+  icon: assets/icon.ico
   target:
     - target: nsis
+      arch:
+        - x64
+    - target: zip
       arch:
         - x64
 

@@ -19,7 +19,7 @@ const net = require('node:net');
 const os = require('node:os');
 
 const { createLineSplitter, terminate } = require('./process-tree');
-const { IS_WINDOWS } = require('./shell-env');
+const { IS_WINDOWS, shellCommandFor } = require('./shell-env');
 
 /** The canonical readiness line printed by `dsh web`. */
 const READY_URL_PATTERN = /dsh web:\s*(https?:\/\/[^\s)]+)/;
@@ -119,7 +119,8 @@ class DshServer extends EventEmitter {
 
     let child;
     try {
-      child = spawn(this.dshCommand, args, {
+      // `.cmd` shims need a shell on Windows, and their path may contain spaces.
+      child = spawn(shellCommandFor(this.dshCommand), args, {
         cwd: this.cwd,
         env: this.env,
         shell: IS_WINDOWS,
