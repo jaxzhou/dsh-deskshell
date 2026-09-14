@@ -1,0 +1,49 @@
+appId: com.deepseek.dsh.desktop
+productName: DSH-D
+copyright: Copyright © 2025 DSH-D
+
+directories:
+  output: release
+  buildResources: assets
+
+# Only the app sources and the manifest are packaged; devDependencies are not.
+files:
+  - src/**/*
+  - assets/icon.png
+  - assets/icon.icns
+  - package.json
+
+asar: true
+
+mac:
+  category: public.app-category.developer-tools
+  # A pre-built .icns avoids electron-builder downloading its icons tool
+  # bundle from GitHub Releases (see scripts/make-icns.sh).
+  icon: assets/icon.icns
+  # No Apple Developer certificate available: build an unsigned local app.
+  identity: null
+  # Current architecture by default; add `--arm64` / `--x64` to build both.
+  target:
+    - dmg
+    - zip
+
+win:
+  icon: assets/icon.png
+  target:
+    - target: nsis
+      arch:
+        - x64
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: DSH-D
+
+linux:
+  icon: assets/icon.png
+  category: Development
+  target:
+    - AppImage
+    - deb

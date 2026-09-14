@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#132a4d"/>
+      <stop offset="0.55" stop-color="#0b1220"/>
+      <stop offset="1" stop-color="#080d16"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8ad7ff"/>
+      <stop offset="0.5" stop-color="#4d8dfd"/>
+      <stop offset="1" stop-color="#7c5cff"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.20"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1024" height="1024" rx="224" fill="url(#bg)"/>
+  <rect x="24" y="24" width="976" height="976" rx="204" fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="8"/>
+  <rect x="24" y="24" width="976" height="500" rx="204" fill="url(#glow)"/>
+
+  <g fill="none" stroke="url(#ink)" stroke-linecap="round" stroke-linejoin="round" stroke-width="76">
+    <polyline points="352,360 512,512 352,664"/>
+    <line x1="576" y1="664" x2="736" y2="664"/>
+  </g>
+
+  <circle cx="812" cy="212" r="34" fill="#4d8dfd"/>
+  <circle cx="212" cy="812" r="22" fill="#7c5cff"/>
+</svg>

@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Local-only UI: no remote code, no inline eval. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self';"
+    />
+    <title>DSH-D</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <!-- Shell toolbar: always on screen, the dsh GUI view is placed below it. -->
+      <header class="toolbar" id="toolbar">
+        <div class="brand">
+          <span class="brand-glyph" aria-hidden="true">&rsaquo;_</span>
+          <span class="brand-name">DSH-D</span>
+          <span class="brand-sub">DeepSeek Harness</span>
+        </div>
+
+        <div class="status" id="status">
+          <span class="status-dot" id="statusDot"></span>
+          <span class="status-text" id="statusText">正在检测…</span>
+          <span class="status-sep" id="statusSep" hidden>·</span>
+          <span class="status-meta" id="statusMeta"></span>
+        </div>
+
+        <div class="toolbar-actions" id="toolbarActions"></div>
+
+        <!-- 调试 / 维护类操作收进菜单，避免工具栏堆满按钮 -->
+        <div class="menu">
+          <button
+            class="icon-btn menu-btn"
+            id="menuBtn"
+            title="菜单"
+            aria-label="菜单"
+            aria-haspopup="true"
+            aria-expanded="false"
+          >
+            ⋮
+          </button>
+          <div class="menu-list" id="menuList" role="menu" hidden></div>
+        </div>
+
+        <button class="icon-btn" id="quitBtn" title="退出应用" aria-label="退出应用">✕</button>
+      </header>
+
+      <main class="stage" id="stage">
+        <!-- 1. 检测中 -->
+        <section class="panel" data-phase="checking">
+          <div class="card card-center">
+            <div class="spinner" aria-hidden="true"></div>
+            <h1>正在检测 DeepSeek Harness…</h1>
+            <p class="muted">检查 node、npm 与 dsh 命令是否可用</p>
+            <div class="kv" id="checkingKv"></div>
+          </div>
+        </section>
+
+        <!-- 2. 缺少 Node.js / npm -->
+        <section class="panel" data-phase="no-node">
+          <div class="card">
+            <span class="badge badge-warn">缺少运行环境</span>
+            <h1>未检测到 Node.js / npm</h1>
+            <p class="muted">
+              dsh 通过 npm 全局安装，因此需要先安装 Node.js（自带 npm）。安装完成后回到本窗口，点击“重新检测”即可继续。
+            </p>
+            <div class="kv" id="noNodeKv"></div>
+            <div class="actions">
+              <button class="btn btn-primary" data-action="open-nodejs">打开 Node.js 下载页</button>
+              <button class="btn" data-action="detect">重新检测</button>
+            </div>
+            <details class="details">
+              <summary>手动安装方式</summary>
+              <p class="muted">
+                使用官方安装包（<code>nodejs.org</code>），或用 nvm：<br />
+                <code>curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash &amp;&amp; nvm install --lts</code>
+              </p>
+            </details>
+          </div>
+        </section>
+
+        <!-- 3. 缺少 dsh：安装提示 -->
+        <section class="panel" data-phase="missing-dsh">
+          <div class="card">
+            <span class="badge badge-warn">未安装</span>
+            <h1>未检测到 DeepSeek Harness（dsh）</h1>
+            <p class="muted">
+              点击下方按钮即可在本机全局安装 dsh，安装过程会实时显示进度；安装完成后应用会自动启动 dsh 并加载它的界面。
+            </p>
+
+            <div class="cmd">
+              <code id="installCmd">npm install -g @deepseek-ai/dsh</code>
+              <button class="btn btn-ghost" data-action="copy-cmd">复制</button>
+            </div>
+
+            <div class="kv" id="missingKv"></div>
+
+            <div class="actions">
+              <button class="btn btn-primary btn-lg" data-action="install">安装 dsh</button>
+              <button class="btn" data-action="detect">重新检测</button>
+            </div>
+
+            <details class="details">
+              <summary>安装需要什么？</summary>
+              <ul class="muted">
+                <li>需要联网访问 npm registry（默认 registry.npmjs.org）。</li>
+                <li>全局安装目录：<span id="globalRoot">检测中…</span></li>
+                <li>若提示权限不足（EACCES），建议改用 nvm 安装的 Node，或在终端执行 <code>sudo npm install -g @deepseek-ai/dsh</code>。</li>
+              </ul>
+            </details>
+          </div>
+        </section>
+
+        <!-- 4. 安装中 -->
+        <section class="panel" data-phase="installing">
+          <div class="card">
+            <span class="badge badge-busy">安装中</span>
+            <h1>正在安装 DeepSeek Harness</h1>
+            <div class="progress">
+              <div class="progress-head">
+                <span class="progress-phase" id="installPhase">准备安装</span>
+                <span class="progress-percent" id="installPercent">0%</span>
+              </div>
+              <div class="bar"><div class="bar-fill" id="installBar" style="width: 0%"></div></div>
+              <div class="progress-foot">
+                <span id="installDetail">正在启动 npm…</span>
+                <span id="installElapsed"></span>
+              </div>
+            </div>
+            <p class="muted small">
+              dsh 依赖较多，首次安装通常需要几十秒到几分钟。请保持网络连接，不要关闭本窗口。
+            </p>
+            <div class="actions">
+              <button class="btn" data-action="cancel-install">取消安装</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- 5. 启动中 -->
+        <section class="panel" data-phase="starting">
+          <div class="card card-center">
+            <div class="spinner" aria-hidden="true"></div>
+            <h1>正在启动 dsh…</h1>
+            <p class="muted" id="startingText">等待 dsh 打印 Web 服务地址</p>
+            <p class="muted small">首次启动需要初始化 profile，可能需要几十秒。</p>
+            <div class="actions">
+              <button class="btn" data-action="stop">停止</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- 6. 运行中（界面由内嵌视图覆盖，此处仅作为占位与兜底入口） -->
+        <section class="panel" data-phase="running">
+          <div class="card card-center">
+            <span class="badge badge-ok">运行中</span>
+            <h1>DSH 已在本窗口加载</h1>
+            <p class="muted">界面没有显示时，可用右上角「⋮」菜单重新加载，或改用浏览器打开。</p>
+          </div>
+        </section>
+
+        <!-- 7. 错误 -->
+        <section class="panel" data-phase="error">
+          <div class="card">
+            <span class="badge badge-error">出错了</span>
+            <h1 id="errorTitle">操作失败</h1>
+            <p class="error-message" id="errorMessage"></p>
+            <p class="muted" id="errorHint"></p>
+            <div class="actions">
+              <button class="btn btn-primary" data-action="retry">重试</button>
+              <button class="btn" data-action="detect">重新检测</button>
+              <button class="btn" data-action="install">重新安装 dsh</button>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <!-- 日志面板：安装 / 启动 / 排错时最有用 -->
+      <section class="logpanel" id="logPanel">
+        <header class="logpanel-head">
+          <button class="log-toggle" id="logToggle" aria-expanded="true">
+            <span class="chev">▾</span>
+            <span>运行日志</span>
+            <span class="log-count" id="logCount">0</span>
+          </button>
+          <div class="logpanel-tools">
+            <button class="btn btn-ghost" data-action="copy-log">复制日志</button>
+            <button class="btn btn-ghost" data-action="clear-log">清空</button>
+          </div>
+        </header>
+        <div class="log-body" id="logBody" role="log" aria-live="polite"></div>
+      </section>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

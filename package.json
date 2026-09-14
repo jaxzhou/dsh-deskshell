@@ -1,0 +1,37 @@
+{
+  "name": "dsh-d",
+  "productName": "DSH-D",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron desktop shell: detects, installs and runs DeepSeek Harness (dsh), then loads the running dsh Web GUI.",
+  "main": "src/main/main.js",
+  "type": "commonjs",
+  "license": "MIT",
+  "author": "DSH-D",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "verify": "node test/verify.mjs",
+    "test": "node test/verify.mjs",
+    "self-test": "electron . --self-test",
+    "capture-ui": "electron . --capture-ui ui-preview",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win",
+    "dist:linux": "electron-builder --linux"
+  },
+  "keywords": [
+    "electron",
+    "desktop",
+    "deepseek-harness",
+    "dsh"
+  ],
+  "devDependencies": {
+    "electron": "^43.7.0",
+    "electron-builder": "^26.15.3"
+  }
+}
