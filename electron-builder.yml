@@ -48,8 +48,24 @@ nsis:
   shortcutName: DSH-D
 
 linux:
-  icon: assets/icon.png
+  # A pre-built PNG size set avoids electron-builder downloading its icons
+  # tool bundle from GitHub Releases (see scripts/make-icons.mjs).
+  icon: assets/icons
   category: Development
+  # Lower-case command name, as Linux conventions expect.
+  executableName: dsh-d
+  # Keep the generated .desktop file name in sync with desktopName, so desktop
+  # environments associate the running window with this entry.
+  syncDesktopName: true
+  desktop:
+    entry:
+      Name: DSH-D
+      Comment: DeepSeek Harness 桌面外壳
   target:
     - AppImage
     - deb
+    - tar.gz
+
+deb:
+  # Debian packages require a maintainer with an email address.
+  maintainer: JaxZhou <jaxzhou@hotmail.com>

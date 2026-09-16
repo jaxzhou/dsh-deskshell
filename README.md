@@ -25,7 +25,7 @@ npm start            # 开发运行
 npm run dist         # 当前平台，输出到 release/
 npm run dist:mac     # macOS: dmg + zip（未签名，本机可直接运行）
 npm run dist:win     # Windows: NSIS 安装包 + 免安装 zip（在 macOS/Linux 上同样可用）
-npm run dist:linux   # Linux: AppImage + deb
+npm run dist:linux   # Linux: AppImage + deb + tar.gz（在 macOS 上交叉构建同样可用）
 npm run pack         # 只产出当前平台的应用目录（最快，双击即可运行）
 ```
 
@@ -47,14 +47,18 @@ npx electron-builder --win
 | `release/DSH-D Setup 0.1.0.exe` | Windows 安装包（NSIS，可选安装目录、创建桌面快捷方式） |
 | `release/DSH-D-0.1.0-win.zip` | Windows 免安装压缩版（解压后运行 `DSH-D.exe`） |
 | `release/win-unpacked/` | Windows 免安装目录（打包中间产物，可直接运行） |
-| `release/*.AppImage` / `*.deb` | Linux 对应产物 |
+| `release/DSH-D-0.1.0.AppImage` | Linux 免安装单文件（chmod +x 后直接运行） |
+| `release/dsh-d_0.1.0_amd64.deb` | Debian/Ubuntu 安装包（自动创建 `/usr/bin/dsh-d` 与桌面项） |
+| `release/dsh-d-0.1.0.tar.gz` | Linux 免安装压缩版 |
 
 > **DMG 需要联网下载工具**：electron-builder 的 `dmg` 目标会从 GitHub Releases 下载 `dmgbuild` 工具包，无法访问 GitHub 时会失败（`.app` 与 `.zip` 已在失败前生成，可直接使用）。离线替代方案：
 > ```bash
 > npm run pack && ./scripts/make-dmg.sh
 > ```
 >
-> 应用图标已预先构建为 `assets/icon.icns`（macOS）与 `assets/icon.ico`（Windows），打包因此不再需要从 GitHub 下载 electron-builder 的图标工具；修改 `assets/icon.png` 后重新生成即可：`./scripts/make-icns.sh` 与 `node scripts/make-ico.mjs`。
+> 应用图标已预先构建好三平台所需格式——`assets/icon.icns`（macOS）、`assets/icon.ico`（Windows）、`assets/icons/*.png`（Linux 尺寸集），打包因此不再需要从 GitHub 下载 electron-builder 的图标工具；修改 `assets/icon.png` 后重新生成即可：`node scripts/make-icons.mjs`。
+>
+> **Linux 的 deb 与 macOS 的 GNU tar**：electron-builder 用 fpm 打包 deb，而 fpm 会用 GNU tar 的 `--owner=0 --group=0` 归档，macOS 自带的 bsdtar 不支持这两个选项（`Option --owner=0 is not supported`），deb 会直接失败。`npm run dist:linux` 在 macOS 上检测不到 GNU tar 时会自动把 `scripts/gtar-shim` 放到 PATH 最前——这是一个把 GNU 选项翻译成 bsdtar 等价的薄垫片（仅用于打包，不进入产物）。装了 `brew install gnu-tar` 后就不再需要它。
 >
 > **Apple Silicon**：默认构建当前架构；交叉构建用 `npx electron-builder --mac --arm64`。`identity: null` 表示不签名，Intel 机器可直接运行；在 M 系列机器上分发时建议至少做临时签名 `codesign --force --deep --sign - "release/mac/DSH-D.app"`，或配置 Apple Developer 证书并公证。
 >

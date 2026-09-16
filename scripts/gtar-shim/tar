@@ -1,0 +1,8 @@
+#!/bin/sh
+#
+# fpm probes tar implementations in the order `tar`, `gtar`, `gnutar` and stops
+# at the first one that accepts GNU options — so the shim must also shadow the
+# plain `tar` name, otherwise a broken/stale `gtar` earlier on PATH can win the
+# probe. See the sibling `gtar` script for the full explanation.
+#
+exec "$(dirname "$0")/gtar" "$@"

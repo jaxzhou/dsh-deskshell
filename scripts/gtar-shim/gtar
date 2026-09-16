@@ -1,0 +1,81 @@
+#!/bin/sh
+#
+# A minimal `gtar` (GNU tar) compatibility shim for macOS.
+#
+# Why this exists
+# ---------------
+# electron-builder builds the Linux `deb` target with fpm, and fpm archives with
+# GNU tar options:
+#
+#     gtar -C <dir> -J -cf out.tar.xz --owner=0 --group=0 --numeric-owner .
+#     gtar -C <dir> -J --numeric-owner --owner 0 --group 0 -cf out.tar.xz .
+#
+# (both spellings appear: the control tarball uses `=`, the data tarball uses
+# the separated form). macOS ships bsdtar, which rejects GNU's `--owner` /
+# `--group` ("Option --owner=0 is not supported") and therefore fails the whole
+# deb build. fpm only prefers `gtar` when it exists, so putting this shim named
+# `gtar` on PATH lets fpm use it — the shim translates the GNU-only options to
+# bsdtar equivalents and forwards everything else:
+#
+#     --owner[=]N  ->  --uid N
+#     --group[=]N  ->  --gid N
+#     --sort=name, --mtime=@0  ->  dropped (no bsdtar equivalent; cosmetic only)
+#
+# It is used for packaging only and never shipped inside the app. Install GNU
+# tar (e.g. `brew install gnu-tar`) and this shim becomes unnecessary.
+#
+set -u
+
+REAL_TAR=/usr/bin/tar
+
+# Single-quote an argument so the rebuilt command line survives `eval`.
+quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# Optional tracing: set DSH_D_GTAR_SHIM_LOG to a file to record invocations.
+if [ -n "${DSH_D_GTAR_SHIM_LOG:-}" ]; then
+  printf 'invoked: %s\n' "$*" >>"$DSH_D_GTAR_SHIM_LOG" 2>/dev/null || true
+fi
+
+rebuilt=''
+while [ "$#" -gt 0 ]; do
+  arg=$1
+  case "$arg" in
+    --version)
+      # fpm probes `gtar --version` before deciding to use it.
+      echo 'tar (GNU tar) 1.35 (bsdtar shim)'
+      exit 0
+      ;;
+    --sort=* | --mtime=*)
+      # Reproducibility niceties bsdtar cannot express; safe to ignore.
+      shift
+      ;;
+    --owner=*)
+      rebuilt="$rebuilt --uid $(quote "${arg#--owner=}")"
+      shift
+      ;;
+    --group=*)
+      rebuilt="$rebuilt --gid $(quote "${arg#--group=}")"
+      shift
+      ;;
+    --owner | --group)
+      # Separated spelling: the value is the next argument.
+      option=$arg
+      shift
+      value=${1:-0}
+      [ "$#" -gt 0 ] && shift
+      if [ "$option" = "--owner" ]; then
+        rebuilt="$rebuilt --uid $(quote "$value")"
+      else
+        rebuilt="$rebuilt --gid $(quote "$value")"
+      fi
+      ;;
+    *)
+      rebuilt="$rebuilt $(quote "$arg")"
+      shift
+      ;;
+  esac
+done
+
+eval "exec \"$REAL_TAR\" $rebuilt"
