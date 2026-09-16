@@ -4,6 +4,7 @@
 
 启动应用后：
 
+0. **自动配置运行环境**：如果本机没有 Node.js、没有 npm，或 Node 低于 dsh 需要的 v22（dsh 依赖用到 `Promise.withResolvers`），应用会**自动下载官方 Node.js LTS 发行版**并解压到自己的数据目录，随后 dsh 也安装在同一个目录内——**无需管理员权限，也不改动系统已有环境**；下载与解压过程都有进度、可取消。
 1. **检测**：自动解析登录 shell 环境（nvm / Homebrew / volta 装的 `node`、`npm`、`dsh` 在 GUI 应用里默认不可见，本项目会主动找回），并检测 `node`、`npm`、`dsh` 是否可用。
 2. **安装提示**：若未检测到 `dsh`，界面展示安装卡片与将要执行的命令，点击「安装 dsh」即执行 `npm install -g @deepseek-ai/dsh`，并**实时显示进度**（阶段 + 百分比 + 已获取包数 + 耗时 + 完整日志，可取消）。
 3. **启动**：安装完成后自动重新检测，并启动 `dsh web --no-open`。
@@ -75,17 +76,21 @@ npx electron-builder --win
 | --- | --- |
 | ![检测中](ui-preview/01-checking.png) | ![安装提示](ui-preview/02-missing-dsh.png) |
 
-| 安装中（进度 + 实时日志） | 运行时出错 |
+| 自动配置 Node.js 运行时 | 安装 dsh（进度 + 实时日志） |
 | --- | --- |
-| ![安装进度](ui-preview/03-installing.png) | ![错误](ui-preview/05-error.png) |
+| ![运行时配置](ui-preview/03-installing-node.png) | ![安装进度](ui-preview/04-installing.png) |
+
+| 运行中出错 |
+| --- |
+| ![错误](ui-preview/06-error.png) |
 
 运行中：顶部工具栏显示 `DSH 已启动 · 机器名 · dsh 版本`，右侧「⋮」菜单包含「返回 DSH 界面 / 查看日志、重新加载界面、在浏览器中打开、重启 dsh、停止 dsh、重新检测、复制日志」，工具栏下方即内嵌的运行中 dsh 界面（选「查看日志」会临时隐藏界面，方便查看日志）。
 
-![运行中](ui-preview/04-running.png)
+![运行中](ui-preview/05-running.png)
 
 「⋮」菜单（运行中）：查看日志 / 重新加载界面 / 在浏览器中打开 / 重启 dsh / 停止 dsh / 重新检测 / 复制日志。
 
-![菜单](ui-preview/06-menu.png)
+![菜单](ui-preview/07-menu.png)
 
 > 预览图由 `npm run capture-ui` 生成（`--capture-ui`，用合成状态渲染各阶段后截图，不会启动 dsh）。
 
@@ -96,7 +101,8 @@ npx electron-builder --win
 | `npm start` | 启动桌面应用 |
 | `npm run dev` | 启动并打开开发者工具 |
 | `npm test` / `npm run verify` | 纯 Node 逻辑验证（检测、进度模型、安装流程、服务生命周期、状态机端到端） |
-| `npm run self-test` | Electron 运行时冒烟测试：窗口、preload 桥、界面、内嵌视图、IPC；**不会启动 dsh** |
+| `npm run self-test` | Electron 运行时冒烟测试：窗口、preload 桥、界面、内嵌视图、工具栏、IPC；**不会启动 dsh** |
+| `npm run test:network` | 实网验证运行时自动配置：真实下载 Node.js LTS、确认 npm 全局目录落在托管目录内、真实安装一次 dsh |
 | `npm run capture-ui` | 把各阶段界面渲染成 `ui-preview/*.png`（含打开的 ⋮ 菜单） |
 | `npm run pack` / `npm run dist` | 打包桌面应用 |
 
@@ -124,6 +130,8 @@ test/              验证脚本与 fixture（伪 npm、伪 dsh）
 - **为什么要等一行日志**：`dsh web` 打印的地址带有本次进程的 token（`?token=…`，用于换取浏览器 cookie）。只有等待 `dsh web: <url>` 这一行，才能把可用的界面地址交给内嵌视图；因此用 `--port 0` 让系统分配空闲端口，避免端口占用类失败。
 - **进程生命周期**：安装与 dsh 服务都是子进程，退出应用时先 `SIGTERM`、超时后 `SIGKILL`（Windows 用 `taskkill /T`），避免残留进程占住端口；`dispose()` 是异步的，所以首个 `before-quit` 会被延后到清理完成。
 - **重启竞态**：旧实例的退出事件不会覆盖新实例的状态（控制器只接受"当前实例"的事件）。
+- **运行环境自举**：dsh 的依赖用到 `Promise.withResolvers`（Node 22+），所以"没有 Node"也包括"Node 太旧"。缺失时下载官方发行版到 `<userData>/runtime/node-<版本>-<平台>-<架构>`，校验 `node --version` 可用后才交给后续流程；已下载的安装包与已解压的运行时都会复用，重试不会重复下载。
+- **为什么必须锁定 npm 的 prefix**：npm 的全局目录来自启动环境——父级 `npm run` 会导出 `npm_config_global_prefix`，用户 `~/.npmrc` 也可能写了 `prefix`，两者都会让 `npm install -g` 落到需要管理员权限的系统目录。因此托管运行时会把 `npm_config_prefix` 与 `npm_config_cache` 钉在托管目录内（registry/代理等其余配置保持不变），这也是实网验证里专门校验的一项。
 - **Windows 上的 `.cmd`**：npm 与 dsh 在 Windows 上都是 `.cmd` 垫片，而 Node 18.20+/20.12+ 起不允许无 shell 直接 spawn `.cmd`/`.bat`，因此探测与启动都显式走 `cmd.exe`，并对 `C:\Program Files\...` 这类含空格的路径加引号（`shellCommandFor`）。
 - **安全边界**：渲染进程 `sandbox` + `contextIsolation`，无 Node 集成，仅暴露白名单 IPC；dsh 界面同样是沙箱化视图，外链一律交给系统浏览器；界面有 CSP。
 
@@ -132,11 +140,15 @@ test/              验证脚本与 fixture（伪 npm、伪 dsh）
 | 变量 | 说明 |
 | --- | --- |
 | `DSH_D_PORT` | 固定 dsh web 端口（默认 `0`，由系统分配空闲端口） |
-| `DSH_D_USER_DATA` | 覆盖 Electron 用户数据目录（便携 / 测试用） |
+| `DSH_D_USER_DATA` | 覆盖 Electron 用户数据目录（便携 / 测试用），托管运行时位于其下的 `runtime/` |
+| `DSH_D_NODE_MIRROR` | Node.js 发行版镜像（如 `https://registry.npmmirror.com/-/binary/node`），自动配置运行时时优先使用 |
+| `DSH_D_NODE_VERSION` | 固定要安装的 Node.js 版本（如 `v24.21.0`），默认取官方最新 LTS |
 
 ## 已验证内容
 
-`npm test`（68 项）覆盖：登录环境解析、检测、进度模型、`dsh web: <url>` 解析、安装成功/失败与提示、服务启停生命周期、状态机端到端（未安装 → 安装 → 启动 → 运行 → 重启 → 停止，使用 fixture 注入，不触碰真实 npm/dsh），以及**模拟 `win32` 的 Windows 代码路径**（`.cmd` 是否走 shell、含空格路径的引号处理、PATH 分号分隔、PATHEXT 解析、Windows 全局目录推断）。
+`npm test`（107 项）覆盖：登录环境解析、检测、进度模型、`dsh web: <url>` 解析、安装成功/失败与提示、服务启停生命周期、状态机端到端（未安装 → 安装 → 启动 → 运行 → 重启 → 停止，使用 fixture 注入，不触碰真实 npm/dsh），**模拟 `win32` 的 Windows 代码路径**（`.cmd` 是否走 shell、含空格路径的引号处理、PATH 分号分隔、PATHEXT 解析、Windows 全局目录推断），以及**运行时自动配置**（发行版地址解析、LTS 选择、下载进度、真实 tar 解压、复用与取消、托管环境 prefix/cache 锁定、控制器"缺 Node → 自动配置 → 进入安装 dsh"流程与失败兜底）。
+
+`npm run test:network`（12 项）在真实网络上验证：下载 Node.js LTS（约 52 MB）→ 解压校验 → `npm prefix -g` 落在托管目录 → 真实执行 `npm install -g @deepseek-ai/dsh` 并运行托管目录内的 dsh。
 
 `npm run self-test`（18 项）在真实 Electron 中验证：窗口与界面渲染、preload 桥、IPC 往返、剪贴板 API、主进程检测、`WebContentsView` 创建/尺寸/隐藏，以及工具栏（菜单可展开、不遮挡退出按钮、运行阶段无内联调试按钮、状态区显示机器名与 dsh 版本且不含端口）。
 

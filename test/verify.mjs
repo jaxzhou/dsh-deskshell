@@ -11,7 +11,9 @@
  */
 
 import { createRequire } from 'node:module';
-import { chmodSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -25,6 +27,7 @@ const { createInstallProgress } = require('../src/main/progress.js');
 const { installDsh } = require('../src/main/dsh-install.js');
 const { DshServer, extractReadyUrl } = require('../src/main/dsh-server.js');
 const { ShellController } = require('../src/main/controller.js');
+const nodeRuntime = require('../src/main/node-runtime.js');
 
 let passed = 0;
 let failed = 0;
@@ -396,6 +399,269 @@ section('9. Windows 代码路径（模拟 process.platform = win32）');
     else process.env.PATHEXT = previousPathext;
     rmSync(binDir, { recursive: true, force: true });
   }
+}
+
+section('10. Node.js 运行时自动配置 (node-runtime)');
+{
+  // --- dist resolution ----------------------------------------------------
+  const darwin = nodeRuntime.describeDist('v24.21.0', { platform: 'darwin', arch: 'arm64' });
+  check(
+    'macOS 发行版文件名与地址正确',
+    darwin.fileName === 'node-v24.21.0-darwin-arm64.tar.gz' &&
+      darwin.url === 'https://nodejs.org/dist/v24.21.0/node-v24.21.0-darwin-arm64.tar.gz' &&
+      darwin.kind === 'tar.gz',
+    darwin.url,
+  );
+  const win = nodeRuntime.describeDist('v24.21.0', { platform: 'win32', arch: 'x64' });
+  check(
+    'Windows 发行版为 zip 且地址正确',
+    win.fileName === 'node-v24.21.0-win-x64.zip' && win.kind === 'zip' && win.url.endsWith('/v24.21.0/node-v24.21.0-win-x64.zip'),
+    win.url,
+  );
+  const mirrored = nodeRuntime.describeDist('v24.21.0', {
+    platform: 'linux',
+    arch: 'x64',
+    base: 'https://registry.npmmirror.com/-/binary/node/',
+  });
+  check(
+    '镜像地址可用于同一版本',
+    mirrored.url === 'https://registry.npmmirror.com/-/binary/node/v24.21.0/node-v24.21.0-linux-x64.tar.gz',
+    mirrored.url,
+  );
+  check(
+    'DSH_D_NODE_MIRROR 会优先作为下载源',
+    nodeRuntime.nodeDistSources({ DSH_D_NODE_MIRROR: 'https://mirror.example.com/node/' })[0].base === 'https://mirror.example.com/node',
+    JSON.stringify(nodeRuntime.nodeDistSources({ DSH_D_NODE_MIRROR: 'https://mirror.example.com/node/' })[0]),
+  );
+  check(
+    '未设置镜像时使用默认源列表',
+    nodeRuntime.nodeDistSources({})[0].name === 'nodejs.org' && nodeRuntime.nodeDistSources({}).length >= 2,
+  );
+  check('版本号可归一化', nodeRuntime.normalizeVersion('24.21.0') === 'v24.21.0' && nodeRuntime.normalizeVersion('v24.21.0/') === 'v24.21.0');
+  check('可解析主版本号', nodeRuntime.nodeMajor('v24.21.0') === 24 && nodeRuntime.nodeMajor('garbage') === null);
+
+  // --- version index ------------------------------------------------------
+  const indexPayload = JSON.stringify([
+    { version: 'v26.8.2', lts: false },
+    { version: 'v25.1.0', lts: false },
+    { version: 'v24.21.0', lts: 'Krypton' },
+    { version: 'v22.20.0', lts: 'Jod' },
+  ]);
+  check('从索引中选出最新 LTS', nodeRuntime.parseLatestLts(indexPayload) === 'v24.21.0', nodeRuntime.parseLatestLts(indexPayload));
+  check(
+    '索引无 LTS 时回退到最新版',
+    nodeRuntime.parseLatestLts(JSON.stringify([{ version: 'v26.8.2', lts: false }])) === 'v26.8.2',
+  );
+
+  // --- sdk requirements ---------------------------------------------------
+  check('dsh 要求 Node 22+', nodeRuntime.MIN_NODE_MAJOR === 22, String(nodeRuntime.MIN_NODE_MAJOR));
+  const gapCases = [
+    ['缺少 node 视为缺口', { node: { available: false, version: null }, npm: { available: true } }, true],
+    ['缺少 npm 视为缺口', { node: { available: true, version: 'v24.0.0' }, npm: { available: false } }, true],
+    ['Node 20 视为缺口', { node: { available: true, version: 'v20.11.0' }, npm: { available: true } }, true],
+    ['Node 22 满足要求', { node: { available: true, version: 'v22.20.0' }, npm: { available: true } }, false],
+    ['Node 24 满足要求', { node: { available: true, version: 'v24.21.0' }, npm: { available: true } }, false],
+  ];
+  for (const [name, detection, expected] of gapCases) {
+    check(name, ShellController.runtimeGap(detection) === expected);
+  }
+
+  // --- download + extract + verify, fully offline -------------------------
+  const workDir = path.join(here, '.tmp-runtime');
+  const serveDir = path.join(workDir, 'serve');
+  const runtimeRoot = path.join(workDir, 'runtime');
+  rmSync(workDir, { recursive: true, force: true });
+
+  // Build a stand-in Node archive with the same layout as the real tarball.
+  const archiveTree = path.join(workDir, 'node-v9.9.9-darwin-x64', 'bin');
+  mkdirSync(archiveTree, { recursive: true });
+  writeFileSync(path.join(archiveTree, 'node'), '#!/bin/sh\necho v9.9.9\n');
+  writeFileSync(path.join(archiveTree, 'npm'), '#!/bin/sh\necho 11.9.9\n');
+  chmodSync(path.join(archiveTree, 'node'), 0o755);
+  chmodSync(path.join(archiveTree, 'npm'), 0o755);
+  mkdirSync(path.join(serveDir, 'v9.9.9'), { recursive: true });
+  execFileSync('tar', [
+    '-czf',
+    path.join(serveDir, 'v9.9.9', 'node-v9.9.9-darwin-x64.tar.gz'),
+    '-C',
+    path.join(workDir),
+    'node-v9.9.9-darwin-x64',
+  ]);
+
+  // A tiny HTTP server plays the role of the dist mirror.
+  const served = [];
+  const server = createServer((request, response) => {
+    const file = path.join(serveDir, request.url.replace(/^\//, ''));
+    try {
+      const body = readFileSync(file);
+      served.push(request.url);
+      response.writeHead(200, { 'content-length': String(body.length) });
+      response.end(body);
+    } catch {
+      response.writeHead(404);
+      response.end('not found');
+    }
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+
+  try {
+    // Direct download with progress.
+    const target = path.join(workDir, 'direct.tar.gz');
+    const updates = [];
+    await nodeRuntime.downloadFile(`${base}/v9.9.9/node-v9.9.9-darwin-x64.tar.gz`, target, {
+      onProgress: (snapshot) => updates.push(snapshot),
+    });
+    check('可下载文件并写入磁盘', statSync(target).size > 0, `${statSync(target).size} bytes`);
+    check('下载过程回报进度', updates.length > 0 && updates.at(-1).percent === 100, JSON.stringify(updates.at(-1)));
+
+    // Full bootstrap: download → extract → verify.
+    const logs = [];
+    const progressSnapshots = [];
+    const first = await nodeRuntime.installNodeRuntime({
+      root: runtimeRoot,
+      version: 'v9.9.9',
+      platform: 'darwin',
+      arch: 'x64',
+      sources: [{ name: 'test-mirror', base }],
+      onLog: (entry) => logs.push(entry.line),
+      onProgress: (snapshot) => progressSnapshots.push(snapshot),
+    });
+    check('运行时自动配置成功', first.ok === true, first.ok ? '' : first.error);
+    check('解压后 node 就位', first.ok && statSync(first.nodePath).isFile(), String(first.nodePath));
+    check('解压后 npm 就位', first.ok && statSync(first.npmPath).isFile(), String(first.npmPath));
+    check('校验会执行 node --version', logs.some((line) => line.includes('v9.9.9')), '');
+    check('进度走到 100%', progressSnapshots.at(-1)?.percent === 100, JSON.stringify(progressSnapshots.at(-1)));
+    check('首次安装标记为未复用', first.ok && first.reused === false);
+
+    // Second run must reuse the unpacked runtime instead of downloading again.
+    const downloadsBefore = served.length;
+    const second = await nodeRuntime.installNodeRuntime({
+      root: runtimeRoot,
+      version: 'v9.9.9',
+      platform: 'darwin',
+      arch: 'x64',
+      sources: [{ name: 'test-mirror', base }],
+    });
+    check('重复调用复用已装运行时', second.ok === true && second.reused === true);
+    check('复用时不再重复下载', served.length === downloadsBefore, `served=${served.length}`);
+
+    // Discovery + PATH injection.
+    const found = nodeRuntime.findManagedRuntime(runtimeRoot);
+    check('可发现已配置的运行时', found?.version === 'v9.9.9' && found.binDir.endsWith(path.join('node-v9.9.9-darwin-x64', 'bin')), String(found?.binDir));
+    const injected = nodeRuntime.withManagedRuntime({ PATH: '/usr/bin:/bin' }, found.binDir);
+    check('托管运行时置于 PATH 最前', injected.PATH.startsWith(found.binDir), injected.PATH);
+    check('PATH 不重复注入同一目录', nodeRuntime.withManagedRuntime(injected, found.binDir).PATH.split(':').filter((p) => p === found.binDir).length === 1);
+
+    // Managed environment: npm must not inherit a prefix from the launcher.
+    const managedEnv = nodeRuntime.managedRuntimeEnv(
+      { PATH: '/usr/bin:/bin', npm_config_global_prefix: '/some/system/prefix' },
+      found,
+      { cacheDir: '/tmp/managed-cache' },
+    );
+    check(
+      '托管环境的 npm 全局 prefix 被锁定到托管目录',
+      managedEnv.npm_config_prefix === found.dir && managedEnv.npm_config_global_prefix === found.dir,
+      `${managedEnv.npm_config_prefix} / ${managedEnv.npm_config_global_prefix}`,
+    );
+    check('托管环境显式指定缓存目录', managedEnv.npm_config_cache === '/tmp/managed-cache', String(managedEnv.npm_config_cache));
+    check('托管环境仍把运行时放在 PATH 最前', managedEnv.PATH.startsWith(found.binDir), managedEnv.PATH);
+
+    // A cancelled download must fail cleanly, not hang.
+    const controllerAbort = new AbortController();
+    controllerAbort.abort();
+    const aborted = await nodeRuntime.installNodeRuntime({
+      root: path.join(workDir, 'runtime-abort'),
+      version: 'v9.9.9',
+      platform: 'darwin',
+      arch: 'x64',
+      sources: [{ name: 'test-mirror', base }],
+      signal: controllerAbort.signal,
+    });
+    check('取消后返回失败而非卡住', aborted.ok === false && typeof aborted.error === 'string', String(aborted.error));
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    rmSync(workDir, { recursive: true, force: true });
+  }
+}
+
+section('11. 控制器：缺少 Node 时自动配置运行时');
+{
+  const calls = [];
+  const fakeProvision = (options) => {
+    calls.push(options);
+    // Mimic the real installer's contract.
+    options.onLog({ stream: 'system', line: '下载 Node.js 运行时' });
+    options.onProgress({ percent: 42, phase: '下载 Node.js 运行时', detail: '12.0 / 30.0 MB' });
+    return Promise.resolve({
+      ok: true,
+      dir: '/tmp/managed/node-v24.21.0-darwin-x64',
+      binDir: '/tmp/managed/node-v24.21.0-darwin-x64/bin',
+      nodePath: '/tmp/managed/node-v24.21.0-darwin-x64/bin/node',
+      npmPath: '/tmp/managed/node-v24.21.0-darwin-x64/bin/npm',
+      version: 'v24.21.0',
+      reused: false,
+    });
+  };
+
+  /** Each controller needs its own counter: "before provisioning" is per-run. */
+  const makeFakeDetect = () => {
+    let calls = 0;
+    return async () => {
+      calls += 1;
+      // Before provisioning: no node at all. After: managed node + npm, no dsh.
+      const provisioned = calls > 1;
+      return {
+      checkedAt: new Date().toISOString(),
+      platform: process.platform,
+      arch: process.arch,
+      packageName: DSH_PACKAGE,
+      node: provisioned
+        ? { available: true, version: 'v24.21.0', command: '/tmp/managed/bin/node', error: null }
+        : { available: false, version: null, command: null, error: 'PATH 中未找到 node' },
+      npm: provisioned
+        ? { available: true, version: '11.6.0', command: '/tmp/managed/bin/npm', error: null, globalRoot: '/tmp/managed/lib/node_modules', globalBin: '/tmp/managed/bin' }
+        : { available: false, version: null, command: null, error: 'PATH 中未找到 npm', globalRoot: null, globalBin: null },
+        dsh: { installed: false, version: null, command: null, error: 'PATH 中未找到 dsh 命令' },
+      };
+    };
+  };
+  const fakeDetect = makeFakeDetect();
+
+  const controller = new ShellController({
+    cwd: here,
+    runtimeRoot: path.join(here, '.tmp-managed-runtime'),
+    detect: fakeDetect,
+    provisionRuntime: fakeProvision,
+    startDelayMs: 10,
+  });
+  const phases = [];
+  controller.on('state', (state) => {
+    if (phases.at(-1) !== state.phase) phases.push(state.phase);
+  });
+
+  await controller.check({ autostart: false });
+  check('缺少 Node 时自动进入运行时配置', phases.includes('installing-node'), phases.join(' → '));
+  check('自动触发了一次运行时安装', calls.length === 1, `calls=${calls.length}`);
+  check('运行时安装收到 root 与取消信号', typeof calls[0].root === 'string' && Boolean(calls[0].signal), String(calls[0].root));
+  check('配置完成后进入安装 dsh 提示', controller.getState().phase === 'missing-dsh', controller.getState().phase);
+  check('托管运行时的 bin 目录已并入 PATH', String(controller.env.PATH).startsWith('/tmp/managed/node-v24.21.0-darwin-x64/bin'), String(controller.env.PATH).slice(0, 60));
+  check('状态里带出运行时信息', controller.getState().runtime?.version === 'v24.21.0', JSON.stringify(controller.getState().runtime));
+
+  // Failure path: provisioning fails → the manual panel with an actionable hint.
+  const failing = new ShellController({
+    cwd: here,
+    runtimeRoot: path.join(here, '.tmp-managed-runtime-fail'),
+    detect: makeFakeDetect(),
+    provisionRuntime: async () => ({ ok: false, error: 'Node.js 运行时下载失败：HTTP 404', hint: '请检查网络或代理设置' }),
+    startDelayMs: 10,
+  });
+  await failing.check({ autostart: false });
+  const failedState = failing.getState();
+  check('运行时配置失败时给出提示与建议', failedState.phase === 'no-node' && Boolean(failedState.error?.hint), JSON.stringify(failedState.error));
+
+  await controller.dispose();
+  await failing.dispose();
 }
 
 // --------------------------------------------------------------------- summary

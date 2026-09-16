@@ -12,7 +12,7 @@
 const api = window.dshShell;
 
 const MAX_LOG_NODES = 500;
-const PHASES = ['checking', 'no-node', 'missing-dsh', 'installing', 'starting', 'running', 'error'];
+const PHASES = ['checking', 'no-node', 'installing-node', 'missing-dsh', 'installing', 'starting', 'running', 'error'];
 
 const el = {
   toolbar: document.getElementById('toolbar'),
@@ -29,6 +29,12 @@ const el = {
   noNodeKv: document.getElementById('noNodeKv'),
   missingKv: document.getElementById('missingKv'),
   globalRoot: document.getElementById('globalRoot'),
+  runtimeMessage: document.getElementById('runtimeMessage'),
+  runtimeBar: document.getElementById('runtimeBar'),
+  runtimePercent: document.getElementById('runtimePercent'),
+  runtimePhase: document.getElementById('runtimePhase'),
+  runtimeDetail: document.getElementById('runtimeDetail'),
+  runtimeElapsed: document.getElementById('runtimeElapsed'),
   installBar: document.getElementById('installBar'),
   installPercent: document.getElementById('installPercent'),
   installPhase: document.getElementById('installPhase'),
@@ -47,7 +53,7 @@ const el = {
 /** @type {object|null} */
 let state = null;
 /** Local timestamps so the elapsed counters do not depend on main's clock. */
-const localClock = { installing: null, starting: null };
+const localClock = { 'installing-node': null, installing: null, starting: null };
 
 // ------------------------------------------------------------------ helpers
 
@@ -71,7 +77,7 @@ function renderKv(node, rows) {
   }
 }
 
-function detectionRows(detection) {
+function detectionRows(detection, runtime) {
   if (!detection) return [['状态', '正在收集环境信息…']];
   const rows = [];
   rows.push(['平台', `${detection.platform} / ${detection.arch}`]);
@@ -91,6 +97,9 @@ function detectionRows(detection) {
     detection.dsh.installed ? 'ok' : 'bad',
   ]);
   if (detection.dsh.command) rows.push(['dsh 路径', detection.dsh.command]);
+  if (runtime?.dir) {
+    rows.push(['托管运行时', `Node.js ${runtime.version ?? '?'} · ${runtime.dir}`]);
+  }
   if (detection.npm.globalBin) rows.push(['全局 bin', detection.npm.globalBin]);
   if (detection.npm.globalRoot) rows.push(['全局 node_modules', detection.npm.globalRoot]);
   if (detection.dsh.error) rows.push(['说明', detection.dsh.error]);
@@ -159,7 +168,12 @@ function resetLog(entries = []) {
 
 const ACTION_SPECS = {
   checking: [],
-  'no-node': [{ label: '重新检测', action: 'detect' }],
+  // Normal path is automatic; this panel is the failure fallback.
+  'no-node': [
+    { label: '自动配置运行时', action: 'install-node', primary: true },
+    { label: '重新检测', action: 'detect' },
+  ],
+  'installing-node': [{ label: '取消', action: 'cancel-node-install' }],
   'missing-dsh': [
     { label: '安装 dsh', action: 'install', primary: true },
     { label: '重新检测', action: 'detect' },
@@ -196,7 +210,12 @@ const PRIMARY_ACTIONS = {
 /** Menu entries per phase; `label` may be a function of the current UI state. */
 const MENU_SPECS = {
   checking: [{ label: '重新检测', action: 'detect' }],
-  'no-node': [{ label: '重新检测', action: 'detect' }],
+  // Normal path is automatic; this panel is the failure fallback.
+  'no-node': [
+    { label: '自动配置运行时', action: 'install-node', primary: true },
+    { label: '重新检测', action: 'detect' },
+  ],
+  'installing-node': [{ label: '取消', action: 'cancel-node-install' }],
   'missing-dsh': [
     { label: '重新检测', action: 'detect' },
     { label: '复制安装命令', action: 'copy-cmd' },
@@ -277,6 +296,7 @@ function render(next) {
   const phase = PHASES.includes(next.phase) ? next.phase : 'checking';
 
   if (phase !== previousPhase) {
+    if (phase === 'installing-node') localClock['installing-node'] = Date.now();
     if (phase === 'installing') localClock.installing = Date.now();
     if (phase === 'starting') localClock.starting = Date.now();
     // Main resets the manual hide on every phase change; keep the labels in sync.
@@ -304,7 +324,7 @@ function render(next) {
   renderToolbarActions(phase);
 
   // --- panels ---------------------------------------------------------------
-  const rows = detectionRows(next.detection);
+  const rows = detectionRows(next.detection, next.runtime);
   renderKv(el.checkingKv, rows);
   renderKv(el.noNodeKv, next.detection?.node?.available ? rows : rows);
   renderKv(el.missingKv, rows);
@@ -316,6 +336,21 @@ function render(next) {
     el.installBar.style.width = `${install.percent ?? 0}%`;
     setText(el.installPhase, install.phase ?? '安装中');
     setText(el.installDetail, install.detail || `已获取 ${install.fetched ?? 0} 个包`);
+  }
+
+  const runtime = next.runtime;
+  if (phase === 'installing-node' && runtime) {
+    setText(el.runtimePercent, `${runtime.percent ?? 0}%`);
+    el.runtimeBar.style.width = `${runtime.percent ?? 0}%`;
+    setText(el.runtimePhase, runtime.phase ?? '正在配置运行时');
+    setText(el.runtimeDetail, runtime.detail || '正在准备…');
+  }
+
+  if (phase === 'no-node') {
+    setText(
+      el.runtimeMessage,
+      next.error ? `${next.error.message}${next.error.hint ? ` — ${next.error.hint}` : ''}` : '',
+    );
   }
 
   if (phase === 'starting') {
@@ -334,6 +369,9 @@ function render(next) {
 /** Tick the elapsed-time labels once per second. */
 function updateElapsed() {
   if (!state) return;
+  if (state.phase === 'installing-node' && localClock['installing-node']) {
+    setText(el.runtimeElapsed, `已用时 ${formatDuration(Date.now() - localClock['installing-node'])}`);
+  }
   if (state.phase === 'installing' && localClock.installing) {
     setText(el.installElapsed, `已用时 ${formatDuration(Date.now() - localClock.installing)}`);
   }
@@ -351,6 +389,8 @@ const ACTIONS = {
   check: () => api.check(),
   detect: () => api.detect(),
   install: () => api.install(),
+  'install-node': () => api.installNode(),
+  'cancel-node-install': () => api.cancelNodeInstall(),
   'cancel-install': () => api.cancelInstall(),
   start: () => api.start(),
   stop: () => api.stop(),

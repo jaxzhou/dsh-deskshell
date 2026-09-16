@@ -58,26 +58,56 @@
           </div>
         </section>
 
-        <!-- 2. 缺少 Node.js / npm -->
+        <!-- 2. 运行时缺失/配置失败：正常情况下会自动配置，此面板用于失败兜底 -->
         <section class="panel" data-phase="no-node">
           <div class="card">
             <span class="badge badge-warn">缺少运行环境</span>
-            <h1>未检测到 Node.js / npm</h1>
+            <h1>需要 Node.js 运行时（含 npm）</h1>
             <p class="muted">
-              dsh 通过 npm 全局安装，因此需要先安装 Node.js（自带 npm）。安装完成后回到本窗口，点击“重新检测”即可继续。
+              dsh 依赖 Node.js 22 及以上版本与 npm。应用会自动下载官方发行版并配置到自己的数据目录，
+              <strong>无需管理员权限，也不会改动系统里已有的 Node.js</strong>；
+              之后 dsh 也安装在该目录内，与系统环境互不影响。
             </p>
+            <p class="muted" id="runtimeMessage"></p>
             <div class="kv" id="noNodeKv"></div>
             <div class="actions">
-              <button class="btn btn-primary" data-action="open-nodejs">打开 Node.js 下载页</button>
+              <button class="btn btn-primary" data-action="install-node">自动配置 Node.js 运行时</button>
               <button class="btn" data-action="detect">重新检测</button>
             </div>
             <details class="details">
-              <summary>手动安装方式</summary>
-              <p class="muted">
-                使用官方安装包（<code>nodejs.org</code>），或用 nvm：<br />
-                <code>curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash &amp;&amp; nvm install --lts</code>
-              </p>
+              <summary>自动配置失败时的其他选择</summary>
+              <ul class="muted">
+                <li>检查网络或代理：需要能访问 <code>nodejs.org</code>（或设置 <code>DSH_D_NODE_MIRROR</code> 指向镜像）。</li>
+                <li>自行安装 Node.js 22+（<span id="nodeSiteHint">nodejs.org</span>），回到本窗口点击“重新检测”即可，应用会直接使用系统的 Node 与 npm。</li>
+                <li>只需 dsh 运行时：nvm 用户可执行 <code>nvm install --lts</code>。</li>
+              </ul>
             </details>
+          </div>
+        </section>
+
+        <!-- 2b. 自动配置运行时中 -->
+        <section class="panel" data-phase="installing-node">
+          <div class="card">
+            <span class="badge badge-busy">自动配置</span>
+            <h1>正在配置 Node.js 运行环境</h1>
+            <div class="progress">
+              <div class="progress-head">
+                <span class="progress-phase" id="runtimePhase">准备下载 Node.js</span>
+                <span class="progress-percent" id="runtimePercent">0%</span>
+              </div>
+              <div class="bar"><div class="bar-fill" id="runtimeBar" style="width: 0%"></div></div>
+              <div class="progress-foot">
+                <span id="runtimeDetail">正在获取版本信息…</span>
+                <span id="runtimeElapsed"></span>
+              </div>
+            </div>
+            <p class="muted small">
+              将从 nodejs.org 下载官方 Node.js LTS 发行版（约 30–60 MB）并解压到应用数据目录，
+              不会修改系统环境；下载完成后会自动继续安装 dsh。
+            </p>
+            <div class="actions">
+              <button class="btn" data-action="cancel-node-install">取消</button>
+            </div>
           </div>
         </section>
 

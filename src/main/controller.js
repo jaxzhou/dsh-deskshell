@@ -12,10 +12,20 @@
 
 const { EventEmitter } = require('node:events');
 const os = require('node:os');
+const path = require('node:path');
 
 const { DSH_PACKAGE, detectDsh } = require('./dsh-detect');
 const { installDsh } = require('./dsh-install');
 const { DshServer } = require('./dsh-server');
+const {
+  MIN_NODE_MAJOR,
+  defaultRuntimeRoot,
+  findManagedRuntime,
+  installNodeRuntime,
+  managedRuntimeEnv,
+  nodeDistSources,
+  nodeMajor,
+} = require('./node-runtime');
 const { resolveShellEnv } = require('./shell-env');
 
 /** How many log lines to keep for a freshly-mounted renderer. */
@@ -31,18 +41,30 @@ class ShellController extends EventEmitter {
    *   cwd?: string,
    *   port?: number,
    *   startDelayMs?: number,
+   *   runtimeRoot?: string,
    *   detect?: typeof detectDsh,
    *   install?: typeof installDsh,
-   * }} [options] `detect`/`install` are injectable so the whole flow can be
-   *   exercised against fixtures without touching the real npm or dsh.
+   *   provisionRuntime?: typeof installNodeRuntime,
+   * }} [options] `detect`/`install`/`provisionRuntime` are injectable so the
+   *   whole flow can be exercised against fixtures without touching the real
+   *   npm, dsh or the network.
    */
   constructor(options = {}) {
     super();
     this.cwd = options.cwd ?? os.homedir();
     this.port = options.port ?? 0;
     this.startDelayMs = options.startDelayMs ?? 350;
+    /** Managed Node.js runtime root (inside the app's user-data directory). */
+    this.runtimeRoot = options.runtimeRoot ?? defaultRuntimeRoot();
     this.detect = options.detect ?? detectDsh;
     this.runInstall = options.install ?? installDsh;
+    this.runProvisionRuntime = options.provisionRuntime ?? installNodeRuntime;
+
+    /** Set once a managed runtime exists; its bin dir leads every PATH we build. */
+    this.managedRuntime = null;
+    /** @type {{cancel: () => void}|null} */
+    this.runtimeHandle = null;
+    this.runtimeSnapshot = null;
 
     /** @type {NodeJS.ProcessEnv|null} */
     this.env = null;
@@ -84,6 +106,16 @@ class ShellController extends EventEmitter {
       install: this.installHandle || this.installSnapshot
         ? { ...(this.installSnapshot ?? { percent: 0, phase: '准备安装', detail: '' }), running: Boolean(this.installHandle) }
         : null,
+      runtime: this.runtimeHandle || this.runtimeSnapshot
+        ? {
+            ...(this.runtimeSnapshot ?? { percent: 0, phase: '准备下载 Node.js', detail: '' }),
+            running: Boolean(this.runtimeHandle),
+            version: this.managedRuntime?.version ?? null,
+            dir: this.managedRuntime?.dir ?? null,
+          }
+        : this.managedRuntime
+          ? { percent: 100, phase: '运行时已就绪', detail: `Node.js ${this.managedRuntime.version}`, running: false, version: this.managedRuntime.version, dir: this.managedRuntime.dir }
+          : null,
       server: {
         running: serverRunning,
         url: this.serverUrl,
@@ -132,8 +164,44 @@ class ShellController extends EventEmitter {
 
   // ---------------------------------------------------------------- detection
 
+  /** True when this detection cannot run dsh: no node/npm, or Node too old. */
+  static runtimeGap(detection) {
+    if (!detection?.node?.available || !detection?.npm?.available) return true;
+    const major = nodeMajor(detection.node.version);
+    return major === null || major < MIN_NODE_MAJOR;
+  }
+
   /**
-   * Resolve the login environment (once) and detect node/npm/dsh.
+   * Resolve the login environment and let a managed runtime lead its PATH.
+   * @private
+   */
+  async resolveEnvironment(token) {
+    if (!this.managedRuntime) {
+      const existing = findManagedRuntime(this.runtimeRoot);
+      if (existing) {
+        this.managedRuntime = existing;
+        this.pushLog({ stream: 'system', line: `复用托管运行时：${existing.dir}（${existing.version}）` });
+      }
+    }
+    if (!this.env) {
+      const resolved = await resolveShellEnv();
+      if (token !== this.checkToken) return false;
+      this.env = resolved.env;
+      this.shellNotes = resolved.notes;
+      this.pushLog({ stream: 'system', line: `环境：${resolved.notes.join('；')}` });
+    }
+    // The managed runtime must lead PATH on every resolution — a fresh
+    // `resolveShellEnv()` knows nothing about it.
+    if (this.managedRuntime) {
+      this.env = this.runtimeEnv(this.managedRuntime);
+    }
+    return true;
+  }
+
+  /**
+   * Detect node/npm/dsh; provision a private Node.js runtime when the machine
+   * cannot run dsh — missing node/npm, or a Node older than dsh supports.
+   *
    * @param {{autostart?: boolean}} [options]
    */
   async check(options = {}) {
@@ -144,17 +212,10 @@ class ShellController extends EventEmitter {
     this.setPhase('checking', '正在检测 DeepSeek Harness…');
     this.broadcast();
 
-    if (!this.env) {
-      const resolved = await resolveShellEnv();
-      if (token !== this.checkToken) return this.detection;
-      this.env = resolved.env;
-      this.shellNotes = resolved.notes;
-      this.pushLog({ stream: 'system', line: `环境：${resolved.notes.join('；')}` });
-    }
+    if (!(await this.resolveEnvironment(token))) return this.detection;
 
-    const detection = await this.detect(this.env);
+    let detection = await this.detect(this.env);
     if (token !== this.checkToken) return this.detection;
-    this.detection = detection;
 
     this.pushLog({
       stream: 'system',
@@ -166,11 +227,15 @@ class ShellController extends EventEmitter {
       ].filter(Boolean).join(' '),
     });
 
-    if (!detection.node.available || !detection.npm.available) {
-      this.setPhase('no-node', '未检测到 Node.js / npm');
-      this.broadcast();
-      return detection;
+    // No usable runtime: fetch one instead of sending the user to nodejs.org.
+    if (ShellController.runtimeGap(detection)) {
+      const provisioned = await this.provisionRuntime(detection, token);
+      if (token !== this.checkToken) return this.detection;
+      if (!provisioned) return this.detection ?? detection;
+      detection = this.detection;
     }
+
+    this.detection = detection;
 
     if (!detection.dsh.installed) {
       this.setPhase('missing-dsh', `未检测到 ${DSH_PACKAGE}`);
@@ -185,6 +250,138 @@ class ShellController extends EventEmitter {
     return detection;
   }
 
+  // ------------------------------------------------------------------ runtime
+
+  /**
+   * Environment used for everything that runs inside the managed runtime.
+   * @private
+   */
+  runtimeEnv(runtime) {
+    return managedRuntimeEnv(this.env ?? process.env, runtime, {
+      cacheDir: path.join(this.runtimeRoot, '.npm-cache'),
+    });
+  }
+
+  /**
+   * Download and configure a private Node.js runtime so dsh can run here.
+   *
+   * @param {object} detection current detection (may already be stale).
+   * @param {number} token check token, so a superseded check stops early.
+   * @returns {Promise<boolean>} true when node and npm are usable afterwards.
+   * @private
+   */
+  async provisionRuntime(detection, token) {
+    const tooOld = detection?.node?.available && nodeMajor(detection.node.version) < MIN_NODE_MAJOR;
+    if (tooOld) {
+      this.pushLog({
+        stream: 'system',
+        line: `系统 Node.js ${detection.node.version} 低于 dsh 需要的 v${MIN_NODE_MAJOR}，将配置独立的运行时`,
+      });
+    }
+
+    // A managed runtime may already satisfy the requirement.
+    const existing = findManagedRuntime(this.runtimeRoot);
+    if (existing && nodeMajor(existing.version) >= MIN_NODE_MAJOR) {
+      this.managedRuntime = existing;
+      this.env = this.runtimeEnv(existing);
+      const detected = await this.detect(this.env);
+      if (token !== this.checkToken) return false;
+      this.detection = detected;
+      if (!ShellController.runtimeGap(detected)) {
+        this.pushLog({ stream: 'system', line: `托管运行时可用：Node.js ${detected.node.version}` });
+        return true;
+      }
+    }
+
+    this.error = null;
+    this.runtimeSnapshot = { percent: 0, phase: '准备下载 Node.js', detail: '' };
+    this.setPhase('installing-node', '正在自动配置 Node.js 运行环境…');
+    this.broadcast();
+
+    const controller = new AbortController();
+    const handle = this.runProvisionRuntime({
+      root: this.runtimeRoot,
+      // DSH_D_NODE_MIRROR / DSH_D_NODE_VERSION let a restricted network or a
+      // managed fleet pin where and which Node.js is installed.
+      version: String(process.env.DSH_D_NODE_VERSION ?? '').trim() || null,
+      sources: nodeDistSources(),
+      signal: controller.signal,
+      onLog: (entry) => this.pushLog(entry),
+      onProgress: (snapshot) => {
+        this.runtimeSnapshot = snapshot;
+        this.scheduleBroadcast();
+      },
+    });
+    this.runtimeHandle = {
+      cancel: () => {
+        this.pushLog({ stream: 'system', line: '用户取消了运行时配置' });
+        controller.abort();
+      },
+      promise: handle,
+    };
+
+    let result;
+    try {
+      result = await handle;
+    } catch (error) {
+      result = { ok: false, error: error instanceof Error ? error.message : String(error), hint: null };
+    }
+    if (token !== this.checkToken) return false;
+
+    this.runtimeHandle = null;
+    this.runtimeSnapshot = {
+      ...(this.runtimeSnapshot ?? { percent: 0, phase: '', detail: '' }),
+      ...(result.ok ? { percent: 100, phase: '运行时已就绪' } : { phase: '运行时配置失败' }),
+      failure: result.ok ? null : result.error,
+    };
+
+    if (!result.ok) {
+      this.error = {
+        message: result.error,
+        hint: result.hint ?? '可以手动安装 Node.js 后点击“重新检测”，或在有网络的环境下重试。',
+      };
+      this.setPhase('no-node', `Node.js 运行时配置失败`);
+      this.broadcast();
+      return false;
+    }
+
+    this.managedRuntime = result;
+    // The managed npm's global prefix is pinned inside the managed directory,
+    // so `npm install -g` there needs no administrator rights.
+    this.env = this.runtimeEnv(result);
+    // PATH changed: re-resolve so npm's own `prefix -g` is read from the new one.
+    this.env = null;
+    await this.resolveEnvironment(token);
+    if (token !== this.checkToken) return false;
+
+    const detected = await this.detect(this.env);
+    if (token !== this.checkToken) return false;
+    this.detection = detected;
+
+    if (ShellController.runtimeGap(detected)) {
+      this.error = {
+        message: `配置完成后仍无法使用 node / npm`,
+        hint: `请检查 ${result.dir} 是否完整，或删除该目录后重试。`,
+      };
+      this.setPhase('no-node', 'Node.js 运行时不可用');
+      this.broadcast();
+      return false;
+    }
+
+    this.pushLog({
+      stream: 'system',
+      line: `运行时已就绪：node ${detected.node.version} · npm ${detected.npm.version}（全局目录 ${detected.npm.globalBin ?? '未知'}）`,
+    });
+    return true;
+  }
+
+  /** Cancel an in-flight runtime download. */
+  cancelRuntimeInstall() {
+    if (!this.runtimeHandle) return;
+    this.runtimeHandle.cancel();
+    this.broadcast();
+  }
+
   // ------------------------------------------------------------------ install
 
   /** Run `npm install -g @deepseek-ai/dsh`, then re-detect and start it. */
@@ -192,7 +389,13 @@ class ShellController extends EventEmitter {
     if (this.installHandle) return;
 
     const detection = this.detection ?? (await this.check({ autostart: false }));
-    if (!detection?.npm?.available) {
+    if (ShellController.runtimeGap(detection)) {
+      // No usable node/npm: provision one, then `check()` continues to here.
+      this.pushLog({ stream: 'system', line: '缺少可用的 Node.js / npm，先自动配置运行时…' });
+      await this.check({ autostart: true });
+      return;
+    }
+    if (!detection.npm?.available) {
       this.error = { message: 'npm 不可用，无法安装 dsh', hint: '请先安装 Node.js（自带 npm），然后点击“重新检测”。' };
       this.setPhase('no-node', '未检测到 Node.js / npm');
       this.broadcast();
@@ -364,7 +567,8 @@ class ShellController extends EventEmitter {
    */
   async retry() {
     const detection = this.detection ?? (await this.check({ autostart: false }));
-    if (!detection?.npm?.available) {
+    // Missing or too-old Node: `check()` provisions the managed runtime.
+    if (ShellController.runtimeGap(detection)) {
       await this.check({ autostart: false });
       return;
     }
@@ -390,6 +594,14 @@ class ShellController extends EventEmitter {
         /* already gone */
       }
       this.installHandle = null;
+    }
+    if (this.runtimeHandle) {
+      try {
+        this.runtimeHandle.cancel();
+      } catch {
+        /* already gone */
+      }
+      this.runtimeHandle = null;
     }
     const server = this.server;
     this.server = null;

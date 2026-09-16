@@ -33,6 +33,8 @@ if (process.env.DSH_D_USER_DATA) {
 
 const controller = new ShellController({
   port: Number(process.env.DSH_D_PORT ?? 0) || 0,
+  // Managed Node.js runtimes live beside the app's own data.
+  runtimeRoot: path.join(app.getPath('userData'), 'runtime'),
 });
 
 /** @type {BrowserWindow|null} */
@@ -231,6 +233,18 @@ function registerIpc() {
     return controller.getState();
   });
 
+  ipcMain.handle('dsh:install-node', () => {
+    // Re-runs the flow; `check()` provisions the managed runtime because the
+    // gap is a missing/too-old Node, then continues to the dsh install prompt.
+    controller.check({ autostart: true }).catch((error) => reportError('配置 Node.js 运行时失败', error));
+    return controller.getState();
+  });
+
+  ipcMain.handle('dsh:cancel-node-install', () => {
+    controller.cancelRuntimeInstall();
+    return controller.getState();
+  });
+
   ipcMain.handle('dsh:start', () => {
     controller.start().catch((error) => reportError('启动失败', error));
     return controller.getState();
@@ -300,7 +314,7 @@ async function runSelfTest() {
     );
     record('preload 已注入 window.dshShell', bridge === true);
     const panels = await win.webContents.executeJavaScript('document.querySelectorAll(".panel").length');
-    record('界面面板已渲染', panels === 7, `panels=${panels}`);
+    record('界面面板已渲染（含运行时配置面板）', panels === 8, `panels=${panels}`);
     const phase = await win.webContents.executeJavaScript('window.dshShell.getState().then((state) => state.phase)');
     record('渲染进程可读取状态', typeof phase === 'string', String(phase));
     const inset = await win.webContents.executeJavaScript('window.dshShell.setViewInset({ top: 64 }).then((v) => v.top)');
@@ -428,7 +442,24 @@ function captureSamples(detection) {
       },
     },
     {
-      file: '03-installing.png',
+      file: '03-installing-node.png',
+      state: {
+        phase: 'installing-node',
+        statusText: '正在自动配置 Node.js 运行环境…',
+        detection: { ...dshDetection, node: { available: false, version: null }, npm: { available: false, version: null } },
+        install: null,
+        runtime: { percent: 43, phase: '下载 Node.js 运行时', detail: '22.4 / 51.7 MB', running: true },
+        server: { running: false, url: null, port: null },
+        error: null,
+        logs: [
+          { ts: Date.now(), stream: 'system', line: '检测结果：node=未找到 npm=未找到 dsh=未安装' },
+          { ts: Date.now(), stream: 'system', line: 'Node.js 最新 LTS：v24.21.0（来自 nodejs.org）' },
+          { ts: Date.now(), stream: 'system', line: '下载 https://nodejs.org/dist/v24.21.0/node-v24.21.0-darwin-x64.tar.gz' },
+        ],
+      },
+    },
+    {
+      file: '04-installing.png',
       state: {
         phase: 'installing',
         statusText: '正在安装 @deepseek-ai/dsh…',
@@ -445,7 +476,7 @@ function captureSamples(detection) {
       },
     },
     {
-      file: '04-running.png',
+      file: '05-running.png',
       state: {
         phase: 'running',
         statusText: 'DSH 已启动',
@@ -457,7 +488,7 @@ function captureSamples(detection) {
       },
     },
     {
-      file: '05-error.png',
+      file: '06-error.png',
       state: {
         phase: 'error',
         statusText: '安装失败',
@@ -509,7 +540,7 @@ async function runUiCapture() {
     );
     await new Promise((resolve) => setTimeout(resolve, 350));
     const image = await win.webContents.capturePage();
-    const target = path.join(outDir, '06-menu.png');
+    const target = path.join(outDir, '07-menu.png');
     fs.writeFileSync(target, image.toPNG());
     console.log(`captured ${target} (${image.getSize().width}x${image.getSize().height})`);
   }

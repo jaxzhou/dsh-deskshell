@@ -25,6 +25,10 @@ contextBridge.exposeInMainWorld('dshShell', {
   install: () => ipcRenderer.invoke('dsh:install'),
   /** Cancel an in-flight install. */
   cancelInstall: () => ipcRenderer.invoke('dsh:cancel-install'),
+  /** Download and configure a private Node.js runtime (no admin rights). */
+  installNode: () => ipcRenderer.invoke('dsh:install-node'),
+  /** Cancel an in-flight runtime download. */
+  cancelNodeInstall: () => ipcRenderer.invoke('dsh:cancel-node-install'),
   /** Start `dsh web` and load the resulting GUI. */
   start: () => ipcRenderer.invoke('dsh:start'),
   /** Stop the `dsh web` child. */

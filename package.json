@@ -16,6 +16,7 @@
     "dev": "electron . --dev",
     "verify": "node test/verify.mjs",
     "test": "node test/verify.mjs",
+    "test:network": "node test/network.mjs",
     "self-test": "electron . --self-test",
     "capture-ui": "electron . --capture-ui ui-preview",
     "pack": "electron-builder --dir",
