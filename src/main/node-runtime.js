@@ -19,9 +19,8 @@ const http = require('node:http');
 const https = require('node:https');
 const os = require('node:os');
 const path = require('node:path');
-const { spawn } = require('node:child_process');
 
-const { IS_WINDOWS, PATH_SEPARATOR, runCapture, shellCommandFor } = require('./shell-env');
+const { IS_WINDOWS, PATH_SEPARATOR, runCapture, setEnv, shellCommandFor } = require('./shell-env');
 
 /**
  * dsh's dependencies use `Promise.withResolvers`, which needs Node 22; Node 20
@@ -297,6 +296,123 @@ function runtimePaths(dir) {
 }
 
 /**
+ * Path of the npm command a runtime should expose.
+ * Windows ships `npm.cmd` beside node.exe; posix ships a `bin/npm` symlink.
+ */
+function npmCommandFor(dir) {
+  return runtimePaths(dir).npmPath;
+}
+
+/**
+ * Rebuild a missing npm command from the npm that ships inside the runtime.
+ *
+ * Node's archive exposes npm through a symlink (`bin/npm` ->
+ * `../lib/node_modules/npm/bin/npm-cli.js` on posix, `npm.cmd` on Windows).
+ * Some extraction tools drop symlinks, and a partially written runtime can lose
+ * the shim while `bin/node` still works — which leaves the machine able to run
+ * node but not npm. Rather than looping, rebuild the shim from the bundled npm.
+ *
+ * @returns {boolean} true when an npm command is available afterwards.
+ */
+function ensureNpmCommand(dir) {
+  const paths = runtimePaths(dir);
+  try {
+    if (fs.statSync(paths.npmPath).isFile()) return true;
+  } catch {
+    /* missing: try to rebuild below */
+  }
+
+  const cli = path.join(dir, 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  try {
+    if (!fs.statSync(cli).isFile()) return false;
+  } catch {
+    return false;
+  }
+
+  try {
+    if (IS_WINDOWS) {
+      // A .cmd shim: run the bundled npm CLI with the managed node.
+      fs.writeFileSync(
+        paths.npmPath,
+        `@ECHO off\r\nSETLOCAL\r\n"%~dp0node.exe" "%~dp0lib\\node_modules\\npm\\bin\\npm-cli.js" %*\r\n`,
+      );
+    } else {
+      // Restore the archive's symlink, falling back to a tiny wrapper script.
+      try {
+        fs.symlinkSync(path.relative(paths.binDir, cli), paths.npmPath);
+      } catch {
+        fs.writeFileSync(
+          paths.npmPath,
+          `#!/bin/sh\nexec "$(dirname "$0")/node" "$(dirname "$0")/../lib/node_modules/npm/bin/npm-cli.js" "$@"\n`,
+        );
+      }
+      fs.chmodSync(paths.npmPath, 0o755);
+    }
+    return fs.statSync(paths.npmPath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check that a runtime really works: both commands must exist *and run*.
+ *
+ * Existence alone is not enough — a half-extracted runtime passes an
+ * existence check and then fails forever, which is what makes a broken
+ * bootstrap loop instead of repairing itself.
+ *
+ * @param {string} dir runtime directory.
+ * @param {{env?: NodeJS.ProcessEnv}} [options] environment for the probes.
+ * @returns {Promise<{ok: true, dir: string, binDir: string, nodePath: string, npmPath: string, version: string, nodeVersion: string, npmVersion: string}
+ *   | {ok: false, reason: string, nodeVersion?: string|null}>}
+ */
+async function verifyManagedRuntime(dir, options = {}) {
+  const paths = runtimePaths(dir);
+  // On posix, `bin/npm` is a symlink to npm-cli.js, whose shebang is
+  // `#!/usr/bin/env node`: running npm therefore needs *this* runtime's node to
+  // be first on PATH. Passing the caller's environment through unchanged would
+  // work on a machine that already has node and fail on exactly the machine
+  // this bootstrap exists for — so the bin directory is always prepended here,
+  // regardless of what the caller supplied.
+  const env = withManagedRuntime(options.env ?? process.env, paths.binDir);
+  const version = (path.basename(dir).match(/^node-(v\d+\.\d+\.\d+)/) ?? [])[1] ?? path.basename(dir);
+
+  ensureNpmCommand(dir);
+
+  for (const [name, file] of [['node', paths.nodePath], ['npm', paths.npmPath]]) {
+    try {
+      if (!fs.statSync(file).isFile()) {
+        return { ok: false, reason: `运行时缺少 ${name}：${file}` };
+      }
+    } catch {
+      return { ok: false, reason: `运行时缺少 ${name}：${file}` };
+    }
+  }
+
+  const nodeProbe = await runCapture(paths.nodePath, ['--version'], { env, timeoutMs: 30_000 });
+  if (!nodeProbe.ok) {
+    return { ok: false, reason: `node --version 执行失败：${nodeProbe.error ?? nodeProbe.stderr.trim() ?? `exit ${nodeProbe.code}`}` };
+  }
+
+  const npmProbe = await runCapture(npmCommandFor(dir), ['--version'], { env, timeoutMs: 60_000 });
+  if (!npmProbe.ok || !/\d+\.\d+\.\d+/.test(npmProbe.stdout)) {
+    return {
+      ok: false,
+      nodeVersion: nodeProbe.stdout.trim(),
+      reason: `npm --version 执行失败：${npmProbe.error ?? npmProbe.stderr.trim() ?? `exit ${npmProbe.code}`}`,
+    };
+  }
+
+  return {
+    ok: true,
+    ...paths,
+    version,
+    nodeVersion: nodeProbe.stdout.trim(),
+    npmVersion: npmProbe.stdout.trim(),
+  };
+}
+
+/**
  * Find an already-provisioned managed runtime, newest version first.
  * @returns {{dir: string, binDir: string, nodePath: string, npmPath: string, version: string}|null}
  */
@@ -327,7 +443,9 @@ function findManagedRuntime(root) {
     const dir = path.join(root, name);
     const paths = runtimePaths(dir);
     try {
-      if (fs.statSync(paths.nodePath).isFile() && fs.statSync(paths.npmPath).isFile()) {
+      // A missing npm shim is repairable, so only node must be present here;
+      // verifyManagedRuntime() decides whether the runtime is actually usable.
+      if (fs.statSync(paths.nodePath).isFile() && ensureNpmCommand(dir)) {
         return { ...paths, version: versionOf(name) };
       }
     } catch {
@@ -342,7 +460,7 @@ function withManagedRuntime(env, binDir) {
   if (!binDir) return env;
   const current = String(env.PATH ?? '').split(PATH_SEPARATOR).filter(Boolean);
   const deduped = [binDir, ...current.filter((entry) => entry !== binDir)];
-  return { ...env, PATH: deduped.join(PATH_SEPARATOR) };
+  return setEnv({ ...env }, 'PATH', deduped.join(PATH_SEPARATOR));
 }
 
 /**
@@ -361,12 +479,10 @@ function withManagedRuntime(env, binDir) {
  */
 function managedRuntimeEnv(env, runtime, options = {}) {
   const base = withManagedRuntime(env, runtime.binDir);
-  return {
-    ...base,
-    npm_config_prefix: runtime.dir,
-    npm_config_global_prefix: runtime.dir,
-    ...(options.cacheDir ? { npm_config_cache: options.cacheDir } : {}),
-  };
+  setEnv(base, 'npm_config_prefix', runtime.dir);
+  setEnv(base, 'npm_config_global_prefix', runtime.dir);
+  if (options.cacheDir) setEnv(base, 'npm_config_cache', options.cacheDir);
+  return base;
 }
 
 /** Progress model for the runtime bootstrap, shaped like the install one. */
@@ -459,13 +575,24 @@ async function installNodeRuntime(options) {
     const targetDir = path.join(root, `node-${version}-${platform}-${arch}`);
     const paths = runtimePaths(targetDir);
 
-    // 2. Already unpacked and complete?
+    // 2. Already unpacked and usable? Existence is not enough: a half-written
+    //    runtime (node runs, npm does not) must be repaired, not reused.
     const existing = findManagedRuntime(root);
     if (existing && existing.version === version) {
-      onLog({ stream: 'system', line: `复用已安装的运行时：${existing.dir}` });
-      progress.done(existing.version);
+      const verified = await verifyManagedRuntime(existing.dir);
+      if (verified.ok) {
+        onLog({ stream: 'system', line: `复用已安装的运行时：${existing.dir}（node ${verified.nodeVersion} / npm ${verified.npmVersion}）` });
+        progress.done(existing.version);
+        report();
+        return { ok: true, ...existing, reused: true };
+      }
+      onLog({
+        stream: 'stderr',
+        line: `已存在的运行时不可用（${verified.reason}），将重新配置：${existing.dir}`,
+      });
+      progress.extracting('正在重新配置运行时');
       report();
-      return { ok: true, ...existing, reused: true };
+      fs.rmSync(existing.dir, { recursive: true, force: true });
     }
 
     // 3. Download (from the first source that answers).
@@ -521,35 +648,29 @@ async function installNodeRuntime(options) {
     fs.rmSync(targetDir, { recursive: true, force: true });
     fs.renameSync(staging, targetDir);
 
-    const staged = runtimePaths(targetDir);
-    if (!fs.existsSync(staged.nodePath) || !fs.existsSync(staged.npmPath)) {
-      progress.failed('解压后未找到 node 或 npm');
-      report();
-      return {
-        ok: false,
-        error: '解压后的运行时缺少 node 或 npm 可执行文件',
-        hint: `请检查下载的安装包是否完整：${archivePath}`,
-      };
-    }
-
-    // 5. Verify it actually runs before handing it to the rest of the app.
+    // 5. Both node and npm must actually run before the app relies on them.
     progress.verifying();
     report();
-    const check = await runCapture(staged.nodePath, ['--version'], { env: process.env, timeoutMs: 30_000 });
-    if (!check.ok || nodeMajor(check.stdout.trim()) === null) {
-      progress.failed('node --version 执行失败');
+    const verified = await verifyManagedRuntime(targetDir);
+    if (!verified.ok) {
+      progress.failed(verified.reason);
       report();
+      onLog({ stream: 'stderr', line: `运行时校验失败：${verified.reason}` });
+      fs.rmSync(targetDir, { recursive: true, force: true });
       return {
         ok: false,
-        error: `运行时校验失败：${check.error ?? check.stderr.trim() ?? 'node --version 无输出'}`,
-        hint: '下载的运行时可能不完整，可删除应用数据目录下的 runtime 后再试。',
+        error: `运行时校验失败：${verified.reason}`,
+        hint: `已删除不可用的运行时目录，可重试；若反复失败请检查下载的安装包：${archivePath}`,
       };
     }
 
-    onLog({ stream: 'system', line: `Node.js 运行时已就绪：${staged.nodePath}（${check.stdout.trim()}）` });
-    progress.done(check.stdout.trim());
+    onLog({
+      stream: 'system',
+      line: `Node.js 运行时已就绪：${verified.nodePath}（node ${verified.nodeVersion} / npm ${verified.npmVersion}）`,
+    });
+    progress.done(verified.nodeVersion);
     report();
-    return { ok: true, ...staged, version, reused: false };
+    return { ok: true, ...verified, reused: false };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     progress.failed(message);
@@ -575,14 +696,17 @@ module.exports = {
   fetchText,
   findManagedRuntime,
   installNodeRuntime,
+  ensureNpmCommand,
   managedNpmCommand,
   managedRuntimeEnv,
   nodeDistSources,
+  npmCommandFor,
   nodeMajor,
   nodePlatformName,
   normalizeVersion,
   parseLatestLts,
   resolveLatestLts,
   runtimePaths,
+  verifyManagedRuntime,
   withManagedRuntime,
 };

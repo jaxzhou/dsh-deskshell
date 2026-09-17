@@ -18,6 +18,7 @@
     "verify": "node test/verify.mjs",
     "test": "node test/verify.mjs",
     "test:network": "node test/network.mjs",
+    "diagnose": "node test/diagnose-runtime.mjs",
     "self-test": "electron . --self-test",
     "capture-ui": "electron . --capture-ui ui-preview",
     "pack": "electron-builder --dir",

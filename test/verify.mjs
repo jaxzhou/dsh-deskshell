@@ -12,7 +12,7 @@
 
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,7 +21,8 @@ const require = createRequire(import.meta.url);
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixtures = path.join(here, 'fixtures');
 
-const { resolveShellEnv, runCapture } = require('../src/main/shell-env.js');
+const shellEnv = require('../src/main/shell-env.js');
+const { resolveShellEnv, runCapture } = shellEnv;
 const { detectDsh, findExecutable, parseVersion, DSH_PACKAGE } = require('../src/main/dsh-detect.js');
 const { createInstallProgress } = require('../src/main/progress.js');
 const { installDsh } = require('../src/main/dsh-install.js');
@@ -472,13 +473,24 @@ section('10. Node.js 运行时自动配置 (node-runtime)');
   const runtimeRoot = path.join(workDir, 'runtime');
   rmSync(workDir, { recursive: true, force: true });
 
-  // Build a stand-in Node archive with the same layout as the real tarball.
-  const archiveTree = path.join(workDir, 'node-v9.9.9-darwin-x64', 'bin');
-  mkdirSync(archiveTree, { recursive: true });
-  writeFileSync(path.join(archiveTree, 'node'), '#!/bin/sh\necho v9.9.9\n');
-  writeFileSync(path.join(archiveTree, 'npm'), '#!/bin/sh\necho 11.9.9\n');
-  chmodSync(path.join(archiveTree, 'node'), 0o755);
-  chmodSync(path.join(archiveTree, 'npm'), 0o755);
+  // Build a stand-in Node archive with the *real* layout, including the detail
+  // that matters most: posix npm is a symlink to a `#!/usr/bin/env node`
+  // script, so running it resolves node through PATH.
+  const archiveRoot = path.join(workDir, 'node-v9.9.9-darwin-x64');
+  const archiveBin = path.join(archiveRoot, 'bin');
+  const archiveNpmCli = path.join(archiveRoot, 'lib', 'node_modules', 'npm', 'bin');
+  mkdirSync(archiveBin, { recursive: true });
+  mkdirSync(archiveNpmCli, { recursive: true });
+  writeFileSync(
+    path.join(archiveBin, 'node'),
+    // Stand-in for node: `--version` reports its own version; anything else
+    // "runs" the given script — the only one used here is npm's CLI.
+    '#!/bin/sh\ncase "$1" in\n  --version) echo v9.9.9 ;;\n  "") exit 0 ;;\n  *) echo 11.9.9 ;;\nesac\n',
+  );
+  chmodSync(path.join(archiveBin, 'node'), 0o755);
+  writeFileSync(path.join(archiveNpmCli, 'npm-cli.js'), '#!/usr/bin/env node\nconsole.log("11.9.9");\n');
+  chmodSync(path.join(archiveNpmCli, 'npm-cli.js'), 0o755);
+  symlinkSync('../lib/node_modules/npm/bin/npm-cli.js', path.join(archiveBin, 'npm'));
   mkdirSync(path.join(serveDir, 'v9.9.9'), { recursive: true });
   execFileSync('tar', [
     '-czf',
@@ -552,6 +564,77 @@ section('10. Node.js 运行时自动配置 (node-runtime)');
     const injected = nodeRuntime.withManagedRuntime({ PATH: '/usr/bin:/bin' }, found.binDir);
     check('托管运行时置于 PATH 最前', injected.PATH.startsWith(found.binDir), injected.PATH);
     check('PATH 不重复注入同一目录', nodeRuntime.withManagedRuntime(injected, found.binDir).PATH.split(':').filter((p) => p === found.binDir).length === 1);
+
+    // --- the root cause of the "node ok, npm broken" loop ----------------
+    // Running the managed npm with a PATH that has no node must be handled by
+    // verifyManagedRuntime itself: it prepends the runtime's own bin directory.
+    const emptyPathDir = path.join(workDir, 'empty-path');
+    mkdirSync(emptyPathDir, { recursive: true });
+    const bareEnv = { PATH: emptyPathDir };
+    const npmShim = path.join(first.dir, 'bin', 'npm');
+    const bareRun = await runCapture(npmShim, ['--version'], { env: bareEnv });
+    check(
+      '（根因）posix 下托管 npm 依赖 PATH 找到 node',
+      process.platform === 'win32' ? true : bareRun.ok === false,
+      `ok=${bareRun.ok} err=${bareRun.error ?? bareRun.stderr.trim()}`,
+    );
+    const selfHealing = await nodeRuntime.verifyManagedRuntime(first.dir, { env: bareEnv });
+    check(
+      '校验函数自行补齐 PATH，无 node 的机器上也能用 npm',
+      selfHealing.ok === true && selfHealing.npmVersion === '11.9.9',
+      selfHealing.ok ? selfHealing.npmVersion : selfHealing.reason,
+    );
+
+    // --- npm shim repair -------------------------------------------------
+    const npmPath = path.join(first.dir, 'bin', 'npm');
+    rmSync(npmPath, { force: true });
+    check('缺少 npm 时会被重新建立', nodeRuntime.ensureNpmCommand(first.dir) === true && statSync(npmPath).isFile());
+    const repairedRun = await nodeRuntime.verifyManagedRuntime(first.dir, { env: bareEnv });
+    check(
+      '重建后的 npm 可以运行',
+      repairedRun.ok === true,
+      repairedRun.ok ? repairedRun.npmVersion : repairedRun.reason,
+    );
+
+    // --- a runtime with a broken npm must not be reused blindly ----------
+    writeFileSync(npmPath, '#!/bin/sh\nexit 1\n');
+    chmodSync(npmPath, 0o755);
+    const brokenCheck = await nodeRuntime.verifyManagedRuntime(first.dir, { env: bareEnv });
+    check(
+      'npm 坏掉时校验会失败并说明原因',
+      brokenCheck.ok === false && /npm/.test(brokenCheck.reason),
+      brokenCheck.reason,
+    );
+    const repaired = await nodeRuntime.installNodeRuntime({
+      root: runtimeRoot,
+      version: 'v9.9.9',
+      platform: 'darwin',
+      arch: 'x64',
+      sources: [{ name: 'test-mirror', base }],
+    });
+    check('坏运行时不会被误判为可复用', repaired.ok === true && repaired.reused === false, `reused=${repaired.reused}`);
+    const afterRepair = repaired.ok
+      ? await nodeRuntime.verifyManagedRuntime(repaired.dir, { env: bareEnv })
+      : { ok: false, reason: '重装失败' };
+    check(
+      '重新配置后 npm 恢复可用',
+      afterRepair.ok === true,
+      afterRepair.ok ? afterRepair.npmVersion : afterRepair.reason,
+    );
+
+    // --- environment variable case handling (Windows Path vs PATH) -------
+    const collapsed = shellEnv.setEnv({ Path: 'C:\\old', PATH: 'C:\\older', KEEP: '1' }, 'PATH', 'C:\\managed');
+    check(
+      'PATH 大小写变体会被合并为一个键',
+      collapsed.PATH === 'C:\\managed' && collapsed.Path === undefined && collapsed.KEEP === '1',
+      JSON.stringify(collapsed),
+    );
+    const npmKey = shellEnv.setEnv({ NPM_CONFIG_PREFIX: '/system' }, 'npm_config_prefix', '/managed');
+    check(
+      'npm_config_* 同理避免重复键',
+      npmKey.npm_config_prefix === '/managed' && npmKey.NPM_CONFIG_PREFIX === undefined,
+      JSON.stringify(npmKey),
+    );
 
     // Managed environment: npm must not inherit a prefix from the launcher.
     const managedEnv = nodeRuntime.managedRuntimeEnv(

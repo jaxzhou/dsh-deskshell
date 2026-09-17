@@ -89,6 +89,28 @@ function dedupe(entries) {
   return result;
 }
 
+/**
+ * Set one environment variable, removing any case-variant already present.
+ *
+ * Windows environment variables are case-insensitive but a JavaScript object is
+ * not: spreading `process.env` (which normally carries `Path`) and then adding
+ * `PATH` leaves both keys, and the child process may read the stale one — so a
+ * managed runtime we prepended could be invisible to npm and dsh.
+ *
+ * @param {NodeJS.ProcessEnv} env environment object to modify.
+ * @param {string} key variable name, e.g. `PATH`.
+ * @param {string} value new value.
+ * @returns {NodeJS.ProcessEnv} the same object, for chaining.
+ */
+function setEnv(env, key, value) {
+  const wanted = key.toUpperCase();
+  for (const existing of Object.keys(env)) {
+    if (existing !== key && existing.toUpperCase() === wanted) delete env[existing];
+  }
+  env[key] = value;
+  return env;
+}
+
 /** True for the Windows shim types that cannot be spawned without a shell. */
 function needsShell(command) {
   return IS_WINDOWS && /\.(cmd|bat)$/i.test(String(command));
@@ -245,7 +267,7 @@ async function resolveShellEnv(options = {}) {
   dirs.push(...splitPath(baseEnv.PATH));
 
   // npm's global prefix is authoritative for where the `dsh` shim lands.
-  const provisionalEnv = { ...baseEnv, PATH: dedupe(existingDirs(dirs)).join(PATH_SEPARATOR) };
+  const provisionalEnv = setEnv({ ...baseEnv }, 'PATH', dedupe(existingDirs(dirs)).join(PATH_SEPARATOR));
   const npmBin = await npmGlobalBinDir(provisionalEnv, timeoutMs);
   if (npmBin) {
     // Kept even when it does not exist yet: the install we are about to run
@@ -256,7 +278,7 @@ async function resolveShellEnv(options = {}) {
     notes.push('未能通过 `npm prefix -g` 解析全局目录');
   }
 
-  const env = { ...baseEnv, PATH: dedupe(existingDirs(dirs)).join(PATH_SEPARATOR) };
+  const env = setEnv({ ...baseEnv }, 'PATH', dedupe(existingDirs(dirs)).join(PATH_SEPARATOR));
   return { env, dirs: dedupe(dirs), shell, notes };
 }
 
@@ -270,6 +292,7 @@ module.exports = {
   npmGlobalBinDir,
   resolveShellEnv,
   runCapture,
+  setEnv,
   shellCommandFor,
   splitPath,
 };

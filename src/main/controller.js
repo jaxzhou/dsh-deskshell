@@ -25,6 +25,7 @@ const {
   managedRuntimeEnv,
   nodeDistSources,
   nodeMajor,
+  verifyManagedRuntime,
 } = require('./node-runtime');
 const { resolveShellEnv } = require('./shell-env');
 
@@ -279,17 +280,35 @@ class ShellController extends EventEmitter {
       });
     }
 
-    // A managed runtime may already satisfy the requirement.
+    // A managed runtime may already satisfy the requirement — but only if it
+    // actually runs. A half-written one (node works, npm does not) must fall
+    // through to a real install, otherwise every retry would reuse it and fail
+    // the same way forever.
     const existing = findManagedRuntime(this.runtimeRoot);
     if (existing && nodeMajor(existing.version) >= MIN_NODE_MAJOR) {
-      this.managedRuntime = existing;
-      this.env = this.runtimeEnv(existing);
-      const detected = await this.detect(this.env);
+      const verified = await verifyManagedRuntime(existing.dir, {
+        env: this.runtimeEnv(existing),
+      });
       if (token !== this.checkToken) return false;
-      this.detection = detected;
-      if (!ShellController.runtimeGap(detected)) {
-        this.pushLog({ stream: 'system', line: `托管运行时可用：Node.js ${detected.node.version}` });
-        return true;
+      if (verified.ok) {
+        this.managedRuntime = existing;
+        this.env = this.runtimeEnv(existing);
+        const detected = await this.detect(this.env);
+        if (token !== this.checkToken) return false;
+        this.detection = detected;
+        if (!ShellController.runtimeGap(detected)) {
+          this.pushLog({
+            stream: 'system',
+            line: `托管运行时可用：node ${verified.nodeVersion} · npm ${verified.npmVersion}`,
+          });
+          return true;
+        }
+        this.pushLog({
+          stream: 'stderr',
+          line: `托管运行时存在但检测失败（node=${detected.node.version ?? '未找到'} npm=${detected.npm.version ?? '未找到'}），将重新配置`,
+        });
+      } else {
+        this.pushLog({ stream: 'stderr', line: `托管运行时不可用（${verified.reason}），将重新配置` });
       }
     }
 
@@ -359,9 +378,15 @@ class ShellController extends EventEmitter {
     this.detection = detected;
 
     if (ShellController.runtimeGap(detected)) {
+      // Name the piece that failed: "node ok, npm missing" needs a different
+      // fix from "nothing runs", and a vague message sent the user in circles.
+      const parts = [];
+      parts.push(detected.node.available ? `node 可用（${detected.node.version}）` : `node 不可用（${detected.node.error ?? '未知原因'}）`);
+      parts.push(detected.npm.available ? `npm 可用（${detected.npm.version}）` : `npm 不可用（${detected.npm.error ?? '未知原因'}）`);
+      this.pushLog({ stream: 'stderr', line: `运行时配置后检测仍不通过：${parts.join('；')}` });
       this.error = {
-        message: `配置完成后仍无法使用 node / npm`,
-        hint: `请检查 ${result.dir} 是否完整，或删除该目录后重试。`,
+        message: `运行时不完整：${parts.join('；')}`,
+        hint: `运行时目录：${result.dir}。可再次点击重试（会自动重新配置），或在终端执行 ${path.join(result.binDir, 'npm')} --version 查看具体报错。`,
       };
       this.setPhase('no-node', 'Node.js 运行时不可用');
       this.broadcast();
