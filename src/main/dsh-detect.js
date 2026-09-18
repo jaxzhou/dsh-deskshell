@@ -15,19 +15,29 @@ const DSH_PACKAGE = '@deepseek-ai/dsh';
 /** `dsh web` server that the desktop shell embeds. */
 const DSH_WEB_PROFILE_ARGS = ['web', '--no-open'];
 
-/** Executable file names to try for `name` on this platform. */
+/**
+ * Executable file names to try for `name` on this platform, in resolution order.
+ *
+ * On Windows this must follow PATHEXT exactly, because cmd.exe never runs an
+ * extension-less file — and Node's Windows archive ships one: alongside
+ * `npm.cmd` there is a bare `npm` POSIX shell wrapper, and a global npm install
+ * likewise writes `dsh`, `dsh.cmd` and `dsh.ps1`. Returning the bare `npm`
+ * would hand back a shell script that Windows cannot execute, so npm (and dsh)
+ * would look broken on a machine where both are perfectly fine.
+ */
 function candidateNames(name) {
   if (!IS_WINDOWS) return [name];
   const extensions = String(process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD')
     .split(';')
     .map((extension) => extension.trim())
     .filter(Boolean);
-  const names = new Set([name]);
+  const names = [];
   for (const extension of extensions) {
-    names.add(`${name}${extension}`);
-    names.add(`${name}${extension.toLowerCase()}`);
+    // cmd.exe tries the extension as listed, then lower-cased on a
+    // case-insensitive filesystem; both spellings keep the PATHEXT order.
+    names.push(`${name}${extension}`, `${name}${extension.toLowerCase()}`);
   }
-  return [...names];
+  return names;
 }
 
 /**
@@ -66,8 +76,8 @@ function parseVersion(text) {
 }
 
 /** Ask a binary for its version; null when it does not run or does not answer. */
-async function probeVersion(command, env, args = ['--version']) {
-  const result = await runCapture(command, args, { env, timeoutMs: 20_000 });
+async function probeVersion(command, env, args = ['--version'], timeoutMs = 20_000) {
+  const result = await runCapture(command, args, { env, timeoutMs });
   if (!result.ok) {
     return { ok: false, version: null, error: result.error ?? result.stderr.trim() ?? `exit ${result.code}` };
   }
@@ -121,7 +131,8 @@ async function detectDsh(env) {
   // --- npm ------------------------------------------------------------------
   const npmCommand = findExecutable('npm', env);
   if (npmCommand) {
-    const probe = await probeVersion(npmCommand, env);
+    // npm is a .cmd shim on Windows and can be slow to start on a cold machine.
+    const probe = await probeVersion(npmCommand, env, ['--version'], 60_000);
     detection.npm = {
       ...detection.npm,
       available: probe.ok,
@@ -146,7 +157,7 @@ async function detectDsh(env) {
   // --- dsh ------------------------------------------------------------------
   const dshCommand = findExecutable('dsh', env);
   if (dshCommand) {
-    const probe = await probeVersion(dshCommand, env);
+    const probe = await probeVersion(dshCommand, env, ['--version'], 60_000);
     detection.dsh.command = dshCommand;
     detection.dsh.viaPath = true;
     if (probe.ok) {

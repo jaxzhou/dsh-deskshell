@@ -49,6 +49,19 @@ function section(title) {
   console.log(`\n${title}`);
 }
 
+/** `candidateNames` as seen from a faked win32 platform. */
+function candidateNamesForWin(name) {
+  const originalPlatform = process.platform;
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  try {
+    const file = require.resolve('../src/main/dsh-detect.js');
+    delete require.cache[file];
+    return require('../src/main/dsh-detect.js').candidateNames(name);
+  } finally {
+    Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+  }
+}
+
 /** Load `dsh-detect` under a faked win32 platform and resolve `name` on PATH. */
 function findExecutableOnPath(winShellEnv, name, pathValue) {
   const originalPlatform = process.platform;
@@ -378,6 +391,43 @@ section('9. Windows 代码路径（模拟 process.platform = win32）');
     winEnv.guessDirs('C:\\Users\\me').some((dir) => dir.includes('Roaming') && dir.endsWith('npm')),
     winEnv.guessDirs('C:\\Users\\me').join(' | '),
   );
+
+  // The Windows archive ships BOTH `npm` (a POSIX shell wrapper) and
+  // `npm.cmd`; a global npm install likewise writes `dsh`, `dsh.cmd`, `dsh.ps1`.
+  // cmd.exe resolves through PATHEXT only, so the wrapper must never win —
+  // otherwise a perfectly good npm/dsh looks broken and the flow loops.
+  const dualDir = path.join(here, '.tmp-win-dual');
+  mkdirSync(dualDir, { recursive: true });
+  writeFileSync(path.join(dualDir, 'npm'), '#!/bin/sh\n');
+  writeFileSync(path.join(dualDir, 'npm.cmd'), '@echo off\r\n');
+  writeFileSync(path.join(dualDir, 'dsh'), '#!/bin/sh\n');
+  writeFileSync(path.join(dualDir, 'dsh.cmd'), '@echo off\r\n');
+  writeFileSync(path.join(dualDir, 'dsh.ps1'), '# powershell\n');
+  const previousPathext2 = process.env.PATHEXT;
+  process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
+  try {
+    const npmResolved = findExecutableOnPath(null, 'npm', dualDir);
+    check(
+      'Windows 下 npm 解析到 npm.cmd 而不是无扩展名的 shell 包装',
+      String(npmResolved).toLowerCase() === path.join(dualDir, 'npm.cmd').toLowerCase(),
+      String(npmResolved),
+    );
+    const dshResolved = findExecutableOnPath(null, 'dsh', dualDir);
+    check(
+      'Windows 下 dsh 解析到 dsh.cmd 而不是无扩展名的包装',
+      String(dshResolved).toLowerCase() === path.join(dualDir, 'dsh.cmd').toLowerCase(),
+      String(dshResolved),
+    );
+    check(
+      'Windows 候选名遵循 PATHEXT 顺序（.CMD 在最后但不缺）',
+      candidateNamesForWin('npm').join(',') === 'npm.COM,npm.com,npm.EXE,npm.exe,npm.BAT,npm.bat,npm.CMD,npm.cmd',
+      candidateNamesForWin('npm').join(','),
+    );
+  } finally {
+    if (previousPathext2 === undefined) delete process.env.PATHEXT;
+    else process.env.PATHEXT = previousPathext2;
+    rmSync(dualDir, { recursive: true, force: true });
+  }
 
   // PATH scanning with the win32 separator and PATHEXT resolution.
   const binDir = path.join(here, '.tmp-win-bin');
