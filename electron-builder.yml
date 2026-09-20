@@ -41,6 +41,9 @@ win:
         - x64
 
 nsis:
+  # No spaces in the artifact name: it is served straight from a URL
+  # (/download/DSH-D-Setup-0.1.0.exe), matching the site's links.
+  artifactName: ${productName}-Setup-${version}.${ext}
   oneClick: false
   perMachine: false
   allowToChangeInstallationDirectory: true
