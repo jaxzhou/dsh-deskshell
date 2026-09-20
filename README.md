@@ -12,6 +12,9 @@
 
 工具栏只保留当前阶段的主操作（安装 / 取消 / 停止 / 重试），**重新加载、查看日志、浏览器打开、重启/停止 dsh、重新检测等调试与维护操作都收在右上角的「⋮」菜单里**；状态区显示当前状态 + 机器名 + dsh 版本（端口仅在内部使用，不占用界面）。退出应用时会一并结束 dsh 子进程。
 
+> 现成安装包发布在 **<https://dsh.textwork.cn>**（Windows / macOS / Linux），
+> 校验清单：<https://dsh.textwork.cn/download/SHA256SUMS>
+
 ## 快速开始
 
 ```bash
@@ -42,14 +45,14 @@ npx electron-builder --win
 | 文件 | 说明 |
 | --- | --- |
 | `release/mac/DSH-D.app` | macOS 应用包，双击运行 |
-| `release/DSH-D-0.1.0-mac.zip` | macOS 压缩分发版（解压即用） |
-| `release/DSH-D-0.1.0.dmg` | macOS 拖拽安装镜像 |
-| `release/DSH-D Setup 0.1.0.exe` | Windows 安装包（NSIS，可选安装目录、创建桌面快捷方式） |
-| `release/DSH-D-0.1.0-win.zip` | Windows 免安装压缩版（解压后运行 `DSH-D.exe`） |
+| `release/DSH-D-0.1.1-mac.zip` | macOS 压缩分发版（解压即用） |
+| `release/DSH-D-0.1.1.dmg` | macOS 拖拽安装镜像 |
+| `release/DSH-D-Setup-0.1.1.exe` | Windows 安装包（NSIS，可选安装目录、创建桌面快捷方式） |
+| `release/DSH-D-0.1.1-win.zip` | Windows 免安装压缩版（解压后运行 `DSH-D.exe`） |
 | `release/win-unpacked/` | Windows 免安装目录（打包中间产物，可直接运行） |
-| `release/DSH-D-0.1.0.AppImage` | Linux 免安装单文件（chmod +x 后直接运行） |
-| `release/dsh-d_0.1.0_amd64.deb` | Debian/Ubuntu 安装包（自动创建 `/usr/bin/dsh-d` 与桌面项） |
-| `release/dsh-d-0.1.0.tar.gz` | Linux 免安装压缩版 |
+| `release/DSH-D-0.1.1.AppImage` | Linux 免安装单文件（chmod +x 后直接运行） |
+| `release/dsh-d_0.1.1_amd64.deb` | Debian/Ubuntu 安装包（自动创建 `/usr/bin/dsh-d` 与桌面项） |
+| `release/dsh-d-0.1.1.tar.gz` | Linux 免安装压缩版 |
 
 > **DMG 需要联网下载工具**：electron-builder 的 `dmg` 目标会从 GitHub Releases 下载 `dmgbuild` 工具包，无法访问 GitHub 时会失败（`.app` 与 `.zip` 已在失败前生成，可直接使用）。离线替代方案：
 > ```bash
