@@ -2,7 +2,7 @@
   "name": "dsh-d",
   "productName": "DSH-D",
   "desktopName": "dsh-d.desktop",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "Electron desktop shell: detects, installs and runs DeepSeek Harness (dsh), then loads the running dsh Web GUI.",
   "main": "src/main/main.js",

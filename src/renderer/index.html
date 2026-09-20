@@ -12,13 +12,23 @@
   </head>
   <body>
     <div class="app">
-      <!-- Shell toolbar: always on screen, the dsh GUI view is placed below it. -->
+      <!-- 顶栏：品牌 + 大 tab 导航 + 状态 + 操作，同一行内完成 -->
       <header class="toolbar" id="toolbar">
         <div class="brand">
           <span class="brand-glyph" aria-hidden="true">&rsaquo;_</span>
           <span class="brand-name">DSH-D</span>
-          <span class="brand-sub">DeepSeek Harness</span>
         </div>
+
+        <nav class="tabs" id="tabs" role="tablist" aria-label="主导航">
+          <button class="tab is-active" id="tab-dsh" data-tab="dsh" role="tab" aria-selected="true" title="运行中的 DSH Web 界面">
+            <span class="tab-title">DSH 运行信息</span>
+            <span class="tab-sub" id="tabDshSub">未启动</span>
+          </button>
+          <button class="tab" id="tab-market" data-tab="market" role="tab" aria-selected="false" title="外壳自带的插件市场">
+            <span class="tab-title">插件市场</span>
+            <span class="tab-sub" id="tabMarketSub">未加载</span>
+          </button>
+        </nav>
 
         <div class="status" id="status">
           <span class="status-dot" id="statusDot"></span>
@@ -46,19 +56,6 @@
 
         <button class="icon-btn" id="quitBtn" title="退出应用" aria-label="退出应用">✕</button>
       </header>
-
-      <!-- 顶部大 tab：主 tab 展示运行中的 dsh Web，另一个是外壳自己的插件市场 -->
-      <nav class="tabs" id="tabs" role="tablist" aria-label="主导航">
-        <button class="tab is-active" id="tab-dsh" data-tab="dsh" role="tab" aria-selected="true">
-          <span class="tab-title">DSH 运行信息</span>
-          <span class="tab-sub" id="tabDshSub">未启动</span>
-        </button>
-        <button class="tab" id="tab-market" data-tab="market" role="tab" aria-selected="false">
-          <span class="tab-title">插件市场</span>
-          <span class="tab-sub" id="tabMarketSub">未加载</span>
-        </button>
-        <span class="tab-fill"></span>
-      </nav>
 
       <main class="stage" id="stage">
         <!-- 1. 检测中 -->

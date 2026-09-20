@@ -53,10 +53,10 @@ body {
 .toolbar {
   display: flex;
   align-items: center;
-  gap: 14px;
-  height: 56px;
-  min-height: 56px;
-  padding: 0 14px;
+  gap: 12px;
+  height: 64px;
+  min-height: 64px;
+  padding: 0 12px;
   background: linear-gradient(180deg, #131f36 0%, #0f1a2e 100%);
   border-bottom: 1px solid var(--border);
 }
@@ -64,14 +64,15 @@ body {
 .brand {
   display: flex;
   align-items: baseline;
-  gap: 8px;
+  gap: 7px;
+  flex: none;
   min-width: 0;
 }
 
 .brand-glyph {
   font-family: var(--mono);
   font-weight: 700;
-  font-size: 15px;
+  font-size: 14px;
   letter-spacing: -1px;
   color: #fff;
   background: linear-gradient(135deg, #4d8dfd, #7c5cff);
@@ -81,6 +82,7 @@ body {
 
 .brand-name {
   font-weight: 650;
+  font-size: 13px;
   letter-spacing: 0.2px;
 }
 
@@ -96,6 +98,7 @@ body {
   gap: 8px;
   margin-left: auto;
   min-width: 0;
+  overflow: hidden;
 }
 
 .status-dot {
@@ -122,10 +125,11 @@ body {
 
 .status-text {
   color: var(--text-dim);
-  font-size: 13px;
+  font-size: 12.5px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  flex: 0 1 auto;
 }
 
 .status-meta {
@@ -704,12 +708,9 @@ code {
 .tabs {
   display: flex;
   align-items: stretch;
-  gap: 6px;
-  height: 52px;
-  min-height: 52px;
-  padding: 0 12px;
-  background: #0d1728;
-  border-bottom: 1px solid var(--border);
+  gap: 4px;
+  height: 100%;
+  flex: none;
 }
 
 .tab {
@@ -721,11 +722,10 @@ code {
   flex-direction: column;
   justify-content: center;
   gap: 1px;
-  padding: 0 18px;
-  min-width: 150px;
+  padding: 0 16px;
+  min-width: 136px;
   cursor: pointer;
   border-bottom: 2px solid transparent;
-  border-radius: 8px 8px 0 0;
   font-family: inherit;
   text-align: left;
 }
@@ -738,13 +738,18 @@ code {
 .tab.is-active {
   color: var(--text);
   border-bottom-color: var(--accent);
-  background: linear-gradient(180deg, rgba(77, 141, 253, 0.16), rgba(77, 141, 253, 0));
+  background: linear-gradient(180deg, rgba(77, 141, 253, 0.14), rgba(77, 141, 253, 0));
 }
 
 .tab-title {
-  font-size: 14px;
+  font-size: 13.5px;
+}
+
+.tab-title {
+  font-size: 13.5px;
   font-weight: 600;
   letter-spacing: 0.2px;
+  white-space: nowrap;
 }
 
 .tab-sub {
@@ -755,10 +760,6 @@ code {
 
 .tab.is-active .tab-sub {
   color: #8fb8ff;
-}
-
-.tab-fill {
-  flex: 1 1 auto;
 }
 
 /* ------------------------------------------------------------- 插件市场 */

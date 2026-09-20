@@ -840,9 +840,9 @@ el.logToggle.addEventListener('click', () => {
 
 // Keep the embedded GUI view aligned with our own toolbar height.
 function reportInset() {
-  const toolbar = el.toolbar.getBoundingClientRect().height;
-  const tabs = el.tabs.getBoundingClientRect().height;
-  const height = Math.round(toolbar + tabs);
+  // The tabs live inside the top bar now, so the embedded view starts right
+  // below that single row.
+  const height = Math.round(el.toolbar.getBoundingClientRect().height);
   if (height > 0) api.setViewInset({ top: height });
 }
 
