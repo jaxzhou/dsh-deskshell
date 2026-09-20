@@ -47,6 +47,19 @@
         <button class="icon-btn" id="quitBtn" title="退出应用" aria-label="退出应用">✕</button>
       </header>
 
+      <!-- 顶部大 tab：主 tab 展示运行中的 dsh Web，另一个是外壳自己的插件市场 -->
+      <nav class="tabs" id="tabs" role="tablist" aria-label="主导航">
+        <button class="tab is-active" id="tab-dsh" data-tab="dsh" role="tab" aria-selected="true">
+          <span class="tab-title">DSH 运行信息</span>
+          <span class="tab-sub" id="tabDshSub">未启动</span>
+        </button>
+        <button class="tab" id="tab-market" data-tab="market" role="tab" aria-selected="false">
+          <span class="tab-title">插件市场</span>
+          <span class="tab-sub" id="tabMarketSub">未加载</span>
+        </button>
+        <span class="tab-fill"></span>
+      </nav>
+
       <main class="stage" id="stage">
         <!-- 1. 检测中 -->
         <section class="panel" data-phase="checking">
@@ -204,6 +217,35 @@
             </div>
           </div>
         </section>
+
+        <!-- 8. 插件市场（外壳自身的功能，独立于 dsh） -->
+        <section class="panel panel-market" data-market-panel="market">
+          <div class="market">
+            <header class="market-head">
+              <div class="market-title">
+                <h2>插件市场</h2>
+                <p class="muted small" id="marketMeta">正在读取目录…</p>
+              </div>
+              <div class="market-head-actions">
+                <button class="btn" data-action="market-refresh">刷新目录</button>
+                <button class="btn" data-action="market-open-site">打开站点</button>
+              </div>
+            </header>
+
+            <div class="market-banner" id="marketBanner" hidden></div>
+            <div class="market-stats" id="marketStats"></div>
+            <div class="market-list" id="marketList">
+              <div class="market-placeholder">正在加载插件目录…</div>
+            </div>
+
+            <details class="market-local" id="marketLocal">
+              <summary>本地已安装插件（<span id="localCount">0</span>）</summary>
+              <div class="local-list" id="localList"></div>
+              <p class="muted small" id="profileHint"></p>
+            </details>
+          </div>
+        </section>
+
       </main>
 
       <!-- 日志面板：安装 / 启动 / 排错时最有用 -->

@@ -41,6 +41,17 @@ contextBridge.exposeInMainWorld('dshShell', {
   reloadGui: () => ipcRenderer.invoke('dsh:reload-gui'),
   /** Show/hide the embedded GUI (hidden = read the shell's log panel). */
   setGuiVisible: (visible) => ipcRenderer.invoke('dsh:set-gui-visible', visible),
+  /** Switch the shell's top tab: 'dsh' (embedded Web) or 'market'. */
+  setActiveTab: (tab) => ipcRenderer.invoke('dsh:set-active-tab', tab),
+
+  /** Plugin market: catalog merged with the installed state. */
+  loadMarket: () => ipcRenderer.invoke('market:load'),
+  /** Plugin market: what the dsh profile has installed right now. */
+  installedPlugins: () => ipcRenderer.invoke('market:installed'),
+  /** Install or update one plugin (progress via onState/onLog). */
+  installPlugin: (payload) => ipcRenderer.invoke('market:install', payload),
+  /** Cancel an in-flight plugin install/update. */
+  cancelPlugin: () => ipcRenderer.invoke('market:cancel'),
   /** Open a URL (or the current GUI URL) in the system browser. */
   openExternal: (url) => ipcRenderer.invoke('dsh:open-external', url),
   /** Tell main where the shell's own toolbar ends, so the GUI view sits below it. */

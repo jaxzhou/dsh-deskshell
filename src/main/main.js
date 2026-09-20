@@ -10,6 +10,7 @@
 
 const path = require('node:path');
 const fs = require('node:fs');
+const http = require('node:http');
 
 const { BrowserWindow, WebContentsView, app, ipcMain, shell } = require('electron');
 
@@ -45,6 +46,8 @@ let guiAttached = false;
 let guiInset = { top: DEFAULT_INSET_TOP };
 let guiLoadedUrl = null;
 let guiHiddenByUser = false;
+/** Which shell tab is showing: the embedded dsh Web view, or the market. */
+let activeTab = 'dsh';
 let quitRequested = false;
 
 // ------------------------------------------------------------------- helpers
@@ -140,18 +143,29 @@ function loadGui(url) {
   guiView.webContents.loadURL(url).catch((error) => reportError('加载 DSH 界面失败', error));
 }
 
-/** Reflect the shell phase onto the embedded GUI view. */
+/**
+ * The embedded dsh Web view is shown only on the DSH tab, while dsh runs, and
+ * when the user has not hidden it to read the log panel.
+ */
+function shouldShowEmbedded(state) {
+  return Boolean(
+    state?.phase === 'running' && state.server?.url && activeTab === 'dsh' && !guiHiddenByUser,
+  );
+}
+
+/** Reflect the shell tab + phase onto the embedded GUI view. */
 function syncGuiView(state) {
-  if (state.phase === 'running' && state.server?.url) {
+  if (shouldShowEmbedded(state)) {
     attachGuiView();
     loadGui(state.server.url);
-    // The user asked to read the log panel: keep the GUI hidden until they return.
-    if (guiHiddenByUser) guiView.setVisible(false);
+    guiView.setVisible(true);
     return;
   }
   detachGuiView();
-  guiHiddenByUser = false;
-  guiLoadedUrl = null;
+  if (state?.phase !== 'running') {
+    guiHiddenByUser = false;
+    guiLoadedUrl = null;
+  }
 }
 
 // -------------------------------------------------------------------- window
@@ -272,6 +286,44 @@ function registerIpc() {
 
   ipcMain.handle('dsh:set-gui-visible', (_event, visible) => setGuiVisible(Boolean(visible)));
 
+  ipcMain.handle('dsh:set-active-tab', (_event, tab) => {
+    activeTab = tab === 'market' ? 'market' : 'dsh';
+    // Switching tabs is what reveals the market or the dsh Web view.
+    syncGuiView(controller.getState());
+    return activeTab;
+  });
+
+  ipcMain.handle('market:load', async () => {
+    try {
+      return await controller.getMarket();
+    } catch (error) {
+      reportError('读取插件市场失败', error);
+      return { ok: false, error: error instanceof Error ? error.message : String(error), rows: [], localOnly: [] };
+    }
+  });
+
+  ipcMain.handle('market:installed', () => {
+    try {
+      return controller.getInstalledPlugins();
+    } catch (error) {
+      reportError('读取已安装插件失败', error);
+      return { profile: controller.profile, plugins: [], error: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('market:install', (_event, payload) => {
+    // Fire and forget: progress arrives through the state stream.
+    controller
+      .installPlugin({ packageName: payload?.packageName, version: payload?.version ?? null })
+      .catch((error) => reportError('安装插件失败', error));
+    return controller.getState();
+  });
+
+  ipcMain.handle('market:cancel', () => {
+    controller.cancelPluginAction();
+    return controller.getState();
+  });
+
   ipcMain.handle('dsh:open-external', (_event, url) => {
     const target = typeof url === 'string' && url ? url : controller.serverUrl;
     return openExternal(target);
@@ -313,8 +365,14 @@ async function runSelfTest() {
       'typeof window.dshShell === "object" && typeof window.dshShell.getState === "function"',
     );
     record('preload 已注入 window.dshShell', bridge === true);
-    const panels = await win.webContents.executeJavaScript('document.querySelectorAll(".panel").length');
-    record('界面面板已渲染（含运行时配置面板）', panels === 8, `panels=${panels}`);
+    const panelCount = await win.webContents.executeJavaScript(
+      '({ phases: document.querySelectorAll(".panel[data-phase]").length, market: document.querySelectorAll(".panel-market").length })',
+    );
+    record(
+      '界面面板已渲染（8 个阶段面板 + 市场面板）',
+      panelCount.phases === 8 && panelCount.market === 1,
+      JSON.stringify(panelCount),
+    );
     const phase = await win.webContents.executeJavaScript('window.dshShell.getState().then((state) => state.phase)');
     record('渲染进程可读取状态', typeof phase === 'string', String(phase));
     const inset = await win.webContents.executeJavaScript('window.dshShell.setViewInset({ top: 64 }).then((v) => v.top)');
@@ -392,6 +450,109 @@ async function runSelfTest() {
       !layout.meta.includes('51234') && !layout.statusText.includes('51234'),
       `${layout.statusText} | ${layout.meta}`,
     );
+
+    console.log('5. 顶部 tab 与插件市场');
+    const tabs = await win.webContents.executeJavaScript(
+      'Array.from(document.querySelectorAll(".tab[data-tab]")).map((t) => t.dataset.tab)',
+    );
+    record('顶部有两个大 tab', tabs.join(',') === 'dsh,market', tabs.join(','));
+    const initialPanels = await win.webContents.executeJavaScript(
+      '({ dsh: document.querySelector(".panel[data-phase].active")?.dataset.phase ?? null, market: document.querySelector(".panel-market").classList.contains("active") })',
+    );
+    record('默认停在 DSH tab', initialPanels.market === false && Boolean(initialPanels.dsh), JSON.stringify(initialPanels));
+
+    // A fixture catalog (served locally) keeps this test off the network.
+    const fixtureCatalog = {
+      schemaVersion: 1,
+      updatedAt: '2026-09-20',
+      plugins: [
+        { name: 'dsh-file-explorer', package: '@jaxzhou/dsh-file-explorer', version: '0.1.5', summary: '文件标签', tags: ['文件'], license: 'MIT' },
+        { name: 'dsh-mathmatic-symbol', package: '@jaxzhou/dsh-mathmatic-symbol', version: '0.1.2', summary: '公式图形', tags: ['公式'], license: 'MIT' },
+      ],
+    };
+    const marketServer = http.createServer((_request, response) => {
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify(fixtureCatalog));
+    });
+    await new Promise((resolve) => marketServer.listen(0, '127.0.0.1', resolve));
+    const marketPort = marketServer.address().port;
+
+    // The controller is only asked for the market here; nothing is installed.
+    let installedFixtureVersion = '0.1.4';
+    controller.marketUrl = `http://127.0.0.1:${marketPort}/plugins/index.json`;
+    controller.runReadInstalled = () => ({
+      profile: 'web',
+      dir: '/tmp/self-test/profiles/web',
+      exists: true,
+      bundles: ['@jaxzhou/dsh-file-explorer'],
+      plugins: [
+        { package: '@jaxzhou/dsh-file-explorer', name: 'dsh-file-explorer', spec: installedFixtureVersion, source: 'registry', version: installedFixtureVersion, bundle: true },
+        { package: '@jaxzhou/dsh-proxy-client', name: 'dsh-proxy-client', spec: '0.4.1', source: 'registry', version: '0.4.1', bundle: true },
+      ],
+      error: null,
+    });
+
+    const marketView = await win.webContents.executeJavaScript(`(async () => {
+      document.getElementById('tab-market').click();
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      return {
+        active: document.querySelector('.panel-market').classList.contains('active'),
+        dshPanelHidden: document.querySelector('.panel[data-phase].active') === null,
+        cards: document.querySelectorAll('.plugin-card').length,
+        localRows: document.querySelectorAll('.local-row').length,
+        sub: document.getElementById('tabMarketSub').textContent,
+        stats: document.getElementById('marketStats').textContent,
+        updateButtons: Array.from(document.querySelectorAll('.plugin-card button[data-action="plugin-install"]')).map((b) => b.textContent),
+      };
+    })()`);
+    record('切到插件市场后阶段面板隐藏', marketView.active === true && marketView.dshPanelHidden === true, JSON.stringify(marketView));
+    record('内嵌 dsh 视图在市场上隐藏', !guiView || guiView.getVisible() === false);
+    record('市场渲染目录卡片', marketView.cards === 2, `cards=${marketView.cards}`);
+    record('市场展示本地已装插件', marketView.localRows === 2, `localRows=${marketView.localRows}`);
+    record('市场 tab 副标题含统计', /可更新/.test(marketView.sub), marketView.sub);
+    record('有更新的插件显示更新按钮', marketView.updateButtons.some((text) => /更新/.test(text)), JSON.stringify(marketView.updateButtons));
+
+    const marketData = await controller.getMarket();
+    record('目录与本地状态合并正确', marketData.ok && marketData.rows.length === 2 && marketData.updates === 1, JSON.stringify({ ok: marketData.ok, updates: marketData.updates }));
+    record('目录外本地插件单列', marketData.localOnly.length === 1 && marketData.localOnly[0].package === '@jaxzhou/dsh-proxy-client');
+
+    // Install path with stubbed collaborators: no pnpm, no dsh, no restart.
+    controller.detection = {
+      dsh: { installed: true, version: '0.1.5-rc.2', command: '/nonexistent/dsh', error: null },
+      node: { available: true, version: 'v24.0.0' },
+      npm: { available: true, version: '11.0.0', command: '/nonexistent/npm' },
+    };
+    controller.runEnsurePnpm = async () => ({ ok: true, command: '/nonexistent/pnpm', installed: false, error: null });
+    let pluginCommands = 0;
+    controller.runPluginCommand = () => {
+      pluginCommands += 1;
+      return { promise: Promise.resolve({ ok: true, code: 0, output: 'added 1 package', error: null }), cancel: () => {} };
+    };
+    let restartCalls = 0;
+    const originalRestart = controller.restart.bind(controller);
+    controller.restart = async () => {
+      restartCalls += 1;
+      return undefined;
+    };
+
+    const installResult = await controller.installPlugin({ packageName: '@jaxzhou/dsh-file-explorer', version: '0.1.5' });
+    installedFixtureVersion = '0.1.5';
+    record('市场安装调用 dsh plugin', pluginCommands === 1 && installResult.ok === true, JSON.stringify(installResult));
+    record('安装后自动重启 dsh（刷新 DSH Web）', restartCalls === 1, `restartCalls=${restartCalls}`);
+    record('安装完成后状态收敛', controller.getState().pluginAction?.ok === true);
+
+    const backToDsh = await win.webContents.executeJavaScript(`(async () => {
+      document.getElementById('tab-dsh').click();
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      return {
+        market: document.querySelector('.panel-market').classList.contains('active'),
+        dsh: document.querySelector('.panel[data-phase].active')?.dataset.phase ?? null,
+      };
+    })()`);
+    record('切回 DSH tab 恢复阶段面板', backToDsh.market === false && backToDsh.dsh !== null, JSON.stringify(backToDsh));
+
+    controller.restart = originalRestart;
+    await new Promise((resolve) => marketServer.close(resolve));
 
     await controller.dispose();
     const failed = results.filter((item) => !item.ok).length;
@@ -531,6 +692,86 @@ async function runUiCapture() {
     fs.writeFileSync(target, image.toPNG());
     console.log(`captured ${target} (${image.getSize().width}x${image.getSize().height})`);
   }
+
+  // Plugin market: render a synthetic catalog so the capture is deterministic
+  // (no network, no dependence on what happens to be installed).
+  const marketFixture = {
+    meta: { profile: 'web', updatedAt: '2026-09-20', source: 'https://dsh.textwork.cn/plugins/index.json' },
+    installed: { profile: 'web', dir: '~/.dsh/profiles/web', exists: true, plugins: [] },
+    rows: [
+      {
+        package: '@jaxzhou/dsh-file-explorer',
+        name: 'dsh-file-explorer',
+        version: '0.1.5',
+        summary: '给 Harness 增加一个与「对话」「轨迹」并列的「文件」标签：左侧是工作区目录树，右侧按文件类型决定预览形态。',
+        highlights: ['Markdown 渲染（GFM）、JSON 树、24 种语法高亮、图片与纯文本预览', 'HTML 在沙箱 iframe 中绘制，预览不执行脚本', '导出 PDF / Word；只读、无需配置、不落任何数据'],
+        tags: ['文件', '预览', '工作区'],
+        license: 'MIT',
+        homepage: 'https://dsh.textwork.cn/plugins/dsh-file-explorer/',
+        repository: 'https://github.com/jaxzhou/dsh-file-explorer',
+        local: { package: '@jaxzhou/dsh-file-explorer', version: '0.1.4', bundle: true, source: 'registry', spec: '0.1.4' },
+        status: 'update-available',
+      },
+      {
+        package: '@jaxzhou/dsh-mathmatic-symbol',
+        name: 'dsh-mathmatic-symbol',
+        version: '0.1.2',
+        summary: '给 agent 四个工具，把公式与图形变成可以直接放进报告、幻灯片、Word、PDF 的图片。',
+        highlights: ['math_formula / math_figure / math_convert / math_document', '产物是自带字形轮廓的 SVG（不依赖字体）+ 可选 PNG'],
+        tags: ['公式', '图形', '导出'],
+        license: 'MIT',
+        homepage: 'https://dsh.textwork.cn/plugins/dsh-mathmatic-symbol/',
+        repository: 'https://github.com/jaxzhou/dsh-mathmatic-symbol',
+        local: null,
+        status: 'not-installed',
+      },
+    ],
+    localOnly: [
+      { package: '@jaxzhou/dsh-proxy-client', name: 'dsh-proxy-client', version: '0.4.1', spec: '0.4.1', source: 'registry', bundle: true },
+    ],
+  };
+  const runningSample = samples.find((sample) => sample.state.phase === 'running');
+  const runningState = { hostname: base.hostname, ...(runningSample?.state ?? { phase: 'running', statusText: 'DSH 已启动' }) };
+  await win.webContents.executeJavaScript(
+    `(() => {
+       window.resetLog(${JSON.stringify(runningSample?.state?.logs ?? [])});
+       market.loaded = true; market.loading = false; market.error = null;
+       market.rows = ${JSON.stringify(marketFixture.rows)};
+       market.localOnly = ${JSON.stringify(marketFixture.localOnly)};
+       market.meta = ${JSON.stringify(marketFixture.meta)};
+       market.installed = ${JSON.stringify(marketFixture.installed)};
+       window.render(${JSON.stringify(runningState)});
+       window.switchTab('market');
+       return true;
+     })()`,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  {
+    const image = await win.webContents.capturePage();
+    const target = path.join(outDir, '08-market.png');
+    fs.writeFileSync(target, image.toPNG());
+    console.log(`captured ${target} (${image.getSize().width}x${image.getSize().height})`);
+  }
+
+  // Installing state: banner with progress + disabled buttons.
+  await win.webContents.executeJavaScript(
+    `(() => {
+       const installed = { ...market.installed };
+       window.render({ ...${JSON.stringify(runningState)}, pluginAction: { running: true, packages: '@jaxzhou/dsh-file-explorer', version: '0.1.5', step: '正在安装 @jaxzhou/dsh-file-explorer@0.1.5', profile: 'web' } });
+       return true;
+     })()`,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  {
+    const image = await win.webContents.capturePage();
+    const target = path.join(outDir, '09-market-installing.png');
+    fs.writeFileSync(target, image.toPNG());
+    console.log(`captured ${target} (${image.getSize().width}x${image.getSize().height})`);
+  }
+
+  // Back to the DSH tab for the menu capture below.
+  await win.webContents.executeJavaScript(`window.switchTab('dsh'); window.render(${JSON.stringify(runningState)}); true;`);
+  await new Promise((resolve) => setTimeout(resolve, 250));
 
   // The ⋮ menu is a surface of its own: capture it open.
   const running = samples.find((sample) => sample.state.phase === 'running');

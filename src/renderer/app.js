@@ -44,6 +44,19 @@ const el = {
   errorTitle: document.getElementById('errorTitle'),
   errorMessage: document.getElementById('errorMessage'),
   errorHint: document.getElementById('errorHint'),
+  tabs: document.getElementById('tabs'),
+  tabButtons: [...document.querySelectorAll('.tab[data-tab]')],
+  tabDshSub: document.getElementById('tabDshSub'),
+  tabMarketSub: document.getElementById('tabMarketSub'),
+  marketPanel: document.querySelector('.panel-market'),
+  marketMeta: document.getElementById('marketMeta'),
+  marketBanner: document.getElementById('marketBanner'),
+  marketStats: document.getElementById('marketStats'),
+  marketList: document.getElementById('marketList'),
+  marketLocal: document.getElementById('marketLocal'),
+  localCount: document.getElementById('localCount'),
+  localList: document.getElementById('localList'),
+  profileHint: document.getElementById('profileHint'),
   logPanel: document.getElementById('logPanel'),
   logToggle: document.getElementById('logToggle'),
   logBody: document.getElementById('logBody'),
@@ -113,6 +126,253 @@ function formatDuration(ms) {
   return minutes > 0 ? `${minutes} 分 ${String(seconds).padStart(2, '0')} 秒` : `${seconds} 秒`;
 }
 
+
+// ------------------------------------------------------------------ 插件市场
+
+/** Sub-label of the DSH tab (kept short — it sits under the title). */
+function describeDshTab(next) {
+  if (!next) return '未启动';
+  const phaseLabels = {
+    checking: '检测中',
+    'no-node': '缺少运行时',
+    'installing-node': '配置运行时',
+    'missing-dsh': '未安装 dsh',
+    installing: '安装 dsh',
+    'ready-to-start': '待启动',
+    starting: '启动中',
+    running: '运行中',
+    error: '出错',
+  };
+  const label = phaseLabels[next.phase] ?? next.phase ?? '未启动';
+  const port = next.server?.port;
+  return next.phase === 'running' && port ? `${label} · :${port}` : label;
+}
+
+/** Sub-label of the market tab. */
+function describeMarketTab() {
+  if (market.loading) return '加载中…';
+  if (market.error) return '加载失败';
+  if (!market.loaded) return '未加载';
+  const updates = market.rows.filter((row) => row.status === 'update-available').length;
+  return updates ? `${market.rows.length} 个插件 · ${updates} 个可更新` : `${market.rows.length} 个插件`;
+}
+
+/** Fetch the catalog + installed state and re-render the market tab. */
+async function loadMarket() {
+  market.loading = true;
+  market.error = null;
+  if (state) render(state);
+  try {
+    const data = await api.loadMarket();
+    market.loaded = true;
+    if (data?.ok === false) market.error = data.error ?? '目录加载失败';
+    market.rows = Array.isArray(data?.rows) ? data.rows : [];
+    market.localOnly = Array.isArray(data?.localOnly) ? data.localOnly : [];
+    market.installed = data?.installed ?? null;
+    market.meta = {
+      source: data?.source ?? null,
+      updatedAt: data?.updatedAt ?? null,
+      fetchedAt: data?.fetchedAt ?? null,
+      profile: data?.profile ?? null,
+    };
+  } catch (error) {
+    market.loaded = true;
+    market.error = error?.message ?? String(error);
+  } finally {
+    market.loading = false;
+    if (state) render(state);
+  }
+}
+
+/** React once when a plugin install/update finishes, to refresh versions. */
+function trackPluginAction(next) {
+  const action = next?.pluginAction;
+  if (!action || action.running) return;
+  const id = `${action.packages}@${action.finishedAt ?? action.step}`;
+  if (handledPluginAction === id) return;
+  handledPluginAction = id;
+  if (action.ok) loadMarket();
+}
+
+function elWith(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text != null) node.textContent = text;
+  return node;
+}
+
+const STATUS_TEXT = {
+  'not-installed': () => '未安装',
+  installed: (row) => `已安装 v${row.local?.version ?? '?'}（已是最新）`,
+  'update-available': (row) => `已安装 v${row.local?.version ?? '?'} → 可更新到 v${row.version}`,
+  'installed-unknown-version': () => '已安装（版本未知）',
+};
+
+/** Build one catalog card. Text goes through textContent: it is remote input. */
+function pluginCard(row) {
+  const card = elWith('article', 'plugin-card');
+
+  const header = elWith('header');
+  header.append(elWith('h3', null, row.name || row.package));
+  header.append(elWith('span', 'pkg', row.package));
+  header.append(elWith('span', 'version', `v${row.version}`));
+  card.append(header);
+
+  if (row.summary) card.append(elWith('p', 'summary', row.summary));
+
+  if (Array.isArray(row.highlights) && row.highlights.length) {
+    const list = elWith('ul', 'highlights');
+    for (const item of row.highlights) list.append(elWith('li', null, item));
+    card.append(list);
+  }
+
+  if (Array.isArray(row.tags) && row.tags.length) {
+    const tags = elWith('div', 'plugin-tags');
+    for (const tag of row.tags) tags.append(elWith('span', 'plugin-tag', tag));
+    card.append(tags);
+  }
+
+  const footer = elWith('footer');
+  const statusKind = row.status === 'update-available' ? 'is-update' : row.status === 'not-installed' ? 'is-missing' : 'is-installed';
+  footer.append(elWith('span', `plugin-status ${statusKind}`, (STATUS_TEXT[row.status] ?? (() => row.status))(row)));
+
+  const action = activePluginAction();
+  const busy = Boolean(action && action.packages === row.package);
+
+  if (row.status === 'not-installed') {
+    footer.append(pluginButton('安装', 'plugin-install', row, false, busy));
+  } else if (row.status === 'update-available') {
+    footer.append(pluginButton(`更新到 v${row.version}`, 'plugin-install', row, true, busy));
+  }
+
+  const link = row.homepage || row.npm;
+  if (link) {
+    const button = elWith('button', 'btn btn-ghost', '详情');
+    button.dataset.action = 'plugin-open';
+    button.dataset.url = link;
+    footer.append(button);
+  }
+  if (row.repository) {
+    const button = elWith('button', 'btn btn-ghost', '源码');
+    button.dataset.action = 'plugin-open';
+    button.dataset.url = row.repository;
+    footer.append(button);
+  }
+
+  card.append(footer);
+  return card;
+}
+
+function pluginButton(label, action, row, primary, busy) {
+  const button = elWith('button', primary ? 'btn btn-primary' : 'btn', label);
+  button.dataset.action = action;
+  button.dataset.package = row.package;
+  button.dataset.version = row.version;
+  if (busy) {
+    button.disabled = true;
+    button.textContent = '处理中…';
+  }
+  return button;
+}
+
+/** The plugin action currently in flight, if any. */
+function activePluginAction() {
+  const action = state?.pluginAction;
+  return action && action.running ? action : null;
+}
+
+/** Progress / result banner for the running or last plugin action. */
+function renderPluginBanner(next) {
+  const action = next?.pluginAction;
+  if (!action) {
+    el.marketBanner.hidden = true;
+    return;
+  }
+  el.marketBanner.hidden = false;
+  el.marketBanner.className = 'market-banner';
+  el.marketBanner.replaceChildren();
+
+  if (action.running) {
+    const spinner = elWith('span', 'spinner');
+    spinner.setAttribute('aria-hidden', 'true');
+    el.marketBanner.append(spinner);
+    el.marketBanner.append(elWith('span', null, `${action.step ?? '处理中'} — ${action.packages}`));
+    const cancel = elWith('button', 'btn btn-ghost', '取消');
+    cancel.dataset.action = 'plugin-cancel';
+    el.marketBanner.append(cancel);
+    return;
+  }
+
+  el.marketBanner.classList.add(action.ok ? 'is-ok' : 'is-error');
+  const version = action.version ? `@${action.version}` : '';
+  el.marketBanner.append(
+    elWith('span', null, action.ok
+      ? `${action.packages}${version} 已就绪，DSH 已重启并刷新界面`
+      : `插件操作失败：${action.error ?? '未知错误'}`),
+  );
+  const dismiss = elWith('button', 'btn btn-ghost', '知道了');
+  dismiss.dataset.action = 'plugin-dismiss';
+  el.marketBanner.append(dismiss);
+}
+
+/** Render the whole market tab from the cached catalog + live shell state. */
+function renderMarket(next) {
+  renderPluginBanner(next);
+
+  const meta = market.meta ?? {};
+  const parts = [];
+  if (meta.profile) parts.push(`profile ${meta.profile}`);
+  if (meta.updatedAt) parts.push(`目录更新于 ${meta.updatedAt}`);
+  if (meta.source) parts.push(meta.source);
+  setText(el.marketMeta, parts.length ? parts.join(' · ') : '正在读取目录…');
+
+  const installed = market.installed;
+  const updates = market.rows.filter((row) => row.status === 'update-available').length;
+  const installedCount = market.rows.filter((row) => row.local).length + market.localOnly.length;
+  el.marketStats.replaceChildren();
+  const stats = [
+    ['目录插件', String(market.rows.length)],
+    ['已安装', String(installedCount)],
+    ['可更新', String(updates)],
+  ];
+  if (installed && installed.exists === false) stats.push(['profile', '未初始化']);
+  for (const [label, value] of stats) {
+    const item = elWith('span');
+    item.append(elWith('b', null, value), document.createTextNode(` ${label}`));
+    el.marketStats.append(item);
+  }
+
+  el.marketList.replaceChildren();
+  if (market.loading && !market.rows.length) {
+    el.marketList.append(elWith('div', 'market-placeholder', '正在加载插件目录…'));
+  } else if (market.error && !market.rows.length) {
+    el.marketList.append(elWith('div', 'market-placeholder', `目录加载失败：${market.error}`));
+  } else if (!market.rows.length) {
+    el.marketList.append(elWith('div', 'market-placeholder', '目录中暂无插件'));
+  } else {
+    for (const row of market.rows) el.marketList.append(pluginCard(row));
+  }
+
+  setText(el.localCount, market.rows.filter((row) => row.local).length + market.localOnly.length);
+  setText(el.profileHint, installed?.dir ? `插件安装位置：${installed.dir}` : '');
+  el.localList.replaceChildren();
+  const localPlugins = [
+    ...market.rows.filter((row) => row.local).map((row) => ({ ...row.local, catalog: row })),
+    ...market.localOnly,
+  ];
+  if (!localPlugins.length) {
+    el.localList.append(elWith('div', 'muted small', installed?.error ?? '尚未安装任何插件'));
+  }
+  for (const plugin of localPlugins) {
+    const row = elWith('div', 'local-row');
+    row.append(elWith('span', 'name', plugin.name ?? plugin.package));
+    row.append(elWith('span', 'ver', plugin.version ? `v${plugin.version}` : '版本未知'));
+    row.append(elWith('span', 'src', plugin.spec ? `${plugin.source}: ${plugin.spec}` : '未在依赖中登记'));
+    row.append(elWith('span', 'bundle', plugin.bundle ? '已启用' : '未启用'));
+    el.localList.append(row);
+  }
+}
+
 // ---------------------------------------------------------------- log panel
 
 let logNodes = 0;
@@ -164,6 +424,22 @@ function resetLog(entries = []) {
   setText(el.logCount, logNodes);
 }
 
+// -------------------------------------------------------------------- tabs
+
+/** Switch the top tab and tell main, which shows/hides the embedded dsh view. */
+function switchTab(tab) {
+  activeTab = tab === 'market' ? 'market' : 'dsh';
+  for (const button of el.tabButtons) {
+    const active = button.dataset.tab === activeTab;
+    button.classList.toggle('is-active', active);
+    button.setAttribute('aria-selected', String(active));
+  }
+  if (activeTab === 'market' && !market.loaded && !market.loading) loadMarket();
+  api.setActiveTab(activeTab).catch(() => {});
+  if (state) render(state);
+  reportInset();
+}
+
 // ------------------------------------------------------------ toolbar actions
 
 const ACTION_SPECS = {
@@ -194,6 +470,13 @@ const ACTION_SPECS = {
 
 /** True while the user reads the log panel instead of the embedded GUI. */
 let guiHidden = false;
+
+/** Active shell tab: `dsh` shows the embedded Web view, `market` the market. */
+let activeTab = 'dsh';
+/** Last plugin action id we already reacted to, so a finished install reloads once. */
+let handledPluginAction = null;
+/** Catalog + installed state rendered by the market tab. */
+const market = { loading: false, loaded: false, error: null, rows: [], localOnly: [], installed: null, meta: null };
 
 /**
  * The only button that stays inline is the phase's primary call to action.
@@ -292,6 +575,7 @@ function openMenu(open) {
 function render(next) {
   const previousPhase = state?.phase ?? null;
   state = next;
+  trackPluginAction(next);
 
   const phase = PHASES.includes(next.phase) ? next.phase : 'checking';
 
@@ -303,12 +587,16 @@ function render(next) {
     if (phase !== 'running') guiHidden = false;
   }
 
+  const showPhasePanel = activeTab === 'dsh';
   for (const [name, panel] of el.panels) {
-    panel.classList.toggle('active', name === phase);
+    panel.classList.toggle('active', showPhasePanel && name === phase);
   }
+  el.marketPanel.classList.toggle('active', activeTab === 'market');
 
   // --- status strip: machine name + dsh version (the port stays internal) ---
   setText(el.statusText, next.statusText ?? '');
+  setText(el.tabDshSub, describeDshTab(next));
+  setText(el.tabMarketSub, describeMarketTab());
   const meta = [];
   if (next.hostname) meta.push(next.hostname);
   if (next.detection?.dsh?.installed && next.detection.dsh.version) meta.push(`dsh ${next.detection.dsh.version}`);
@@ -357,6 +645,8 @@ function render(next) {
     setText(el.startingText, next.statusText ?? '等待 dsh 打印 Web 服务地址');
   }
 
+  if (activeTab === 'market') renderMarket(next);
+
   if (phase === 'error' && next.error) {
     setText(el.errorTitle, next.statusText ?? '操作失败');
     setText(el.errorMessage, next.error.message ?? '');
@@ -404,6 +694,18 @@ const ACTIONS = {
     renderToolbarActions(state?.phase ?? 'running');
   },
   'open-browser': () => api.openExternal(),
+  'market-refresh': () => loadMarket(),
+  'market-open-site': () => api.openExternal('https://dsh.textwork.cn/plugins/'),
+  'plugin-install': (button) =>
+    api.installPlugin({ packageName: button.dataset.package, version: button.dataset.version || null }),
+  'plugin-open': (button) => api.openExternal(button.dataset.url),
+  'plugin-cancel': () => api.cancelPlugin(),
+  'plugin-dismiss': () => {
+    if (state) {
+      state = { ...state, pluginAction: null };
+      render(state);
+    }
+  },
   'open-nodejs': () => api.openExternal('https://nodejs.org/zh-cn/download'),
   'copy-cmd': (button) => copyText(button, document.getElementById('installCmd')?.textContent ?? ''),
   'copy-log': (button) =>
@@ -476,6 +778,11 @@ document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') openMenu(false);
 });
 
+el.tabs.addEventListener('click', (event) => {
+  const button = event.target.closest('.tab[data-tab]');
+  if (button) switchTab(button.dataset.tab);
+});
+
 el.quitBtn.addEventListener('click', () => api.quit());
 
 el.logToggle.addEventListener('click', () => {
@@ -485,7 +792,9 @@ el.logToggle.addEventListener('click', () => {
 
 // Keep the embedded GUI view aligned with our own toolbar height.
 function reportInset() {
-  const height = Math.round(el.toolbar.getBoundingClientRect().height);
+  const toolbar = el.toolbar.getBoundingClientRect().height;
+  const tabs = el.tabs.getBoundingClientRect().height;
+  const height = Math.round(toolbar + tabs);
   if (height > 0) api.setViewInset({ top: height });
 }
 
@@ -493,6 +802,7 @@ function reportInset() {
 
 api.onState(render);
 api.onLog(appendLog);
+api.setActiveTab('dsh').catch(() => {});
 
 window.addEventListener('resize', reportInset);
 window.addEventListener('load', reportInset);

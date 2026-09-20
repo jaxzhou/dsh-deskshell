@@ -29,6 +29,7 @@ const { installDsh } = require('../src/main/dsh-install.js');
 const { DshServer, extractReadyUrl } = require('../src/main/dsh-server.js');
 const { ShellController } = require('../src/main/controller.js');
 const nodeRuntime = require('../src/main/node-runtime.js');
+const market = require('../src/main/plugin-market.js');
 
 let passed = 0;
 let failed = 0;
@@ -795,6 +796,245 @@ section('11. 控制器：缺少 Node 时自动配置运行时');
 
   await controller.dispose();
   await failing.dispose();
+}
+
+section('12. 插件市场 (plugin-market)');
+{
+  // --- version comparison -------------------------------------------------
+  const versionCases = [
+    ['0.1.5', '0.1.5', 0],
+    ['0.1.5', '0.1.4', 1],
+    ['0.2.0', '0.1.9', 1],
+    ['1.0.0', '0.9.9', 1],
+    ['v1.2.3', '1.2.3', 0],
+    ['1.0.0+build.5', '1.0.0', 0],
+    ['1.0.0-rc.1', '1.0.0', -1],
+    ['1.0.0-alpha.2', '1.0.0-alpha.10', -1],
+    ['1.0.0-alpha', '1.0.0-alpha.1', -1],
+  ];
+  for (const [a, b, expected] of versionCases) {
+    check(`版本比较 ${a} vs ${b} → ${expected}`, market.compareVersions(a, b) === expected, String(market.compareVersions(a, b)));
+  }
+
+  // --- command-line safety -----------------------------------------------
+  check('合法包名通过', market.isSafePackageName('@jaxzhou/dsh-file-explorer') && market.isSafePackageName('dsh-proxy-client'));
+  check(
+    '危险包名被拒（目录穿越/命令注入/空）',
+    ['../../etc/passwd', '@scope/pkg; rm -rf /', 'a b', '$(whoami)', '', null, 'pkg@1.0.0'].every(
+      (name) => market.isSafePackageName(name) === false,
+    ),
+  );
+  check('版本号校验（含 dist-tag 与预发布）', market.isSafeVersion('0.1.5') && market.isSafeVersion('latest') && market.isSafeVersion('1.0.0-rc.1'));
+  check('危险版本号被拒', ['$(x)', 'a b', '1.0.0; rm', ''].every((v) => market.isSafeVersion(v) === false));
+
+  // --- catalog parsing ----------------------------------------------------
+  const catalogPayload = JSON.stringify({
+    schemaVersion: 1,
+    updatedAt: '2026-09-20',
+    site: 'https://dsh.textwork.cn',
+    plugins: [
+      {
+        name: 'dsh-file-explorer',
+        package: '@jaxzhou/dsh-file-explorer',
+        version: '0.1.5',
+        summary: '文件标签',
+        highlights: ['a', 'b'],
+        tags: ['文件'],
+        license: 'MIT',
+        homepage: 'https://dsh.textwork.cn/plugins/dsh-file-explorer/',
+      },
+      { package: '../../evil', version: '1.0.0', name: 'evil' },
+      { package: '@jaxzhou/dsh-mathmatic-symbol', version: '0.1.2' },
+    ],
+  });
+  const parsed = market.parseCatalog(catalogPayload);
+  check('目录解析保留合法条目', parsed.plugins.length === 2, `plugins=${parsed.plugins.length}`);
+  check('目录解析丢弃非法条目', parsed.plugins.every((p) => market.isSafePackageName(p.package)));
+  check('目录解析保留版本与元数据', parsed.plugins[0].version === '0.1.5' && parsed.plugins[0].license === 'MIT' && parsed.updatedAt === '2026-09-20');
+  check('目录缺少 plugins 时报错', (() => {
+    try {
+      market.parseCatalog('{"schemaVersion":1}');
+      return false;
+    } catch {
+      return true;
+    }
+  })());
+  check('目录非法 JSON 时报错', (() => {
+    try {
+      market.parseCatalog('not json');
+      return false;
+    } catch {
+      return true;
+    }
+  })());
+
+  // --- installed plugins from a profile fixture --------------------------
+  const dshHome = path.join(here, '.tmp-dsh-home');
+  const profileDir = path.join(dshHome, 'profiles', 'web');
+  mkdirSync(path.join(profileDir, 'node_modules', '@jaxzhou', 'dsh-file-explorer'), { recursive: true });
+  writeFileSync(
+    path.join(profileDir, 'package.json'),
+    JSON.stringify({
+      name: 'dsh-profile-web',
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@jaxzhou/dsh-file-explorer', '@jaxzhou/dsh-proxy-client'] } },
+      dependencies: {
+        '@deepseek-ai/dsh-base': '^1.0.0',
+        '@jaxzhou/dsh-file-explorer': 'link:/tmp/local/explorer',
+        '@jaxzhou/dsh-proxy-client': '0.4.1',
+      },
+    }),
+  );
+  writeFileSync(path.join(profileDir, 'node_modules', '@jaxzhou', 'dsh-file-explorer', 'package.json'), JSON.stringify({ name: '@jaxzhou/dsh-file-explorer', version: '0.1.4' }));
+
+  const installed = market.readInstalledPlugins({ dshHome, profile: 'web' });
+  check('读取已装插件（排除内置层）', installed.exists && installed.plugins.length === 2, `plugins=${installed.plugins.length}`);
+  check('已装版本来自 node_modules', installed.plugins.find((p) => p.package === '@jaxzhou/dsh-file-explorer')?.version === '0.1.4');
+  check('未安装依赖版本为未知', installed.plugins.find((p) => p.package === '@jaxzhou/dsh-proxy-client')?.version === null);
+  check('识别 link: 依赖来源', installed.plugins.find((p) => p.package === '@jaxzhou/dsh-file-explorer')?.source === 'link');
+  check('标记是否为启用的 bundle', installed.plugins.every((p) => p.bundle === true));
+  check('profile 不存在时报告错误而非抛异常', market.readInstalledPlugins({ dshHome: '/nope', profile: 'web' }).exists === false);
+
+  // --- merge catalog with installed --------------------------------------
+  const merged = market.marketRows(parsed, installed);
+  check('未安装插件标记 not-installed', merged.rows.find((r) => r.package === '@jaxzhou/dsh-mathmatic-symbol')?.status === 'not-installed');
+  check('旧版本标记 update-available', merged.rows.find((r) => r.package === '@jaxzhou/dsh-file-explorer')?.status === 'update-available');
+  check('统计可更新数量', merged.updates === 1, `updates=${merged.updates}`);
+  check('目录外的本地插件单列', merged.localOnly.some((p) => p.package === '@jaxzhou/dsh-proxy-client') && merged.localOnly.length === 1);
+
+  const upToDate = market.marketRows(parsed, {
+    plugins: [{ package: '@jaxzhou/dsh-file-explorer', version: '0.1.5', bundle: true, name: 'x' }],
+  });
+  check('同版本标记 installed', upToDate.rows.find((r) => r.package === '@jaxzhou/dsh-file-explorer')?.status === 'installed');
+
+  // --- command construction ----------------------------------------------
+  check(
+    '构造安装参数（带版本）',
+    market.buildPluginArgs({ packageName: '@jaxzhou/dsh-file-explorer', version: '0.1.5' }).join(' ') ===
+      'plugin --profile web add @jaxzhou/dsh-file-explorer@0.1.5',
+    market.buildPluginArgs({ packageName: '@jaxzhou/dsh-file-explorer', version: '0.1.5' }).join(' '),
+  );
+  check('构造安装参数（不带版本）', market.buildPluginArgs({ packageName: 'dsh-x', profile: 'tui' }).join(' ') === 'plugin --profile tui add dsh-x');
+  check('非法包名构造时抛错', (() => {
+    try {
+      market.buildPluginArgs({ packageName: '../evil' });
+      return false;
+    } catch {
+      return true;
+    }
+  })());
+
+  // --- pnpm bootstrap -----------------------------------------------------
+  const pnpmOk = await market.ensurePnpm({ env: {}, npmCommand: '/usr/bin/npm', locate: () => '/usr/bin/pnpm' });
+  check('已有 pnpm 时不重复安装', pnpmOk.ok && pnpmOk.installed === false && pnpmOk.command === '/usr/bin/pnpm');
+
+  let locateCalls = 0;
+  const installs = [];
+  const pnpmInstalled = await market.ensurePnpm({
+    env: {},
+    npmCommand: '/usr/bin/npm',
+    locate: () => (locateCalls++ === 0 ? null : '/managed/bin/pnpm'),
+    run: async (command, args) => {
+      installs.push([command, ...args].join(' '));
+      return { ok: true, code: 0, stdout: '', stderr: '', error: null };
+    },
+  });
+  check('缺少 pnpm 时用 npm 自动安装', pnpmInstalled.ok && pnpmInstalled.installed === true, pnpmInstalled.error ?? '');
+  check('安装命令为 npm install -g pnpm', installs[0]?.startsWith('/usr/bin/npm install -g pnpm'), String(installs[0]));
+  const pnpmFailed = await market.ensurePnpm({
+    env: {},
+    npmCommand: null,
+    locate: () => null,
+  });
+  check('无 npm 可用时给出可读错误', pnpmFailed.ok === false && /pnpm/.test(pnpmFailed.error), String(pnpmFailed.error));
+
+  rmSync(dshHome, { recursive: true, force: true });
+}
+
+section('13. 插件安装流程（控制器，注入协作者）');
+{
+  const fakeDsh = path.join(fixtures, 'fake-dsh.sh');
+  let installedVersion = '0.1.4';
+  const controller = new ShellController({
+    cwd: here,
+    profile: 'web',
+    detect: async () => ({
+      checkedAt: new Date().toISOString(),
+      platform: process.platform,
+      arch: process.arch,
+      packageName: DSH_PACKAGE,
+      node: { available: true, version: 'v24.21.0', command: '/tmp/node', error: null },
+      npm: { available: true, version: '11.19.0', command: '/tmp/npm', error: null, globalRoot: '/tmp/nm', globalBin: '/tmp/bin' },
+      dsh: { installed: true, version: '0.1.5-rc.2', command: fakeDsh, error: null, packageManifest: null, viaPath: true },
+    }),
+    ensurePnpm: async (options) => {
+      options.onLog?.({ stream: 'system', line: 'pnpm 已就绪' });
+      return { ok: true, command: '/tmp/pnpm', installed: false, error: null };
+    },
+    readInstalled: () => ({
+      profile: 'web',
+      dir: '/tmp/dsh/profiles/web',
+      exists: true,
+      bundles: ['@jaxzhou/dsh-file-explorer'],
+      plugins: [{ package: '@jaxzhou/dsh-file-explorer', name: 'dsh-file-explorer', spec: installedVersion, source: 'registry', version: installedVersion, bundle: true }],
+      error: null,
+    }),
+    pluginCommand: (options) => {
+      options.onLog({ stream: 'stdout', line: 'Progress: resolved 1, reused 0, downloaded 1, added 1' });
+      return {
+        promise: Promise.resolve({ ok: true, code: 0, output: 'added 1 package', error: null }),
+        cancel: () => {},
+      };
+    },
+    startDelayMs: 10,
+  });
+
+  // dsh is already installed: run it so a restart has something to restart.
+  await controller.check({ autostart: true });
+  const before = await waitForPhase(controller, 'running');
+  check('插件操作前 dsh 处于运行中', before.phase === 'running', before.phase);
+
+  // Stub the restart so the test does not spawn a second dsh, but record it.
+  let restarts = 0;
+  const realRestart = controller.restart.bind(controller);
+  controller.restart = async () => {
+    restarts += 1;
+    return realRestart();
+  };
+
+  const steps = [];
+  controller.on('state', (snapshot) => {
+    const step = snapshot.pluginAction?.step;
+    if (step && steps.at(-1) !== step) steps.push(step);
+  });
+
+  const result = await controller.installPlugin({ packageName: '@jaxzhou/dsh-file-explorer', version: '0.1.5' });
+  installedVersion = '0.1.5';
+  check('安装返回成功', result.ok === true, result.error ?? '');
+  check('安装后自动重启 dsh（刷新 DSH Web）', restarts === 1, `restarts=${restarts}`);
+  check('过程步骤可见（含重启）', steps.includes('检查 pnpm') && steps.some((s) => s.includes('正在安装')) && steps.includes('重启 dsh 以加载插件'), steps.join(' → '));
+  const action = controller.getState().pluginAction;
+  check('动作状态收敛为完成', action.running === false && action.ok === true && action.step === '完成', JSON.stringify(action));
+
+  const after = await waitForPhase(controller, 'running');
+  check('重启后 dsh 仍在运行', after.phase === 'running', after.phase);
+  check('已装版本随之更新', controller.getInstalledPlugins().plugins[0].version === '0.1.5');
+
+  // Reject unsafe input without touching anything.
+  const rejected = await controller.installPlugin({ packageName: '../../etc/passwd' });
+  check('拒绝非法包名', rejected.ok === false && /非法/.test(rejected.error ?? ''), String(rejected.error));
+
+  // Failure path: no restart, error surfaced.
+  controller.runPluginCommand = () => ({
+    promise: Promise.resolve({ ok: false, code: 1, output: 'ERR_PNPM_FETCH_404  Not found', error: 'dsh plugin 退出码 1' }),
+    cancel: () => {},
+  });
+  const restartsBefore = restarts;
+  const failed = await controller.installPlugin({ packageName: '@jaxzhou/dsh-mathmatic-symbol', version: '0.1.2' });
+  check('安装失败时返回错误', failed.ok === false && /404|退出码/.test(failed.error ?? ''), String(failed.error));
+  check('安装失败时不会重启 dsh', restarts === restartsBefore, `restarts=${restarts}`);
+  check('失败状态暴露给界面', controller.getState().pluginAction.ok === false);
+
+  await controller.dispose();
 }
 
 // --------------------------------------------------------------------- summary

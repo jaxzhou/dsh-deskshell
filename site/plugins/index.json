@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-09-20",
+  "site": "https://dsh.textwork.cn",
+  "profile": "web",
+  "note": "DSH-D 插件市场目录。本文件由仓库维护并发布到 https://dsh.textwork.cn/plugins/index.json；插件均为 DeepSeek Harness（dsh）插件，安装到 dsh profile。",
+  "plugins": [
+    {
+      "name": "dsh-file-explorer",
+      "package": "@jaxzhou/dsh-file-explorer",
+      "version": "0.1.5",
+      "summary": "给 Harness 增加一个与「对话」「轨迹」并列的「文件」标签：左侧是工作区目录树，右侧按文件类型决定预览形态。",
+      "highlights": [
+        "Markdown 渲染（GFM）、JSON 树、24 种语法高亮、图片与纯文本预览",
+        "HTML 在沙箱 iframe 中绘制，预览不执行脚本",
+        "导出 PDF / Word；只读、无需配置、不落任何数据"
+      ],
+      "tags": ["文件", "预览", "工作区"],
+      "license": "MIT",
+      "author": "jaxzhou",
+      "npm": "https://www.npmjs.com/package/@jaxzhou/dsh-file-explorer",
+      "repository": "https://github.com/jaxzhou/dsh-file-explorer",
+      "homepage": "https://dsh.textwork.cn/plugins/dsh-file-explorer/",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "dsh-mathmatic-symbol",
+      "package": "@jaxzhou/dsh-mathmatic-symbol",
+      "version": "0.1.2",
+      "summary": "给 agent 四个工具，把公式与图形变成可以直接放进报告、幻灯片、Word、PDF 的图片。",
+      "highlights": [
+        "math_formula / math_figure / math_convert / math_document",
+        "产物是自带字形轮廓的 SVG（不依赖字体）+ 可选 PNG",
+        "同时返回 Markdown / HTML / LaTeX 嵌入片段"
+      ],
+      "tags": ["公式", "图形", "导出"],
+      "license": "MIT",
+      "author": "jaxzhou",
+      "npm": "https://www.npmjs.com/package/@jaxzhou/dsh-mathmatic-symbol",
+      "repository": "https://github.com/jaxzhou/dsh-mathmatic-symbol",
+      "homepage": "https://dsh.textwork.cn/plugins/dsh-mathmatic-symbol/",
+      "minShell": "0.1.2"
+    }
+  ]
+}

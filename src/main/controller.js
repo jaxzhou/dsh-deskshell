@@ -27,6 +27,18 @@ const {
   nodeMajor,
   verifyManagedRuntime,
 } = require('./node-runtime');
+const {
+  DEFAULT_MARKET_URL,
+  DEFAULT_PROFILE,
+  buildPluginArgs,
+  defaultDshHome,
+  ensurePnpm,
+  fetchCatalog,
+  isSafePackageName,
+  marketRows,
+  readInstalledPlugins,
+  runPluginCommand,
+} = require('./plugin-market');
 const { resolveShellEnv } = require('./shell-env');
 
 /** How many log lines to keep for a freshly-mounted renderer. */
@@ -60,6 +72,19 @@ class ShellController extends EventEmitter {
     this.detect = options.detect ?? detectDsh;
     this.runInstall = options.install ?? installDsh;
     this.runProvisionRuntime = options.provisionRuntime ?? installNodeRuntime;
+
+    /** dsh profile the shell boots; market plugins are installed into it. */
+    this.profile = options.profile ?? (String(process.env.DSH_D_PROFILE ?? '').trim() || DEFAULT_PROFILE);
+    /** Market collaborators, injectable so the flow is testable without network/pnpm. */
+    this.marketUrl = options.marketUrl ?? (String(process.env.DSH_D_MARKET_URL ?? '').trim() || DEFAULT_MARKET_URL);
+    this.runFetchCatalog = options.fetchCatalog ?? fetchCatalog;
+    this.runReadInstalled = options.readInstalled ?? readInstalledPlugins;
+    this.runEnsurePnpm = options.ensurePnpm ?? ensurePnpm;
+    this.runPluginCommand = options.pluginCommand ?? runPluginCommand;
+    /** @type {object|null} current plugin install/update, surfaced to the UI. */
+    this.pluginAction = null;
+    /** @type {{cancel: () => void}|null} */
+    this.pluginHandle = null;
 
     /** Set once a managed runtime exists; its bin dir leads every PATH we build. */
     this.managedRuntime = null;
@@ -124,6 +149,9 @@ class ShellController extends EventEmitter {
         startedAt: this.server?.startedAt ?? null,
       },
       error: this.error,
+      profile: this.profile,
+      marketUrl: this.marketUrl,
+      pluginAction: this.pluginAction,
       logs: this.logs.slice(-LOG_REPLAY),
     };
   }
@@ -249,6 +277,167 @@ class ShellController extends EventEmitter {
 
     if (autostart) await this.start();
     return detection;
+  }
+
+  // ------------------------------------------------------------ plugin market
+
+  /** What the dsh profile currently has installed. */
+  getInstalledPlugins() {
+    return this.runReadInstalled({
+      dshHome: defaultDshHome(this.env ?? process.env),
+      profile: this.profile,
+    });
+  }
+
+  /** Fetch the market catalog and merge it with the installed state. */
+  async getMarket() {
+    const [catalog, installed] = await Promise.all([
+      this.runFetchCatalog({ url: this.marketUrl }),
+      Promise.resolve(this.getInstalledPlugins()),
+    ]);
+    const merged = marketRows(catalog.ok ? catalog.catalog : null, installed);
+    return {
+      ok: catalog.ok,
+      error: catalog.ok ? null : catalog.error,
+      source: catalog.source,
+      fetchedAt: catalog.fetchedAt ?? null,
+      updatedAt: catalog.ok ? catalog.catalog.updatedAt : null,
+      profile: this.profile,
+      installed,
+      ...merged,
+    };
+  }
+
+  /**
+   * Install or update one plugin, then restart dsh so the new layer loads.
+   *
+   * `dsh plugin` forwards to pnpm in the profile directory and reconciles
+   * `dsh.profile.bundles`; the bundle is only read at boot, so a restart is
+   * what actually makes the plugin appear — and that restart is also what
+   * refreshes the embedded DSH Web view.
+   *
+   * @param {{packageName: string, version?: string|null}} options
+   */
+  async installPlugin(options = {}) {
+    const packageName = String(options.packageName ?? '');
+    const version = options.version ? String(options.version) : null;
+
+    if (this.pluginAction?.running) return { ok: false, error: '已有插件操作正在进行' };
+    if (!isSafePackageName(packageName)) {
+      return { ok: false, error: `非法的包名：${packageName || '(空)'}` };
+    }
+
+    if (!this.detection?.dsh?.installed) await this.check({ autostart: false });
+    if (!this.detection?.dsh?.installed) {
+      this.pushLog({ stream: 'stderr', line: '尚未安装 dsh，无法管理插件' });
+      return { ok: false, error: '尚未安装 dsh，请先完成 dsh 安装' };
+    }
+
+    const args = buildPluginArgs({ profile: this.profile, packageName, version });
+    const started = Date.now();
+    const setStep = (step, extra = {}) => {
+      this.pluginAction = { ...this.pluginAction, ...extra, step, running: true };
+      this.broadcast();
+    };
+
+    this.pluginAction = {
+      running: true,
+      packages: packageName,
+      version,
+      profile: this.profile,
+      step: '准备',
+      ok: null,
+      error: null,
+      startedAt: started,
+    };
+    this.broadcast();
+    this.pushLog({ stream: 'system', line: `插件操作：${args.join(' ')}` });
+
+    const onLog = (entry) => this.pushLog(entry);
+
+    // dsh plugin needs pnpm; a runtime we provisioned only ships npm.
+    setStep('检查 pnpm');
+    const pnpm = await this.runEnsurePnpm({
+      env: this.env ?? process.env,
+      npmCommand: this.detection.npm?.command ?? null,
+      onLog,
+    });
+    if (!pnpm.ok) {
+      return this.#failPlugin(pnpm.error ?? 'pnpm 不可用', started);
+    }
+
+    setStep(version ? `正在安装 ${packageName}@${version}` : `正在安装 ${packageName}`);
+    const handle = this.runPluginCommand({
+      dshCommand: this.detection.dsh.command,
+      args,
+      env: this.env ?? process.env,
+      cwd: this.cwd,
+      onLog,
+    });
+    this.pluginHandle = handle;
+
+    let result;
+    try {
+      result = await handle.promise;
+    } catch (error) {
+      result = { ok: false, error: error instanceof Error ? error.message : String(error), output: '' };
+    }
+    this.pluginHandle = null;
+
+    if (!result.ok) {
+      const tail = String(result.output ?? '').trim().split('\n').slice(-3).join(' / ');
+      return this.#failPlugin([result.error, tail].filter(Boolean).join(' — ') || '安装失败', started);
+    }
+
+    // The plugin only becomes an active layer at boot: restart dsh, which also
+    // reloads the embedded DSH Web view.
+    setStep('重启 dsh 以加载插件');
+    this.pushLog({ stream: 'system', line: '插件已写入 profile，正在重启 dsh 使插件生效…' });
+    await this.restart();
+
+    const installed = this.getInstalledPlugins();
+    const entry = installed.plugins.find((plugin) => plugin.package === packageName) ?? null;
+    this.pluginAction = {
+      running: false,
+      packages: packageName,
+      version: entry?.version ?? version,
+      profile: this.profile,
+      step: '完成',
+      ok: true,
+      error: null,
+      startedAt: started,
+      finishedAt: Date.now(),
+    };
+    this.pushLog({
+      stream: 'system',
+      line: `插件已就绪：${packageName}${entry?.version ? `@${entry.version}` : ''}（dsh 已重启，界面已刷新）`,
+    });
+    this.broadcast();
+    return { ok: true, plugin: entry };
+  }
+
+  /** @private Record a plugin failure and surface it to the UI. */
+  #failPlugin(message, started) {
+    this.pluginAction = {
+      ...(this.pluginAction ?? { packages: '', profile: this.profile }),
+      running: false,
+      step: '失败',
+      ok: false,
+      error: message,
+      startedAt: started,
+      finishedAt: Date.now(),
+    };
+    this.pushLog({ stream: 'stderr', line: `插件操作失败：${message}` });
+    this.broadcast();
+    return { ok: false, error: message };
+  }
+
+  /** Cancel an in-flight plugin install. */
+  cancelPluginAction() {
+    if (!this.pluginHandle) return;
+    this.pushLog({ stream: 'system', line: '用户取消了插件操作' });
+    this.pluginHandle.cancel();
+    this.broadcast();
   }
 
   // ------------------------------------------------------------------ runtime
@@ -627,6 +816,14 @@ class ShellController extends EventEmitter {
         /* already gone */
       }
       this.runtimeHandle = null;
+    }
+    if (this.pluginHandle) {
+      try {
+        this.pluginHandle.cancel();
+      } catch {
+        /* already gone */
+      }
+      this.pluginHandle = null;
     }
     const server = this.server;
     this.server = null;
