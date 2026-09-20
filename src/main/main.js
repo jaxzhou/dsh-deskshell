@@ -324,6 +324,15 @@ function registerIpc() {
     return controller.getState();
   });
 
+  ipcMain.handle('market:setup-pnpm', async () => {
+    try {
+      await controller.setupPnpm();
+    } catch (error) {
+      reportError('配置 pnpm 失败', error);
+    }
+    return controller.getState();
+  });
+
   ipcMain.handle('dsh:open-external', (_event, url) => {
     const target = typeof url === 'string' && url ? url : controller.serverUrl;
     return openExternal(target);
@@ -541,6 +550,58 @@ async function runSelfTest() {
     record('安装后自动重启 dsh（刷新 DSH Web）', restartCalls === 1, `restartCalls=${restartCalls}`);
     record('安装完成后状态收敛', controller.getState().pluginAction?.ok === true);
 
+    // Market identifies the dsh it acts on (path + profile dir + pnpm).
+    const runtimeLine = await win.webContents.executeJavaScript(`(async () => {
+      document.getElementById('tab-market').click();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      return { runtime: document.getElementById('marketRuntime').textContent, meta: document.getElementById('marketMeta').textContent };
+    })()`);
+    record(
+      '市场显示 profile 目录与 dsh 路径',
+      /profiles[\\/]web/.test(runtimeLine.runtime) && /dsh/.test(runtimeLine.runtime),
+      runtimeLine.runtime,
+    );
+
+    // Missing pnpm must be visible and one click away from being fixed.
+    // (Clear the previous install's result banner so this check is unambiguous.)
+    controller.pluginAction = null;
+    controller.detection = { ...controller.detection, pnpm: { available: false, version: null, command: null, error: 'PATH 中未找到 pnpm' } };
+    controller.pnpmError = '自检：pnpm 不可用';
+    controller.broadcast();
+    const pnpmWarning = await win.webContents.executeJavaScript(`(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const banner = document.getElementById('marketBanner');
+      return {
+        visible: !banner.hidden,
+        text: banner.textContent,
+        hasSetup: Boolean(banner.querySelector('button[data-action="market-setup-pnpm"]')),
+        runtime: document.getElementById('marketRuntime').textContent,
+      };
+    })()`);
+    record('pnpm 不可用时市场给出告警', pnpmWarning.visible === true && /pnpm/.test(pnpmWarning.text), pnpmWarning.text);
+    record('告警提供自动配置入口', pnpmWarning.hasSetup === true);
+    record('运行信息行标出 pnpm 不可用', /pnpm 不可用/.test(pnpmWarning.runtime), pnpmWarning.runtime);
+
+    let setupCalls = 0;
+    controller.setupPnpm = async () => {
+      setupCalls += 1;
+      controller.detection = { ...controller.detection, pnpm: { available: true, version: '9.9.9', command: '/tmp/pnpm', error: null } };
+      controller.pnpmError = null;
+      controller.broadcast();
+      return { ok: true };
+    };
+    await win.webContents.executeJavaScript(`(async () => {
+      document.querySelector('button[data-action="market-setup-pnpm"]').click();
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      return true;
+    })()`);
+    record('点击后触发 pnpm 配置', setupCalls === 1, `setupCalls=${setupCalls}`);
+    const afterSetup = await win.webContents.executeJavaScript(
+      `({ hidden: document.getElementById('marketBanner').hidden, runtime: document.getElementById('marketRuntime').textContent })`,
+    );
+    record('配置成功后告警消失', afterSetup.hidden === true, JSON.stringify(afterSetup));
+    record('运行信息行更新为 pnpm 可用', /pnpm 9\.9\.9|pnpm 可用/.test(afterSetup.runtime), afterSetup.runtime);
+
     const backToDsh = await win.webContents.executeJavaScript(`(async () => {
       document.getElementById('tab-dsh').click();
       await new Promise((resolve) => setTimeout(resolve, 250));
@@ -697,6 +758,7 @@ async function runUiCapture() {
   // (no network, no dependence on what happens to be installed).
   const marketFixture = {
     meta: { profile: 'web', updatedAt: '2026-09-20', source: 'https://dsh.textwork.cn/plugins/index.json' },
+    runtime: { profileDir: '~/.dsh/profiles/web', command: '/Users/you/.nvm/versions/node/v24.18.0/bin/dsh', version: '0.1.5-rc.2', private: false },
     installed: { profile: 'web', dir: '~/.dsh/profiles/web', exists: true, plugins: [] },
     rows: [
       {
@@ -739,8 +801,9 @@ async function runUiCapture() {
        market.rows = ${JSON.stringify(marketFixture.rows)};
        market.localOnly = ${JSON.stringify(marketFixture.localOnly)};
        market.meta = ${JSON.stringify(marketFixture.meta)};
+       market.runtime = ${JSON.stringify(marketFixture.runtime)};
        market.installed = ${JSON.stringify(marketFixture.installed)};
-       window.render(${JSON.stringify(runningState)});
+       window.render({ ...${JSON.stringify(runningState)}, pnpm: { available: true, version: '12.5.1', command: '/usr/bin/pnpm', error: null } });
        window.switchTab('market');
        return true;
      })()`,

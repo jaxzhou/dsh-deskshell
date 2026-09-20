@@ -50,6 +50,8 @@ const el = {
   tabMarketSub: document.getElementById('tabMarketSub'),
   marketPanel: document.querySelector('.panel-market'),
   marketMeta: document.getElementById('marketMeta'),
+  marketRuntime: document.getElementById('marketRuntime'),
+  runtimeTitle: document.getElementById('runtimeTitle'),
   marketBanner: document.getElementById('marketBanner'),
   marketStats: document.getElementById('marketStats'),
   marketList: document.getElementById('marketList'),
@@ -109,6 +111,13 @@ function detectionRows(detection, runtime) {
     detection.dsh.installed ? `${detection.dsh.version ?? '未知版本'}` : '未安装',
     detection.dsh.installed ? 'ok' : 'bad',
   ]);
+  if (detection.pnpm) {
+    rows.push([
+      'pnpm',
+      detection.pnpm.available ? `${detection.pnpm.version ?? '可用'}` : '未安装（插件市场需要）',
+      detection.pnpm.available ? 'ok' : 'bad',
+    ]);
+  }
   if (detection.dsh.command) rows.push(['dsh 路径', detection.dsh.command]);
   if (runtime?.dir) {
     rows.push(['托管运行时', `Node.js ${runtime.version ?? '?'} · ${runtime.dir}`]);
@@ -175,6 +184,8 @@ async function loadMarket() {
       fetchedAt: data?.fetchedAt ?? null,
       profile: data?.profile ?? null,
     };
+    market.runtime = data?.dshRuntime ?? null;
+    market.pnpm = data?.pnpm ?? null;
   } catch (error) {
     market.loaded = true;
     market.error = error?.message ?? String(error);
@@ -284,22 +295,41 @@ function activePluginAction() {
 /** Progress / result banner for the running or last plugin action. */
 function renderPluginBanner(next) {
   const action = next?.pluginAction;
-  if (!action) {
-    el.marketBanner.hidden = true;
-    return;
-  }
+  const pnpm = next?.pnpm;
+
   el.marketBanner.hidden = false;
   el.marketBanner.className = 'market-banner';
   el.marketBanner.replaceChildren();
 
-  if (action.running) {
+  // Priority: work in flight, then a blocker, then the last result. A missing
+  // pnpm outranks a "finished" notice because it needs a decision from the user.
+  if (action?.running || (pnpm?.installing && !action?.running)) {
     const spinner = elWith('span', 'spinner');
     spinner.setAttribute('aria-hidden', 'true');
     el.marketBanner.append(spinner);
-    el.marketBanner.append(elWith('span', null, `${action.step ?? '处理中'} — ${action.packages}`));
+    const label = action?.running
+      ? `${action.step ?? '处理中'} — ${action.packages}`
+      : `正在配置 pnpm — ${pnpm?.error ?? '插件市场依赖'}`;
+    el.marketBanner.append(elWith('span', null, label));
     const cancel = elWith('button', 'btn btn-ghost', '取消');
-    cancel.dataset.action = 'plugin-cancel';
+    cancel.dataset.action = action?.running ? 'plugin-cancel' : 'plugin-dismiss';
     el.marketBanner.append(cancel);
+    return;
+  }
+
+  if (pnpm && pnpm.available === false) {
+    el.marketBanner.classList.add('is-error');
+    el.marketBanner.append(
+      elWith('span', null, `插件安装需要 pnpm：${pnpm.failedReason ?? pnpm.error ?? '未检测到 pnpm'}`),
+    );
+    const setup = elWith('button', 'btn btn-ghost', '自动配置 pnpm');
+    setup.dataset.action = 'market-setup-pnpm';
+    el.marketBanner.append(setup);
+    return;
+  }
+
+  if (!action) {
+    el.marketBanner.hidden = true;
     return;
   }
 
@@ -321,10 +351,21 @@ function renderMarket(next) {
 
   const meta = market.meta ?? {};
   const parts = [];
-  if (meta.profile) parts.push(`profile ${meta.profile}`);
   if (meta.updatedAt) parts.push(`目录更新于 ${meta.updatedAt}`);
   if (meta.source) parts.push(meta.source);
   setText(el.marketMeta, parts.length ? parts.join(' · ') : '正在读取目录…');
+
+  // Which dsh and which profile the market is acting on: a private install or a
+  // custom DSH_HOME makes this the difference between "works" and "installs
+  // somewhere else", so it is always on screen.
+  const runtimeInfo = market.runtime ?? {};
+  const runtimeParts = [];
+  if (runtimeInfo.profileDir) runtimeParts.push(`profile ${runtimeInfo.profileDir}`);
+  if (runtimeInfo.command) runtimeParts.push(`dsh ${runtimeInfo.command}${runtimeInfo.version ? ` (v${runtimeInfo.version})` : ''}`);
+  if (runtimeInfo.private) runtimeParts.push('私有安装');
+  const pnpm = next.pnpm;
+  if (pnpm) runtimeParts.push(pnpm.available ? `pnpm ${pnpm.version ?? '可用'}` : 'pnpm 不可用');
+  setText(el.marketRuntime, runtimeParts.join(' · '));
 
   const installed = market.installed;
   const updates = market.rows.filter((row) => row.status === 'update-available').length;
@@ -476,7 +517,7 @@ let activeTab = 'dsh';
 /** Last plugin action id we already reacted to, so a finished install reloads once. */
 let handledPluginAction = null;
 /** Catalog + installed state rendered by the market tab. */
-const market = { loading: false, loaded: false, error: null, rows: [], localOnly: [], installed: null, meta: null };
+const market = { loading: false, loaded: false, error: null, rows: [], localOnly: [], installed: null, meta: null, runtime: null, pnpm: null };
 
 /**
  * The only button that stays inline is the phase's primary call to action.
@@ -627,6 +668,9 @@ function render(next) {
   }
 
   const runtime = next.runtime;
+  if (phase === 'installing-node') {
+    setText(el.runtimeTitle, next.statusText || '正在配置运行环境');
+  }
   if (phase === 'installing-node' && runtime) {
     setText(el.runtimePercent, `${runtime.percent ?? 0}%`);
     el.runtimeBar.style.width = `${runtime.percent ?? 0}%`;
@@ -700,6 +744,10 @@ const ACTIONS = {
     api.installPlugin({ packageName: button.dataset.package, version: button.dataset.version || null }),
   'plugin-open': (button) => api.openExternal(button.dataset.url),
   'plugin-cancel': () => api.cancelPlugin(),
+  'market-setup-pnpm': async () => {
+    await api.setupPnpm();
+    await loadMarket();
+  },
   'plugin-dismiss': () => {
     if (state) {
       state = { ...state, pluginAction: null };

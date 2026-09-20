@@ -42,10 +42,55 @@ const VERSION_PATTERN = /^[0-9A-Za-z][0-9A-Za-z.+-]*$/;
 const CATALOG_TIMEOUT_MS = 20_000;
 const INSTALL_TIMEOUT_MS = 15 * 60_000;
 
-/** Where dsh keeps its profiles (`$DSH_HOME` or `~/.dsh`). */
-function defaultDshHome(env = process.env) {
+/**
+ * Home directory as the spawned dsh would see it.
+ *
+ * dsh resolves its home through `os.homedir()`, which on Windows reads
+ * `USERPROFILE` (and `HOMEDRIVE`+`HOMEPATH`) rather than `HOME`. Reading the
+ * market's profile from *our* process home while dsh runs with another one is
+ * exactly how installed plugins end up looking missing, so the environment we
+ * hand to dsh is the single source of truth here.
+ */
+function homedirOf(env = process.env) {
+  if (IS_WINDOWS) {
+    const profile = String(env.USERPROFILE ?? '').trim();
+    if (profile) return profile;
+    const drive = String(env.HOMEDRIVE ?? '').trim();
+    const rest = String(env.HOMEPATH ?? '').trim();
+    if (drive && rest) return `${drive}${rest}`;
+  }
+  const home = String(env.HOME ?? '').trim();
+  return home || os.homedir();
+}
+
+/** Expand the `~`, `~/` and `~\\` prefixes dsh accepts in configured paths. */
+function expandHomePath(value, home) {
+  const text = String(value ?? '').trim();
+  if (text === '~') return home;
+  if (text.startsWith('~/') || text.startsWith('~\\')) return path.join(home, text.slice(2));
+  return text;
+}
+
+/**
+ * Resolve the harness home exactly the way dsh does
+ * (`$DSH_HOME` with tilde expansion, otherwise `<homedir>/.dsh`).
+ *
+ * A DSH-D that bootstrapped its own private dsh still shares the user's
+ * harness home, and a machine may point DSH_HOME somewhere else entirely — so
+ * the market must ask this question instead of assuming `~/.dsh`.
+ *
+ * @param {NodeJS.ProcessEnv} [env] the environment dsh is spawned with.
+ * @returns {string} absolute harness home path.
+ */
+function resolveDshHome(env = process.env) {
+  const home = homedirOf(env);
   const configured = String(env.DSH_HOME ?? '').trim();
-  return configured || path.join(os.homedir(), '.dsh');
+  return configured ? expandHomePath(configured, home) : path.join(home, '.dsh');
+}
+
+/** @deprecated kept for callers/tests; identical to {@link resolveDshHome}. */
+function defaultDshHome(env = process.env) {
+  return resolveDshHome(env);
 }
 
 /**
@@ -241,7 +286,7 @@ function describeSpec(spec) {
  */
 function readInstalledPlugins(options = {}) {
   const profile = options.profile ?? DEFAULT_PROFILE;
-  const dshHome = options.dshHome ?? defaultDshHome();
+  const dshHome = options.dshHome ?? resolveDshHome(options.env ?? process.env);
   const dir = path.join(dshHome, 'profiles', profile);
   const manifestPath = path.join(dir, 'package.json');
 
@@ -249,13 +294,30 @@ function readInstalledPlugins(options = {}) {
   try {
     manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   } catch (error) {
+    // Report what actually exists under this home: a "missing" profile is
+    // often a different DSH_HOME, and the UI needs to show that.
+    const profilesDir = path.join(dshHome, 'profiles');
+    let availableProfiles = [];
+    try {
+      availableProfiles = fs
+        .readdirSync(profilesDir, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+        .sort();
+    } catch {
+      availableProfiles = [];
+    }
     return {
       profile,
       dir,
+      home: dshHome,
       exists: false,
       bundles: [],
       plugins: [],
-      error: `读取 profile 清单失败：${error instanceof Error ? error.message : String(error)}`,
+      availableProfiles,
+      error: fs.existsSync(dshHome)
+        ? `profile「${profile}」尚未初始化（该 home 下的 profile：${availableProfiles.join('、') || '无'}）`
+        : `harness home 不存在：${dshHome}（dsh 尚未在该位置启动过）`,
     };
   }
 
@@ -283,7 +345,7 @@ function readInstalledPlugins(options = {}) {
     });
   }
 
-  return { profile, dir, exists: true, bundles, plugins, error: null };
+  return { profile, dir, home: dshHome, exists: true, bundles, plugins, error: null };
 }
 
 /**
@@ -464,6 +526,9 @@ module.exports = {
   compareVersions,
   defaultDshHome,
   describeSpec,
+  expandHomePath,
+  homedirOf,
+  resolveDshHome,
   ensurePnpm,
   fetchCatalog,
   findPnpm,

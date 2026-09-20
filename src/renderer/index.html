@@ -102,7 +102,7 @@
         <section class="panel" data-phase="installing-node">
           <div class="card">
             <span class="badge badge-busy">自动配置</span>
-            <h1>正在配置 Node.js 运行环境</h1>
+            <h1 id="runtimeTitle">正在配置 Node.js 运行环境</h1>
             <div class="progress">
               <div class="progress-head">
                 <span class="progress-phase" id="runtimePhase">准备下载 Node.js</span>
@@ -225,6 +225,7 @@
               <div class="market-title">
                 <h2>插件市场</h2>
                 <p class="muted small" id="marketMeta">正在读取目录…</p>
+                <p class="muted small market-runtime" id="marketRuntime"></p>
               </div>
               <div class="market-head-actions">
                 <button class="btn" data-action="market-refresh">刷新目录</button>

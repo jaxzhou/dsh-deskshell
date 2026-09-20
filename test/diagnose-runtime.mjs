@@ -109,6 +109,7 @@ console.log('\n配置前检测：');
 show({
   node: { available: before.node.available, version: before.node.version, command: before.node.command, error: before.node.error },
   npm: { available: before.npm.available, version: before.npm.version, command: before.npm.command, error: before.npm.error },
+  pnpm: { available: before.pnpm.available, version: before.pnpm.version, error: before.pnpm.error },
   dsh: { installed: before.dsh.installed, error: before.dsh.error },
 });
 
@@ -143,8 +144,11 @@ console.log('\n配置后检测：');
 show({
   node: state.detection?.node,
   npm: state.detection?.npm,
+  pnpm: state.detection?.pnpm,
   dsh: state.detection?.dsh,
 });
+console.log('\ndsh 实际位置（市场据此安装插件）：');
+show(state.dshRuntime ?? null);
 
 // ----------------------------------------- 3. 托管运行时与 npm 的逐项检查
 
@@ -178,6 +182,9 @@ if (!managed) {
     ['npm prefix -g', managedNpmCommand(managed), ['prefix', '-g']],
     ['npm root -g', managedNpmCommand(managed), ['root', '-g']],
   ];
+  // pnpm is installed into the managed runtime by the startup check.
+  const managedPnpm = path.join(managed.binDir, process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm');
+  if (existsSync(managedPnpm)) checks.push(['pnpm --version', managedPnpm, ['--version']]);
   console.log('\n逐条执行：');
   for (const [label, command, args] of checks) {
     const result = await runCapture(command, args, { env: managedEnv, timeoutMs: 120_000 });

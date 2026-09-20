@@ -111,6 +111,7 @@ async function detectDsh(env) {
     installArgs: ['install', '-g', DSH_PACKAGE],
     node: { available: false, version: null, command: null, error: null },
     npm: { available: false, version: null, command: null, error: null, globalRoot: null, globalBin: null },
+    pnpm: { available: false, version: null, command: null, error: null },
     dsh: { installed: false, version: null, command: null, error: null, packageManifest: null, viaPath: false },
   };
 
@@ -152,6 +153,22 @@ async function detectDsh(env) {
     }
   } else {
     detection.npm.error = 'PATH 中未找到 npm';
+  }
+
+  // --- pnpm -----------------------------------------------------------------
+  // The plugin market installs through `dsh plugin`, which forwards to pnpm, so
+  // pnpm is a real dependency of the shell rather than an optional extra.
+  const pnpmCommand = findExecutable('pnpm', env);
+  if (pnpmCommand) {
+    const probe = await probeVersion(pnpmCommand, env, ['--version'], 60_000);
+    detection.pnpm = {
+      available: probe.ok,
+      version: probe.version,
+      command: pnpmCommand,
+      error: probe.error,
+    };
+  } else {
+    detection.pnpm.error = 'PATH 中未找到 pnpm（插件市场安装/更新插件需要它）';
   }
 
   // --- dsh ------------------------------------------------------------------

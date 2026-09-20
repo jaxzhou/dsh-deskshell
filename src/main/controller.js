@@ -31,12 +31,12 @@ const {
   DEFAULT_MARKET_URL,
   DEFAULT_PROFILE,
   buildPluginArgs,
-  defaultDshHome,
   ensurePnpm,
   fetchCatalog,
   isSafePackageName,
   marketRows,
   readInstalledPlugins,
+  resolveDshHome,
   runPluginCommand,
 } = require('./plugin-market');
 const { resolveShellEnv } = require('./shell-env');
@@ -83,6 +83,10 @@ class ShellController extends EventEmitter {
     this.runPluginCommand = options.pluginCommand ?? runPluginCommand;
     /** @type {object|null} current plugin install/update, surfaced to the UI. */
     this.pluginAction = null;
+    /** pnpm is a market dependency: attempted once per session, retryable. */
+    this.pnpmAttempted = false;
+    this.pnpmError = null;
+    this.pnpmInstalling = false;
     /** @type {{cancel: () => void}|null} */
     this.pluginHandle = null;
 
@@ -151,6 +155,13 @@ class ShellController extends EventEmitter {
       error: this.error,
       profile: this.profile,
       marketUrl: this.marketUrl,
+      // Where dsh actually is and where its profile lives — plugins must land
+      // in the profile of the dsh the shell itself boots (possibly a private
+      // install provisioned by this app).
+      dshRuntime: this.describeDshRuntime(),
+      pnpm: this.detection?.pnpm
+        ? { ...this.detection.pnpm, installing: this.pnpmInstalling, failedReason: this.pnpmError }
+        : { available: false, version: null, command: null, error: '尚未检测', installing: this.pnpmInstalling, failedReason: this.pnpmError },
       pluginAction: this.pluginAction,
       logs: this.logs.slice(-LOG_REPLAY),
     };
@@ -264,6 +275,21 @@ class ShellController extends EventEmitter {
       detection = this.detection;
     }
 
+    // pnpm is a hard dependency of the plugin market, so it belongs in the
+    // startup check rather than surfacing on the first install click. It is
+    // still non-fatal: without pnpm the market cannot install, but dsh runs.
+    if (
+      detection.node.available &&
+      detection.npm.available &&
+      detection.pnpm &&
+      !detection.pnpm.available &&
+      !this.pnpmAttempted
+    ) {
+      const withPnpm = await this.provisionPnpm(detection, token);
+      if (token !== this.checkToken) return this.detection;
+      if (withPnpm) detection = withPnpm;
+    }
+
     this.detection = detection;
 
     if (!detection.dsh.installed) {
@@ -281,10 +307,111 @@ class ShellController extends EventEmitter {
 
   // ------------------------------------------------------------ plugin market
 
+  /** Where dsh actually is and where its profile lives. */
+  describeDshRuntime() {
+    const env = this.env ?? process.env;
+    const home = resolveDshHome(env);
+    return {
+      command: this.detection?.dsh?.command ?? null,
+      version: this.detection?.dsh?.version ?? null,
+      private: Boolean(this.managedRuntime && String(this.detection?.dsh?.command ?? '').startsWith(this.managedRuntime.dir)),
+      home,
+      profile: this.profile,
+      profileDir: path.join(home, 'profiles', this.profile),
+    };
+  }
+
+  /**
+   * Make sure pnpm exists (installing it through npm when it does not).
+   *
+   * @returns {Promise<object|null>} fresh detection, or null when superseded.
+   * @private
+   */
+  async provisionPnpm(detection, token) {
+    this.pnpmAttempted = true;
+    this.pnpmError = null;
+    this.pnpmInstalling = true;
+    this.runtimeSnapshot = {
+      percent: 10,
+      phase: '安装 pnpm（插件市场依赖）',
+      detail: 'npm install -g pnpm',
+    };
+    this.setPhase('installing-node', '正在配置 pnpm（插件市场依赖）…');
+    this.broadcast();
+    this.pushLog({
+      stream: 'system',
+      line: `未检测到 pnpm，正在用 npm 安装（插件市场安装/更新插件依赖它）：${detection.npm.command}`,
+    });
+
+    let result;
+    try {
+      result = await this.runEnsurePnpm({
+        env: this.env ?? process.env,
+        npmCommand: detection.npm?.command ?? null,
+        onLog: (entry) => this.pushLog(entry),
+      });
+    } catch (error) {
+      result = { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+    if (token !== this.checkToken) return null;
+    this.pnpmInstalling = false;
+
+    if (result.ok) {
+      this.runtimeSnapshot = { percent: 100, phase: 'pnpm 已就绪', detail: result.command ?? 'npm install -g pnpm' };
+    } else {
+      // Non-fatal: keep going, but remember the reason for the market UI.
+      this.pnpmError = result.error ?? 'pnpm 安装失败';
+      this.runtimeSnapshot = { percent: 100, phase: 'pnpm 配置失败', detail: this.pnpmError };
+      this.pushLog({ stream: 'stderr', line: `pnpm 配置失败（不影响 dsh 运行）：${this.pnpmError}` });
+    }
+    this.broadcast();
+
+    // pnpm may have landed in a directory our PATH does not contain yet, so
+    // re-resolve the environment before re-detecting.
+    let detected = await this.detect(this.env);
+    if (token !== this.checkToken) return null;
+    if (result.ok && !detected.pnpm?.available) {
+      this.env = null;
+      await this.resolveEnvironment(token);
+      if (token !== this.checkToken) return null;
+      detected = await this.detect(this.env);
+      if (token !== this.checkToken) return null;
+    }
+    this.detection = detected;
+    if (result.ok && detected.pnpm?.available) {
+      this.pushLog({ stream: 'system', line: `pnpm 已就绪：${detected.pnpm.version ?? detected.pnpm.command}` });
+    }
+    return detected;
+  }
+
+  /** Explicitly (re)try the pnpm setup — used by the market's retry button. */
+  async setupPnpm() {
+    const token = (this.checkToken += 1);
+    this.error = null;
+    this.pnpmAttempted = false;
+    if (!(await this.resolveEnvironment(token))) return { ok: false, error: '环境解析失败' };
+    const detection = await this.detect(this.env);
+    if (token !== this.checkToken) return { ok: false, error: '已取消' };
+    this.detection = detection;
+    if (detection.pnpm?.available) {
+      this.pushLog({ stream: 'system', line: `pnpm 已可用：${detection.pnpm.version ?? detection.pnpm.command}` });
+      this.broadcast();
+      return { ok: true };
+    }
+    const updated = await this.provisionPnpm(detection, token);
+    this.setPhase(this.phase === 'installing-node' ? 'ready-to-start' : this.phase, '');
+    this.broadcast();
+    return { ok: Boolean(updated?.pnpm?.available), error: this.pnpmError };
+  }
+
   /** What the dsh profile currently has installed. */
   getInstalledPlugins() {
+    // The home is resolved from the environment dsh is spawned with, so a
+    // private install or a custom DSH_HOME is read from the right place.
+    const env = this.env ?? process.env;
     return this.runReadInstalled({
-      dshHome: defaultDshHome(this.env ?? process.env),
+      env,
+      dshHome: resolveDshHome(env),
       profile: this.profile,
     });
   }
@@ -303,6 +430,8 @@ class ShellController extends EventEmitter {
       fetchedAt: catalog.fetchedAt ?? null,
       updatedAt: catalog.ok ? catalog.catalog.updatedAt : null,
       profile: this.profile,
+      dshRuntime: this.describeDshRuntime(),
+      pnpm: this.detection?.pnpm ? { ...this.detection.pnpm, failedReason: this.pnpmError } : null,
       installed,
       ...merged,
     };

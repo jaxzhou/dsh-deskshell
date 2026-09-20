@@ -52,6 +52,8 @@ contextBridge.exposeInMainWorld('dshShell', {
   installPlugin: (payload) => ipcRenderer.invoke('market:install', payload),
   /** Cancel an in-flight plugin install/update. */
   cancelPlugin: () => ipcRenderer.invoke('market:cancel'),
+  /** Check for pnpm and install it when missing (market dependency). */
+  setupPnpm: () => ipcRenderer.invoke('market:setup-pnpm'),
   /** Open a URL (or the current GUI URL) in the system browser. */
   openExternal: (url) => ipcRenderer.invoke('dsh:open-external', url),
   /** Tell main where the shell's own toolbar ends, so the GUI view sits below it. */

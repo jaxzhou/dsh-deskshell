@@ -14,6 +14,7 @@ import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -1035,6 +1036,187 @@ section('13. 插件安装流程（控制器，注入协作者）');
   check('失败状态暴露给界面', controller.getState().pluginAction.ok === false);
 
   await controller.dispose();
+}
+
+section('14. dsh 实际位置与 pnpm 依赖');
+{
+  // --- harness home resolution mirrors dsh's own rules --------------------
+  check('未设 DSH_HOME 时用 HOME/.dsh', market.resolveDshHome({ HOME: '/Users/you' }) === path.join('/Users/you', '.dsh'));
+  check('DSH_HOME 覆盖默认位置', market.resolveDshHome({ HOME: '/Users/you', DSH_HOME: '/data/harness' }) === '/data/harness');
+  check('DSH_HOME 支持 ~ 展开', market.resolveDshHome({ HOME: '/Users/you', DSH_HOME: '~/hh' }) === path.join('/Users/you', 'hh'));
+  check('无 HOME 时回退 os.homedir()', market.resolveDshHome({}) === path.join(os.homedir(), '.dsh'));
+
+  // Windows: os.homedir() reads USERPROFILE, so the market must too.
+  const winMarket = (() => {
+    const original = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      for (const file of ['../src/main/shell-env.js', '../src/main/dsh-detect.js', '../src/main/plugin-market.js']) {
+        delete require.cache[require.resolve(file)];
+      }
+      return require('../src/main/plugin-market.js');
+    } finally {
+      Object.defineProperty(process, 'platform', { value: original, configurable: true });
+    }
+  })();
+  check(
+    'Windows 用 USERPROFILE 解析 home',
+    winMarket.homedirOf({ USERPROFILE: 'C:\\Users\\me', HOME: '/ignored' }) === 'C:\\Users\\me',
+  );
+  check('Windows 回退 HOMEDRIVE+HOMEPATH', winMarket.homedirOf({ HOMEDRIVE: 'D:', HOMEPATH: '\\work' }) === 'D:\\work');
+  check(
+    'Windows 下 DSH_HOME 指向私有位置时以它为准',
+    path.win32.normalize(winMarket.resolveDshHome({ USERPROFILE: 'C:\\Users\\me', DSH_HOME: 'D:\\dshdata' })) === 'D:\\dshdata',
+    path.win32.normalize(winMarket.resolveDshHome({ USERPROFILE: 'C:\\Users\\me', DSH_HOME: 'D:\\dshdata' })),
+  );
+  check(
+    'Windows 默认 home 为 USERPROFILE\\.dsh',
+    path.win32.normalize(winMarket.resolveDshHome({ USERPROFILE: 'C:\\Users\\me' })) === 'C:\\Users\\me\\.dsh',
+    path.win32.normalize(winMarket.resolveDshHome({ USERPROFILE: 'C:\\Users\\me' })),
+  );
+
+  // --- installed plugins are read from the env-derived home ---------------
+  const homeA = path.join(here, '.tmp-home-a');
+  const homeB = path.join(here, '.tmp-home-b');
+  // HOME is the OS home; the harness home lives in `.dsh` beneath it.
+  const profileA = path.join(homeA, '.dsh', 'profiles', 'web');
+  mkdirSync(profileA, { recursive: true });
+  mkdirSync(path.join(homeB, '.dsh', 'profiles', 'desktop'), { recursive: true });
+  writeFileSync(
+    path.join(profileA, 'package.json'),
+    JSON.stringify({ dsh: { profile: { bundles: ['@jaxzhou/dsh-file-explorer'] } }, dependencies: { '@jaxzhou/dsh-file-explorer': '0.1.5' } }),
+  );
+  const fromEnv = market.readInstalledPlugins({ env: { HOME: homeA }, profile: 'web' });
+  check('按环境 home 读取已装插件', fromEnv.exists === true && fromEnv.home === path.join(homeA, '.dsh'), String(fromEnv.home));
+
+  const missing = market.readInstalledPlugins({ env: { HOME: homeB }, profile: 'web' });
+  check('home 存在但 profile 未初始化时给出可读说明', missing.exists === false && /desktop/.test(missing.error), String(missing.error));
+  check('列出该 home 下实际存在的 profile', missing.availableProfiles.join(',') === 'desktop', JSON.stringify(missing.availableProfiles));
+
+  const noHome = market.readInstalledPlugins({ env: { DSH_HOME: path.join(here, '.tmp-nope') }, profile: 'web' });
+  check('home 不存在时提示 dsh 未在该位置启动过', noHome.exists === false && /不存在/.test(noHome.error), String(noHome.error));
+
+  // --- pnpm is part of detection -----------------------------------------
+  const pnpmBin = path.join(here, '.tmp-pnpm-bin');
+  mkdirSync(pnpmBin, { recursive: true });
+  const fakePnpm = path.join(pnpmBin, process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm');
+  writeFileSync(fakePnpm, '#!/bin/sh\necho 9.9.9\n');
+  chmodSync(fakePnpm, 0o755);
+  const withPnpm = await detectDsh({ PATH: `${pnpmBin}:${process.env.PATH}` });
+  check('检测结果包含 pnpm 可用与版本', withPnpm.pnpm.available === true && withPnpm.pnpm.version === '9.9.9', JSON.stringify(withPnpm.pnpm));
+  const withoutPnpm = await detectDsh({ PATH: '/nonexistent-path' });
+  check('缺少 pnpm 时给出原因而非报错', withoutPnpm.pnpm.available === false && /pnpm/.test(withoutPnpm.pnpm.error ?? ''), String(withoutPnpm.pnpm.error));
+  rmSync(pnpmBin, { recursive: true, force: true });
+  rmSync(homeA, { recursive: true, force: true });
+  rmSync(homeB, { recursive: true, force: true });
+
+  // --- controller: startup pnpm setup ------------------------------------
+  const makeDetect = (pnpmAvailable) => {
+    let calls = 0;
+    return async () => {
+      calls += 1;
+      // pnpm only appears after the installer ran (i.e. from the second call).
+      const hasPnpm = pnpmAvailable && calls > 1;
+      return {
+        checkedAt: new Date().toISOString(),
+        platform: process.platform,
+        arch: process.arch,
+        packageName: DSH_PACKAGE,
+        node: { available: true, version: 'v24.21.0', command: '/tmp/node', error: null },
+        npm: { available: true, version: '11.19.0', command: '/tmp/npm', error: null, globalRoot: '/tmp/nm', globalBin: '/tmp/bin' },
+        pnpm: hasPnpm
+          ? { available: true, version: '9.9.9', command: '/tmp/pnpm', error: null }
+          : { available: false, version: null, command: null, error: 'PATH 中未找到 pnpm' },
+        dsh: { installed: false, version: null, command: null, error: 'PATH 中未找到 dsh 命令' },
+      };
+    };
+  };
+
+  let ensureCalls = 0;
+  const withPnpmController = new ShellController({
+    cwd: here,
+    detect: makeDetect(true),
+    ensurePnpm: async () => {
+      ensureCalls += 1;
+      return { ok: true, command: '/tmp/pnpm', installed: true, error: null };
+    },
+    startDelayMs: 10,
+  });
+  const phases = [];
+  withPnpmController.on('state', (snapshot) => {
+    if (phases.at(-1) !== snapshot.phase) phases.push(snapshot.phase);
+  });
+  await withPnpmController.check({ autostart: false });
+  check('启动时检测到缺少 pnpm 并自动安装', ensureCalls === 1, `ensureCalls=${ensureCalls}`);
+  check('安装过程展示在运行环境面板', phases.includes('installing-node'), phases.join(' → '));
+  check('安装后 pnpm 可用并继续流程', withPnpmController.getState().detection.pnpm.available === true && withPnpmController.getState().phase === 'missing-dsh', withPnpmController.getState().phase);
+  check('状态中暴露 pnpm 信息', withPnpmController.getState().pnpm?.version === '9.9.9', JSON.stringify(withPnpmController.getState().pnpm));
+  await withPnpmController.dispose();
+
+  // Failure is non-fatal: dsh flow continues, reason is kept for the market.
+  const failing = new ShellController({
+    cwd: here,
+    detect: makeDetect(false),
+    ensurePnpm: async () => ({ ok: false, command: null, installed: false, error: 'npm 安装 pnpm 失败：网络不可达' }),
+    startDelayMs: 10,
+  });
+  await failing.check({ autostart: false });
+  const failingState = failing.getState();
+  check('pnpm 配置失败不阻塞 dsh 流程', failingState.phase === 'missing-dsh', failingState.phase);
+  check('失败原因保留给市场界面', /网络不可达/.test(failingState.pnpm?.failedReason ?? ''), JSON.stringify(failingState.pnpm));
+
+  // Retry path.
+  let retryDetect = 0;
+  const retried = new ShellController({
+    cwd: here,
+    detect: async () => {
+      retryDetect += 1;
+      const hasPnpm = retryDetect > 1;
+      return {
+        platform: process.platform,
+        arch: process.arch,
+        packageName: DSH_PACKAGE,
+        node: { available: true, version: 'v24.21.0', command: '/tmp/node', error: null },
+        npm: { available: true, version: '11.19.0', command: '/tmp/npm', error: null },
+        pnpm: hasPnpm ? { available: true, version: '9.9.9', command: '/tmp/pnpm', error: null } : { available: false, version: null, command: null, error: '未找到' },
+        dsh: { installed: true, version: '0.1.5', command: '/tmp/dsh', error: null },
+      };
+    },
+    ensurePnpm: async () => ({ ok: true, command: '/tmp/pnpm', installed: true, error: null }),
+    startDelayMs: 10,
+  });
+  await retried.check({ autostart: false });
+  const setupResult = await retried.setupPnpm();
+  check('可手动重试 pnpm 配置', setupResult.ok === true, JSON.stringify(setupResult));
+  await retried.dispose();
+
+  // --- dsh runtime identity (private installs, custom homes) -------------
+  const privateRuntime = path.join(here, '.tmp-private-runtime');
+  const privateDsh = path.join(privateRuntime, 'node-v24.21.0-win32-x64', 'dsh.cmd');
+  const identity = new ShellController({ cwd: here, profile: 'web' });
+  identity.env = { HOME: path.join(here, '.tmp-identity-home') };
+  identity.managedRuntime = { dir: path.join(privateRuntime, 'node-v24.21.0-win32-x64') };
+  identity.detection = { dsh: { installed: true, version: '0.1.5', command: privateDsh } };
+  const described = identity.describeDshRuntime();
+  check('运行信息指向实际使用的 dsh', described.command === privateDsh, String(described.command));
+  check('识别出 dsh 来自本应用私有安装', described.private === true);
+  check('profile 目录按实际 home 计算', described.profileDir === path.join(identity.env.HOME, '.dsh', 'profiles', 'web'), described.profileDir);
+
+  const customHome = new ShellController({ cwd: here, profile: 'web' });
+  customHome.env = { HOME: '/tmp/ignored', DSH_HOME: '/srv/dsh' };
+  check('自定义 DSH_HOME 时 profile 目录随之改变', customHome.describeDshRuntime().profileDir === path.join('/srv/dsh', 'profiles', 'web'), customHome.describeDshRuntime().profileDir);
+
+  // The market must read plugins from that same home.
+  let readHome = null;
+  customHome.runReadInstalled = (options) => {
+    readHome = options.dshHome;
+    return { profile: 'web', dir: '', home: options.dshHome, exists: true, bundles: [], plugins: [], error: null };
+  };
+  customHome.getInstalledPlugins();
+  check('市场读取插件使用同一 home', readHome === '/srv/dsh', String(readHome));
+  await identity.dispose();
+  await customHome.dispose();
+  await failing.dispose();
 }
 
 // --------------------------------------------------------------------- summary
