@@ -25,10 +25,14 @@ const root = path.resolve(here, '..');
 
 const {
   FALLBACK_NODE_VERSION,
+  fetchText,
   installNodeRuntime,
   managedNpmCommand,
   managedRuntimeEnv,
 } = require('../src/main/node-runtime.js');
+const market = require('../src/main/plugin-market.js');
+const { findExecutable } = require('../src/main/dsh-detect.js');
+const { shellCommandFor } = require('../src/main/shell-env.js');
 const { runCapture } = require('../src/main/shell-env.js');
 
 const RUNTIME_ROOT = path.join(here, '.network-runtime');
@@ -116,6 +120,56 @@ if (!runtime.ok) {
   console.log('\n5. 清理');
   rmSync(RUNTIME_ROOT, { recursive: true, force: true });
   check('测试目录已清理', !existsSync(RUNTIME_ROOT));
+}
+
+// ---------------------------------------------------------------- 插件市场
+
+console.log('\n6. 插件市场目录（客户端读取 dsh.textwork.cn）');
+const liveMarket = await market.fetchCatalog({});
+check('默认目录地址指向 dsh.textwork.cn', market.DEFAULT_MARKET_URL === 'https://dsh.textwork.cn/plugins/index.json', market.DEFAULT_MARKET_URL);
+check('目录可下载并解析', liveMarket.ok === true, liveMarket.ok ? '' : liveMarket.error);
+if (liveMarket.ok) {
+  const { catalog } = liveMarket;
+  console.log(`    条数：${catalog.plugins.length} · 更新于：${catalog.updatedAt}`);
+  check('目录含至少一个插件', catalog.plugins.length > 0, String(catalog.plugins.length));
+  check(
+    '每个条目都有合法包名与版本',
+    catalog.plugins.every((plugin) => market.isSafePackageName(plugin.package) && market.isSafeVersion(plugin.version)),
+    catalog.plugins.map((plugin) => `${plugin.package}@${plugin.version}`).join(', '),
+  );
+
+  // Drift check: the catalog is published by the site tooling, so a plugin that
+  // moved on npm would leave the market offering an outdated version.
+  // The host npm is enough for a read-only `npm view`, and stays valid after
+  // the managed runtime has been cleaned up.
+  const hostNpm = findExecutable('npm', process.env) ?? 'npm';
+  const drifted = [];
+  for (const plugin of catalog.plugins) {
+    const latest = await runCapture(shellCommandFor(hostNpm), ['view', plugin.package, 'version'], {
+      env: process.env,
+      timeoutMs: 60_000,
+    });
+    const version = latest.stdout.trim();
+    if (latest.ok && version && version !== plugin.version) {
+      drifted.push(`${plugin.package}: 目录 ${plugin.version} / npm ${version}`);
+    } else {
+      console.log(`    ${plugin.package}@${plugin.version} 与 npm 一致`);
+    }
+  }
+  if (drifted.length) {
+    console.log(`    ⚠ 目录版本落后于 npm（需要更新目录）：${drifted.join('；')}`);
+  } else {
+    console.log('    ✓ 目录版本与 npm 最新一致');
+  }
+
+  // The human page must list what the machine catalog offers.
+  try {
+    const page = await fetchText('https://dsh.textwork.cn/plugins/', { timeoutMs: 30_000 });
+    const missing = catalog.plugins.filter((plugin) => !page.includes(plugin.package)).map((plugin) => plugin.package);
+    check('站点插件页与目录条目一致', missing.length === 0, missing.length ? `页面缺少：${missing.join(', ')}` : '');
+  } catch (error) {
+    console.log(`    （跳过插件页一致性检查：${error instanceof Error ? error.message : String(error)}）`);
+  }
 }
 
 console.log(`\n${'─'.repeat(58)}`);

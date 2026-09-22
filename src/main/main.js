@@ -15,6 +15,7 @@ const http = require('node:http');
 const { BrowserWindow, WebContentsView, app, ipcMain, shell } = require('electron');
 
 const { ShellController } = require('./controller');
+const { DEFAULT_MARKET_URL } = require('./plugin-market');
 
 const RENDERER_INDEX = path.join(__dirname, '..', 'renderer', 'index.html');
 const PRELOAD = path.join(__dirname, 'preload.js');
@@ -611,6 +612,33 @@ async function runSelfTest() {
       };
     })()`);
     record('切回 DSH tab 恢复阶段面板', backToDsh.market === false && backToDsh.dsh !== null, JSON.stringify(backToDsh));
+
+    // Optional live pass: proves the renderer reads the real catalog from the
+    // site, not just the fixture. Off by default so the self-test stays offline.
+    if (process.env.DSH_D_MARKET_LIVE === '1') {
+      controller.marketUrl = DEFAULT_MARKET_URL;
+      const live = await win.webContents.executeJavaScript(`(async () => {
+        market.loaded = false;
+        document.getElementById('tab-dsh').click();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        document.getElementById('tab-market').click();
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+        return {
+          cards: Array.from(document.querySelectorAll('.plugin-card .pkg')).map((node) => node.textContent),
+          source: document.getElementById('marketMeta').textContent,
+        };
+      })()`);
+      record(
+        '实网：市场从 dsh.textwork.cn 渲染目录',
+        live.cards.length > 0 && /dsh\.textwork\.cn/.test(live.source),
+        `${live.cards.join(', ')} | ${live.source}`,
+      );
+      record(
+        '实网：目录条目与站点一致',
+        live.cards.includes('@jaxzhou/dsh-proxy-client'),
+        live.cards.join(', '),
+      );
+    }
 
     controller.restart = originalRestart;
     await new Promise((resolve) => marketServer.close(resolve));

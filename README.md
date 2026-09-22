@@ -19,7 +19,7 @@
 | **DSH 运行信息** | 运行中的 dsh Web 界面（内嵌 `WebContentsView`）；未就绪时显示检测/安装/启动各阶段面板 |
 | **插件市场** | 外壳自带的插件市场（独立于 dsh，不是 dsh 插件）：读取 `dsh.textwork.cn` 上的目录，展示版本、本地已安装版本与可更新项，可一键安装/更新；安装完成后自动重启 dsh 并刷新 DSH tab 的 Web 界面 |
 
-插件市场的数据来源是 <https://dsh.textwork.cn/plugins/index.json>（仓库内为 `site/plugins/index.json`，随站点发布）；默认管理 dsh 的 `web` profile。
+插件市场的数据来源是 **<https://dsh.textwork.cn/plugins/index.json>**（仓库内 `site/plugins/index.json` 是站点发布内容的镜像，由站点侧工具生成，不是手工编辑的源）；默认管理 dsh 的 `web` profile。可用 `npm run test:network` 校验线上目录可达、条目合法，并对比目录版本与 npm 最新版是否漂移。
 
 工具栏只保留当前阶段的主操作（安装 / 取消 / 停止 / 重试），**重新加载、查看日志、浏览器打开、重启/停止 dsh、重新检测等调试与维护操作都收在右上角的「⋮」菜单里**；状态区显示当前状态 + 机器名 + dsh 版本（端口仅在内部使用，不占用界面）。退出应用时会一并结束 dsh 子进程。
 

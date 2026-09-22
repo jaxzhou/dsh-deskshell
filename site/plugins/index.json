@@ -1,21 +1,27 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-09-20",
+  "updatedAt": "2026-09-22",
   "site": "https://dsh.textwork.cn",
   "profile": "web",
-  "note": "DSH-D 插件市场目录。本文件由仓库维护并发布到 https://dsh.textwork.cn/plugins/index.json；插件均为 DeepSeek Harness（dsh）插件，安装到 dsh profile。",
+  "source": "https://dsh.textwork.cn/plugins/plugins.json",
+  "note": "DSH-D 插件市场目录。本文件由 dsh-site/plugins/plugins.json 自动生成（tools/gen-pages.py），请勿手工编辑；版本/说明等 npm 字段由 tools/sync-plugins.py 同步。页面 /plugins/ 与本目录始终同源。",
   "plugins": [
     {
       "name": "dsh-file-explorer",
       "package": "@jaxzhou/dsh-file-explorer",
       "version": "0.1.5",
-      "summary": "给 Harness 增加一个与「对话」「轨迹」并列的「文件」标签：左侧是工作区目录树，右侧按文件类型决定预览形态。",
+      "summary": "给 Harness 增加一个与「对话」「轨迹」并列的「文件」标签：左侧是会话工作区的目录树，右侧按文件类型决定预览形态 —— 渲染 Markdown、JSON 折叠树、24 种语法高亮、图片与沙箱 HTML，并能把渲染结果导出为 PDF / Word。只读、无需配置、不落任何数据。",
+      "description": "给 Harness 增加一个与「对话」「轨迹」并列的「文件」标签：左侧是会话工作区的目录树，右侧按文件类型决定预览形态 —— 渲染 Markdown、JSON 折叠树、24 种语法高亮、图片与沙箱 HTML，并能把渲染结果导出为 PDF / Word。只读、无需配置、不落任何数据。",
       "highlights": [
-        "Markdown 渲染（GFM）、JSON 树、24 种语法高亮、图片与纯文本预览",
-        "HTML 在沙箱 iframe 中绘制，预览不执行脚本",
-        "导出 PDF / Word；只读、无需配置、不落任何数据"
+        "Markdown 渲染（GFM）、JSON 折叠树、24 种语法高亮、图片、纯文本",
+        "HTML 在沙箱 iframe 中绘制；导出 PDF / Word",
+        "只读、无需配置、不落任何数据"
       ],
-      "tags": ["文件", "预览", "工作区"],
+      "tags": [
+        "文件浏览",
+        "多格式预览",
+        "导出 PDF / Word"
+      ],
       "license": "MIT",
       "author": "jaxzhou",
       "npm": "https://www.npmjs.com/package/@jaxzhou/dsh-file-explorer",
@@ -27,18 +33,46 @@
       "name": "dsh-mathmatic-symbol",
       "package": "@jaxzhou/dsh-mathmatic-symbol",
       "version": "0.1.2",
-      "summary": "给 agent 四个工具，把公式与图形变成可以直接放进报告、幻灯片、Word、PDF 的图片。",
+      "summary": "给 agent 四个工具，把公式与图形变成可以直接放进报告、幻灯片、Word、PDF 的图片：LaTeX 排版、声明式规格画几何与函数图形、公式或 SVG 转可嵌入图片、生成插好图形的文档。产物是自带字形轮廓的 SVG（不依赖字体）加可选 PNG，并附带 Markdown / HTML / LaTeX 片段。",
+      "description": "给 agent 四个工具，把公式与图形变成可以直接放进报告、幻灯片、Word、PDF 的图片：LaTeX 排版、声明式规格画几何与函数图形、公式或 SVG 转可嵌入图片、生成插好图形的文档。产物是自带字形轮廓的 SVG（不依赖字体）加可选 PNG，并附带 Markdown / HTML / LaTeX 片段。",
       "highlights": [
-        "math_formula / math_figure / math_convert / math_document",
+        "math_formula / math_figure / math_convert / math_document 四个工具",
         "产物是自带字形轮廓的 SVG（不依赖字体）+ 可选 PNG",
         "同时返回 Markdown / HTML / LaTeX 嵌入片段"
       ],
-      "tags": ["公式", "图形", "导出"],
+      "tags": [
+        "公式排版",
+        "数学图形",
+        "文档配图"
+      ],
       "license": "MIT",
       "author": "jaxzhou",
       "npm": "https://www.npmjs.com/package/@jaxzhou/dsh-mathmatic-symbol",
       "repository": "https://github.com/jaxzhou/dsh-mathmatic-symbol",
       "homepage": "https://dsh.textwork.cn/plugins/dsh-mathmatic-symbol/",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "dsh-proxy-client",
+      "package": "@jaxzhou/dsh-proxy-client",
+      "version": "0.4.1",
+      "summary": "把本机终端里的 dsh web 通过 dsh-proxy-server 反向暴露给同账号的其它端：侧边栏新增「远程访问」面板，填服务器地址后用 textwork.cn 账号登录（手机号 + 短信验证码，或账号密码），就能在服务器上打开任意一台在线设备的完整 Harness 界面。",
+      "description": "把本机终端里的 dsh web 通过 dsh-proxy-server 反向暴露给同账号的其它端：侧边栏新增「远程访问」面板，填服务器地址后用 textwork.cn 账号登录（手机号 + 短信验证码，或账号密码），就能在服务器上打开任意一台在线设备的完整 Harness 界面。",
+      "highlights": [
+        "宿主半零运行时依赖（Node 内置 WebSocket），持久连接 + 指数退避重连",
+        "浏览器半：侧边栏入口 + 配置面板 + 账号弹窗 + 人机验证浮层",
+        "与远端强隔离：不阻塞启动、连接/停止均有超时上界、错误边界包裹"
+      ],
+      "tags": [
+        "远程访问",
+        "反向代理",
+        "账号登录"
+      ],
+      "license": "MIT",
+      "author": "jaxzhou",
+      "npm": "https://www.npmjs.com/package/@jaxzhou/dsh-proxy-client",
+      "repository": "https://github.com/jaxzhou/dsh-proxy",
+      "homepage": "https://dsh.textwork.cn/plugins/dsh-proxy-client/",
       "minShell": "0.1.2"
     }
   ]
