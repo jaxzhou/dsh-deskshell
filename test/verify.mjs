@@ -869,6 +869,63 @@ section('12. 插件市场 (plugin-market)');
     }
   })());
 
+  // --- the site's current plugins.json shape (first-party + community) ----
+  const siteShape = JSON.stringify({
+    schema: 1,
+    updated_at: '2026-09-23T02:52:42Z',
+    registry: 'https://registry.npmjs.org',
+    plugins: [
+      {
+        id: 'dsh-file-explorer',
+        name: '@jaxzhou/dsh-file-explorer',
+        short_name: 'dsh-file-explorer',
+        title: '文件浏览器与多格式预览',
+        description: '给 Harness 增加一个与「对话」「轨迹」并列的「文件」标签。第二句话在这里。',
+        version: '0.1.5',
+        license: 'MIT',
+        requires: 'DeepSeek Harness 0.1.5-rc.2 的 Web 界面',
+        engines_node: '>=22.19.0',
+        keywords: ['dsh-plugin', 'dsh'],
+        npm: 'https://www.npmjs.com/package/@jaxzhou/dsh-file-explorer',
+        detail: '/plugins/dsh-file-explorer/',
+      },
+    ],
+    community: {
+      note: '社区热门插件（第三方）',
+      source: 'https://awesome-dsh-plugin.com/plugins.json',
+      metric: '近 30 天 npm 下载量',
+      verified_at: '2026-09-22',
+      plugins: [
+        {
+          id: 'dsh-better-sidebar',
+          name: 'dsh-better-sidebar',
+          title: '侧边栏工作台',
+          category: '界面',
+          version: '0.19.1',
+          license: 'MIT',
+          downloads: 293037,
+          stars: 3705,
+          description: '开放的侧边栏底座。',
+          npm: 'https://www.npmjs.com/package/dsh-better-sidebar',
+          repository: 'https://github.com/omdsh-dev/DSH-better-sidebar',
+        },
+        { name: '../evil', version: '1.0.0' },
+      ],
+    },
+  });
+  const siteCatalog = market.parseCatalog(siteShape);
+  check('新版目录解析出两组', siteCatalog.groups['first-party'].length === 1 && siteCatalog.groups.community.length === 1, JSON.stringify(market.marketRows(siteCatalog, { plugins: [] }).groupCounts));
+  check('包名字段兼容 name/package', siteCatalog.plugins.every((p) => market.isSafePackageName(p.package)));
+  check('社区段非法条目被丢弃', siteCatalog.groups.community.every((p) => p.package === 'dsh-better-sidebar'));
+  check('社区段元数据保留', siteCatalog.community?.metric === '近 30 天 npm 下载量' && siteCatalog.community?.verifiedAt === '2026-09-22', JSON.stringify(siteCatalog.community));
+  const firstParty = siteCatalog.groups['first-party'][0];
+  check('title/requires/engines 等新字段解析', firstParty.title === '文件浏览器与多格式预览' && firstParty.enginesNode === '>=22.19.0' && /Harness/.test(firstParty.requires));
+  check('summary 取描述首句', /并列的「文件」标签。$/.test(firstParty.summary), firstParty.summary);
+  check('站点相对链接补全为绝对地址', firstParty.detail === 'https://dsh.textwork.cn/plugins/dsh-file-explorer/', firstParty.detail);
+  const communityFirst = siteCatalog.groups.community[0];
+  check('社区字段解析（category/downloads/stars）', communityFirst.category === '界面' && communityFirst.downloads === 293037 && communityFirst.stars === 3705);
+  check('顶层 registry 保留', siteCatalog.registry === 'https://registry.npmjs.org');
+
   // --- installed plugins from a profile fixture --------------------------
   const dshHome = path.join(here, '.tmp-dsh-home');
   const profileDir = path.join(dshHome, 'profiles', 'web');
@@ -915,6 +972,16 @@ section('12. 插件市场 (plugin-market)');
     market.buildPluginArgs({ packageName: '@jaxzhou/dsh-file-explorer', version: '0.1.5' }).join(' '),
   );
   check('构造安装参数（不带版本）', market.buildPluginArgs({ packageName: 'dsh-x', profile: 'tui' }).join(' ') === 'plugin --profile tui add dsh-x');
+  check(
+    '构造卸载参数',
+    market.buildPluginArgs({ packageName: 'dsh-better-sidebar', action: 'remove' }).join(' ') ===
+      'plugin --profile web remove dsh-better-sidebar',
+    market.buildPluginArgs({ packageName: 'dsh-better-sidebar', action: 'remove' }).join(' '),
+  );
+  check(
+    '卸载参数忽略版本号',
+    market.buildPluginArgs({ packageName: 'dsh-x', version: '9.9.9', action: 'remove' }).join(' ') === 'plugin --profile web remove dsh-x',
+  );
   check('非法包名构造时抛错', (() => {
     try {
       market.buildPluginArgs({ packageName: '../evil' });

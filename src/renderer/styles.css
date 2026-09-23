@@ -905,6 +905,10 @@ code {
   margin: 0;
   color: var(--text-dim);
   font-size: 13px;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .plugin-card .highlights {
@@ -1013,4 +1017,51 @@ code {
   border: 1px solid var(--border);
   border-radius: 999px;
   padding: 1px 8px;
+}
+
+/* 市场分组标题（跨列） */
+.market-section {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+  padding-bottom: 2px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.market-section h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.market-section h3 .count {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-faint);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+.market-section p {
+  margin: 0;
+  line-height: 1.5;
+}
+
+/* 危险操作（卸载确认） */
+.btn-danger {
+  color: #ffc9c9;
+  border-color: #5a2727;
+  background: #2a1618;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: #3a1c1f;
+  border-color: #6d3030;
 }

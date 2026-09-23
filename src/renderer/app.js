@@ -186,6 +186,8 @@ async function loadMarket() {
     };
     market.runtime = data?.dshRuntime ?? null;
     market.pnpm = data?.pnpm ?? null;
+    market.groups = data?.groupCounts ?? null;
+    market.community = data?.community ?? null;
   } catch (error) {
     market.loaded = true;
     market.error = error?.message ?? String(error);
@@ -237,9 +239,17 @@ function pluginCard(row) {
     card.append(list);
   }
 
-  if (Array.isArray(row.tags) && row.tags.length) {
+  const facts = [];
+  if (row.category) facts.push(row.category);
+  if (row.group === 'community') {
+    if (Number.isFinite(row.downloads)) facts.push(`月下载 ${formatCount(row.downloads)}`);
+    if (Number.isFinite(row.stars)) facts.push(`★ ${formatCount(row.stars)}`);
+  }
+  if (row.enginesNode) facts.push(`Node ${row.enginesNode}`);
+  if (Array.isArray(row.tags) && row.tags.length) facts.push(...row.tags);
+  if (facts.length) {
     const tags = elWith('div', 'plugin-tags');
-    for (const tag of row.tags) tags.append(elWith('span', 'plugin-tag', tag));
+    for (const tag of facts.slice(0, 6)) tags.append(elWith('span', 'plugin-tag', tag));
     card.append(tags);
   }
 
@@ -254,6 +264,9 @@ function pluginCard(row) {
     footer.append(pluginButton('安装', 'plugin-install', row, false, busy));
   } else if (row.status === 'update-available') {
     footer.append(pluginButton(`更新到 v${row.version}`, 'plugin-install', row, true, busy));
+    footer.append(uninstallButton(row, busy));
+  } else if (row.local) {
+    footer.append(uninstallButton(row, busy));
   }
 
   const link = row.homepage || row.npm;
@@ -272,6 +285,24 @@ function pluginCard(row) {
 
   card.append(footer);
   return card;
+}
+
+/** Two-step uninstall: the first click only arms the button. */
+function uninstallButton(row, busy) {
+  const button = elWith('button', 'btn btn-ghost', '卸载');
+  button.dataset.action = 'plugin-uninstall';
+  button.dataset.package = row.package;
+  if (busy) {
+    button.disabled = true;
+  }
+  return button;
+}
+
+/** Compact number formatting for download/star counts. */
+function formatCount(value) {
+  if (value >= 10000) return `${(value / 10000).toFixed(1)}万`;
+  if (value >= 1000) return `${(value / 1000).toFixed(1)}k`;
+  return String(value);
 }
 
 function pluginButton(label, action, row, primary, busy) {
@@ -308,7 +339,7 @@ function renderPluginBanner(next) {
     spinner.setAttribute('aria-hidden', 'true');
     el.marketBanner.append(spinner);
     const label = action?.running
-      ? `${action.step ?? '处理中'} — ${action.packages}`
+      ? `${action.step ?? (action.kind === 'uninstall' ? '正在卸载' : '正在安装')} — ${action.packages}`
       : `正在配置 pnpm — ${pnpm?.error ?? '插件市场依赖'}`;
     el.marketBanner.append(elWith('span', null, label));
     const cancel = elWith('button', 'btn btn-ghost', '取消');
@@ -337,7 +368,9 @@ function renderPluginBanner(next) {
   const version = action.version ? `@${action.version}` : '';
   el.marketBanner.append(
     elWith('span', null, action.ok
-      ? `${action.packages}${version} 已就绪，DSH 已重启并刷新界面`
+      ? action.kind === 'uninstall'
+        ? `${action.packages} 已卸载，DSH 已重启并刷新界面`
+        : `${action.packages}${version} 已就绪，DSH 已重启并刷新界面`
       : `插件操作失败：${action.error ?? '未知错误'}`),
   );
   const dismiss = elWith('button', 'btn btn-ghost', '知道了');
@@ -371,8 +404,10 @@ function renderMarket(next) {
   const updates = market.rows.filter((row) => row.status === 'update-available').length;
   const installedCount = market.rows.filter((row) => row.local).length + market.localOnly.length;
   el.marketStats.replaceChildren();
+  const groups = market.groups ?? {};
   const stats = [
-    ['目录插件', String(market.rows.length)],
+    ['本站维护', String(groups['first-party'] ?? market.rows.filter((row) => row.group !== 'community').length)],
+    ['社区插件', String(groups.community ?? market.rows.filter((row) => row.group === 'community').length)],
     ['已安装', String(installedCount)],
     ['可更新', String(updates)],
   ];
@@ -391,7 +426,24 @@ function renderMarket(next) {
   } else if (!market.rows.length) {
     el.marketList.append(elWith('div', 'market-placeholder', '目录中暂无插件'));
   } else {
-    for (const row of market.rows) el.marketList.append(pluginCard(row));
+    // The catalog carries two groups: the site's own plugins and community
+    // picks. They are shown as separate sections, each with its own note.
+    const sections = [
+      { key: 'first-party', title: '本站维护', rows: market.rows.filter((row) => row.group !== 'community') },
+      { key: 'community', title: '社区插件', rows: market.rows.filter((row) => row.group === 'community') },
+    ];
+    for (const section of sections) {
+      if (!section.rows.length) continue;
+      const header = elWith('div', 'market-section');
+      const title = elWith('h3');
+      title.append(document.createTextNode(section.title), elWith('span', 'count', String(section.rows.length)));
+      header.append(title);
+      if (section.key === 'community' && market.community?.note) {
+        header.append(elWith('p', 'muted small', market.community.note));
+      }
+      el.marketList.append(header);
+      for (const row of section.rows) el.marketList.append(pluginCard(row));
+    }
   }
 
   setText(el.localCount, market.rows.filter((row) => row.local).length + market.localOnly.length);
@@ -409,6 +461,12 @@ function renderMarket(next) {
     row.append(elWith('span', 'name', plugin.name ?? plugin.package));
     row.append(elWith('span', 'ver', plugin.version ? `v${plugin.version}` : '版本未知'));
     row.append(elWith('span', 'src', plugin.spec ? `${plugin.source}: ${plugin.spec}` : '未在依赖中登记'));
+    const isBusy = Boolean(activePluginAction() && activePluginAction().packages === plugin.package);
+    const remove = elWith('button', 'btn btn-ghost', '卸载');
+    remove.dataset.action = 'plugin-uninstall';
+    remove.dataset.package = plugin.package;
+    remove.disabled = isBusy;
+    row.append(remove);
     row.append(elWith('span', 'bundle', plugin.bundle ? '已启用' : '未启用'));
     el.localList.append(row);
   }
@@ -517,7 +575,7 @@ let activeTab = 'dsh';
 /** Last plugin action id we already reacted to, so a finished install reloads once. */
 let handledPluginAction = null;
 /** Catalog + installed state rendered by the market tab. */
-const market = { loading: false, loaded: false, error: null, rows: [], localOnly: [], installed: null, meta: null, runtime: null, pnpm: null };
+const market = { loading: false, loaded: false, error: null, rows: [], localOnly: [], installed: null, meta: null, runtime: null, pnpm: null, groups: null, community: null };
 
 /**
  * The only button that stays inline is the phase's primary call to action.
@@ -605,10 +663,24 @@ function renderMenu(phase) {
   }
 }
 
+/**
+ * Open/close the ⋮ dropdown.
+ *
+ * The embedded dsh Web view is a native view stacked *above* this renderer, so
+ * a dropdown that extends below the top bar would be painted underneath it and
+ * look unresponsive. The view is therefore hidden while the menu is open and
+ * restored to whatever the user had chosen afterwards.
+ */
 function openMenu(open) {
-  const shouldOpen = open ?? el.menuList.hidden;
+  const wasOpen = !el.menuList.hidden;
+  const shouldOpen = open ?? !wasOpen;
   el.menuList.hidden = !shouldOpen;
   el.menuBtn.setAttribute('aria-expanded', String(shouldOpen));
+  // `guiHidden` is the user's own preference (the 查看日志 toggle); the menu
+  // only borrows the view's visibility, and only when it actually changed.
+  if (shouldOpen !== wasOpen) {
+    api.setGuiVisible(shouldOpen ? false : !guiHidden).catch(() => {});
+  }
 }
 
 // -------------------------------------------------------------------- render
@@ -744,6 +816,23 @@ const ACTIONS = {
     api.installPlugin({ packageName: button.dataset.package, version: button.dataset.version || null }),
   'plugin-open': (button) => api.openExternal(button.dataset.url),
   'plugin-cancel': () => api.cancelPlugin(),
+  'plugin-uninstall': (button) => {
+    // First click arms the button; the second one really removes the plugin.
+    if (button.dataset.confirm !== '1') {
+      button.dataset.confirm = '1';
+      button.textContent = '确认卸载';
+      button.classList.add('btn-danger');
+      setTimeout(() => {
+        if (!button.isConnected) return;
+        button.dataset.confirm = '';
+        button.textContent = '卸载';
+        button.classList.remove('btn-danger');
+      }, 3000);
+      return undefined;
+    }
+    button.disabled = true;
+    return api.uninstallPlugin({ packageName: button.dataset.package });
+  },
   'market-setup-pnpm': async () => {
     await api.setupPnpm();
     await loadMarket();

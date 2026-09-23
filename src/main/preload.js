@@ -50,6 +50,8 @@ contextBridge.exposeInMainWorld('dshShell', {
   installedPlugins: () => ipcRenderer.invoke('market:installed'),
   /** Install or update one plugin (progress via onState/onLog). */
   installPlugin: (payload) => ipcRenderer.invoke('market:install', payload),
+  /** Uninstall one plugin (progress via onState/onLog). */
+  uninstallPlugin: (payload) => ipcRenderer.invoke('market:uninstall', payload),
   /** Cancel an in-flight plugin install/update. */
   cancelPlugin: () => ipcRenderer.invoke('market:cancel'),
   /** Check for pnpm and install it when missing (market dependency). */

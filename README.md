@@ -17,9 +17,9 @@
 | tab | 内容 |
 | --- | --- |
 | **DSH 运行信息** | 运行中的 dsh Web 界面（内嵌 `WebContentsView`）；未就绪时显示检测/安装/启动各阶段面板 |
-| **插件市场** | 外壳自带的插件市场（独立于 dsh，不是 dsh 插件）：读取 `dsh.textwork.cn` 上的目录，展示版本、本地已安装版本与可更新项，可一键安装/更新；安装完成后自动重启 dsh 并刷新 DSH tab 的 Web 界面 |
+| **插件市场** | 外壳自带的插件市场（独立于 dsh，不是 dsh 插件）：读取 `dsh.textwork.cn` 的目录，按 **本站维护 / 社区插件** 两组展示，标注版本、本地已安装版本与可更新项，可一键 **安装 / 更新 / 卸载**；变更后自动重启 dsh 并刷新 DSH tab 的 Web 界面 |
 
-插件市场的数据来源是 **<https://dsh.textwork.cn/plugins/index.json>**（仓库内 `site/plugins/index.json` 是站点发布内容的镜像，由站点侧工具生成，不是手工编辑的源）；默认管理 dsh 的 `web` profile。可用 `npm run test:network` 校验线上目录可达、条目合法，并对比目录版本与 npm 最新版是否漂移。
+插件市场的数据来源是站点的唯一数据源 **<https://dsh.textwork.cn/plugins/plugins.json>**（自身段 `plugins` + 社区段 `community`，含 npm 同步的版本/许可/仓库等字段；`plugins/index.json` 作为旧格式回退保留）。仓库内 `site/plugins/index.json` 是站点发布内容的镜像，由站点侧工具生成，不是手工编辑的源。默认管理 dsh 的 `web` profile。可用 `npm run test:network` 校验线上目录可达、两组齐全、条目合法，并对比目录版本与 npm 最新版是否漂移。
 
 工具栏只保留当前阶段的主操作（安装 / 取消 / 停止 / 重试），**重新加载、查看日志、浏览器打开、重启/停止 dsh、重新检测等调试与维护操作都收在右上角的「⋮」菜单里**；状态区显示当前状态 + 机器名 + dsh 版本（端口仅在内部使用，不占用界面）。退出应用时会一并结束 dsh 子进程。
 
@@ -124,7 +124,7 @@ npx electron-builder --win
 | `npm run dev` | 启动并打开开发者工具 |
 | `npm test` / `npm run verify` | 纯 Node 逻辑验证（检测、进度模型、安装流程、服务生命周期、状态机端到端） |
 | `npm run self-test` | Electron 运行时冒烟测试：窗口、preload 桥、界面、内嵌视图、工具栏、IPC；**不会启动 dsh** |
-| `npm run test:network` | 实网验证运行时自动配置：真实下载 Node.js LTS、确认 npm 全局目录落在托管目录内、真实安装一次 dsh |
+| `npm run test:network` | 实网验证：真实下载 Node.js LTS、确认 npm 全局目录落在托管目录内、真实安装一次 dsh，以及校验线上插件目录（两组齐全 / 条目合法 / 与 npm 版本一致） |
 | `npm run diagnose` | 运行时配置诊断：模拟一台没有 Node 的机器跑完整流程，逐条打印 node/npm 检查结果（排查环境问题用） |
 | `npm run capture-ui` | 把各阶段界面渲染成 `ui-preview/*.png`（含打开的 ⋮ 菜单） |
 | `npm run pack` / `npm run dist` | 打包桌面应用 |
@@ -160,6 +160,7 @@ test/              验证脚本与 fixture（伪 npm、伪 dsh）
 - **坏运行时不会被困在循环里**：只检查文件是否存在是不够的（半解压的运行时 node 能跑、npm 不能），复用前必须真实执行 node 与 npm；校验失败就删除目录重新配置，并在界面上说明是 node 还是 npm 失败、具体报错是什么。
 - **为什么必须锁定 npm 的 prefix**：npm 的全局目录来自启动环境——父级 `npm run` 会导出 `npm_config_global_prefix`，用户 `~/.npmrc` 也可能写了 `prefix`，两者都会让 `npm install -g` 落到需要管理员权限的系统目录。因此托管运行时会把 `npm_config_prefix` 与 `npm_config_cache` 钉在托管目录内（registry/代理等其余配置保持不变），这也是实网验证里专门校验的一项。
 - **插件装到"实际在跑的 dsh"上**：dsh 的 home 由 `$DSH_HOME`（支持 `~` 展开）或 `os.homedir()/.dsh` 决定，而 `os.homedir()` 在 Windows 读的是 `USERPROFILE`/`HOMEDRIVE`+`HOMEPATH`。市场因此**按传给 dsh 的那个环境**解析 home 与 `profiles/<profile>`（而不是想当然用 `~/.dsh`），并且始终用检测到的那个 dsh 执行命令——这样当 dsh 是 DSH-D 私有安装的（Windows 上常见，`<userData>/runtime/node-*/dsh.cmd`）、或机器把 `DSH_HOME` 指到别处时，读取的已装版本与安装目标都仍然正确。市场页顶部始终显示 `profile 目录 · dsh 路径(版本) · pnpm 状态`，profile 缺失时会列出该 home 下实际存在的 profile。
+- **原生视图与壳层 UI 的层级**：内嵌的 dsh 界面是原生 `WebContentsView`，绘制在渲染层**之上**；因此下拉菜单若延伸到顶栏以下就会被它盖住（表现为"点了没反应"）。菜单展开期间会临时隐藏该视图、关闭后恢复，并且主进程在收到显示/隐藏请求时会按"当前 tab + 阶段"重新判断，避免市场 tab 上误显示视图。
 - **插件市场为什么这样工作**：市场是外壳自身的能力（不是 dsh 插件）；它管理的是 **dsh 插件**，因为只有装进 dsh profile 的插件才会影响 Harness 本身。`dsh plugin` 本质是 pnpm 转发器——在 profile 目录里 `pnpm add`，随后把 `dsh.profile.bundles` 与已安装状态对齐，而 **bundle 只在启动时读取**，所以安装/更新成功后必须重启 dsh，这次重启同时也是"刷新 DSH tab 里 dsh Web"的动作。已安装的版本来自 `<profile>/node_modules/<pkg>/package.json`，`link:`/`file:` 等本地依赖会被标注出来。
 - **外部输入不直接进命令行**：目录是远端数据，包名与版本都要先通过白名单正则（`@scope/name`、semver/dist-tag）才会拼进 `dsh plugin … add <pkg>@<ver>`；解析时也会丢弃非法条目，避免把远端内容变成可执行的命令。
 - **pnpm 缺失时自动补**：`dsh plugin` 依赖 pnpm，而自动配置的托管运行时只有 npm，所以市场在安装前会检测 pnpm，缺失时用当前 npm 装到同一运行时而无需管理员权限。
@@ -180,11 +181,11 @@ test/              验证脚本与 fixture（伪 npm、伪 dsh）
 
 ## 已验证内容
 
-`npm test`（192 项）覆盖：登录环境解析、检测、进度模型、`dsh web: <url>` 解析、安装成功/失败与提示、服务启停生命周期、状态机端到端（未安装 → 安装 → 启动 → 运行 → 重启 → 停止，使用 fixture 注入，不触碰真实 npm/dsh），**模拟 `win32` 的 Windows 代码路径**（`.cmd` 是否走 shell、含空格路径的引号处理、PATH 分号分隔、PATHEXT 解析、Windows 全局目录推断），**运行时自动配置**（发行版地址解析、LTS 选择、下载进度、真实 tar 解压、复用与取消、托管环境 prefix/cache 锁定、控制器"缺 Node → 自动配置 → 进入安装 dsh"流程与失败兜底），**插件市场**（semver 比较含预发布、包名/版本白名单、目录解析与非法条目丢弃、profile 已装插件读取与版本来源、目录与本地状态合并、pnpm 自举、安装参数构造、控制器"安装 → 自动重启 dsh → 版本更新"与失败不重启），以及**dsh 实际位置与 pnpm 依赖**（按环境解析 home：posix `HOME` / Windows `USERPROFILE`/`HOMEDRIVE+HOMEPATH`/`DSH_HOME` 含 `~` 展开、profile 缺失时列出实际存在的 profile、pnpm 纳入检测、启动时自动安装 pnpm 且失败不阻塞、私有安装识别、市场读数与安装使用同一 home）。
+`npm test`（203 项）覆盖：登录环境解析、检测、进度模型、`dsh web: <url>` 解析、安装成功/失败与提示、服务启停生命周期、状态机端到端（未安装 → 安装 → 启动 → 运行 → 重启 → 停止，使用 fixture 注入，不触碰真实 npm/dsh），**模拟 `win32` 的 Windows 代码路径**（`.cmd` 是否走 shell、含空格路径的引号处理、PATH 分号分隔、PATHEXT 解析、Windows 全局目录推断），**运行时自动配置**（发行版地址解析、LTS 选择、下载进度、真实 tar 解压、复用与取消、托管环境 prefix/cache 锁定、控制器"缺 Node → 自动配置 → 进入安装 dsh"流程与失败兜底），**插件市场**（新目录 schema：自身/社区分组、`name`/`package` 兼容、站点相对链接补全、社区 downloads/stars、semver 比较含预发布、包名/版本白名单、目录解析与非法条目丢弃、profile 已装插件读取与版本来源、目录与本地状态合并、pnpm 自举、安装参数构造、控制器"安装 → 自动重启 dsh → 版本更新"与失败不重启），以及**dsh 实际位置与 pnpm 依赖**（按环境解析 home：posix `HOME` / Windows `USERPROFILE`/`HOMEDRIVE+HOMEPATH`/`DSH_HOME` 含 `~` 展开、profile 缺失时列出实际存在的 profile、pnpm 纳入检测、启动时自动安装 pnpm 且失败不阻塞、私有安装识别、市场读数与安装使用同一 home）。
 
 `npm run test:network`（12 项）在真实网络上验证：下载 Node.js LTS（约 52 MB）→ 解压校验 → `npm prefix -g` 落在托管目录 → 真实执行 `npm install -g @deepseek-ai/dsh` 并运行托管目录内的 dsh。
 
-`npm run self-test`（39 项）在真实 Electron 中验证：窗口与界面渲染、preload 桥、IPC 往返、剪贴板 API、主进程检测、`WebContentsView` 创建/尺寸/隐藏，工具栏（菜单可展开、不遮挡退出按钮、运行阶段无内联调试按钮、状态区显示机器名与 dsh 版本且不含端口），**顶部 tab 与插件市场**（两个大 tab、切换后阶段面板让位、内嵌视图在市场上隐藏、用本地 fixture 目录渲染卡片与本地已装列表、有更新时出现更新按钮、安装会调用 dsh plugin 并自动重启、切回 DSH tab 恢复），以及**实际位置与 pnpm 告警**（市场显示 profile 目录与 dsh 路径、pnpm 不可用时给出告警与"自动配置 pnpm"入口、点击后触发配置且告警消失）。
+`npm run self-test`（53 项）在真实 Electron 中验证：窗口与界面渲染、preload 桥、IPC 往返、剪贴板 API、主进程检测、`WebContentsView` 创建/尺寸/隐藏，工具栏（菜单可展开、不遮挡退出按钮、运行阶段无内联调试按钮、状态区显示机器名与 dsh 版本且不含端口），**顶部 tab 与插件市场**（两个大 tab、切换后阶段面板让位、内嵌视图在市场上隐藏、用本地 fixture 目录渲染卡片与本地已装列表、有更新时出现更新按钮、安装会调用 dsh plugin 并自动重启、切回 DSH tab 恢复），**实际位置与 pnpm 告警**（市场显示 profile 目录与 dsh 路径、pnpm 不可用时给出告警与"自动配置 pnpm"入口、点击后触发配置且告警消失），以及**菜单与层级**（用真实鼠标输入点击 ⋮ 验证可命中/展开/收起，菜单展开时内嵌视图隐藏、关闭后恢复，市场 tab 不显示视图）、**分组与卸载**（自身/社区两个分组、分组计数、已安装项出现卸载按钮、卸载走 dsh plugin remove 并同样重启）。
 
 > 在受限环境（容器、外层的进程沙箱、CI）中，Chromium 自身的沙箱可能无法初始化，此时可加 `--no-sandbox --disable-gpu` 运行自检：
 > ```bash

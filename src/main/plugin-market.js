@@ -25,8 +25,20 @@ const { fetchText } = require('./node-runtime');
 const { createLineSplitter, terminate } = require('./process-tree');
 const { IS_WINDOWS, runCapture, shellCommandFor } = require('./shell-env');
 
-/** Catalog endpoint served by the project's download site. */
-const DEFAULT_MARKET_URL = 'https://dsh.textwork.cn/plugins/index.json';
+/**
+ * Catalog endpoints, in order of preference.
+ *
+ * `plugins/plugins.json` is the site's single source of truth (first-party
+ * `plugins` plus a `community` section); `plugins/index.json` is the older
+ * machine-only shape and stays as a fallback.
+ */
+const DEFAULT_MARKET_URLS = [
+  'https://dsh.textwork.cn/plugins/plugins.json',
+  'https://dsh.textwork.cn/plugins/index.json',
+];
+const DEFAULT_MARKET_URL = DEFAULT_MARKET_URLS[0];
+/** Origin used to absolutize site-relative links such as `detail`. */
+const DEFAULT_MARKET_ORIGIN = 'https://dsh.textwork.cn';
 
 /** The profile the shell boots; plugins are installed into it. */
 const DEFAULT_PROFILE = 'web';
@@ -174,82 +186,168 @@ function cleanList(value, max = 12) {
 }
 
 /**
+ * First sentence of a long description, for the compact card.
+ *
+ * CJK sentences end with a full-width mark and take no following space, while
+ * an ASCII period only ends a sentence when a space or the end follows (so
+ * version numbers stay intact).
+ */
+function firstSentence(text, max = 160) {
+  const value = cleanText(text, 800);
+  if (!value) return '';
+  const match = value.match(/^(.{4,}?[。！？；]|.{10,}?\.(?=\s|$))/);
+  const sentence = match ? match[1] : value;
+  return sentence.length > max ? `${sentence.slice(0, max - 1)}…` : sentence;
+}
+
+/** Resolve a possibly site-relative link against the catalog origin. */
+function absoluteUrl(value, origin) {
+  const text = cleanText(value, 300);
+  if (!text) return '';
+  if (/^https?:\/\//i.test(text)) return text;
+  if (text.startsWith('/') && origin) return `${String(origin).replace(/\/+$/, '')}${text}`;
+  return text;
+}
+
+/**
+ * Normalize one catalog entry.
+ *
+ * Both shapes are accepted: the site's current `plugins.json` (`name`, `title`,
+ * `description`, `keywords`, `detail`, community extras) and the older
+ * `index.json` (`package`, `summary`, `highlights`, `tags`).
+ *
+ * @returns {object|null} normalized entry, or null when unsafe/malformed.
+ */
+function normalizeCatalogEntry(raw, context) {
+  if (!raw || typeof raw !== 'object') return null;
+  const packageName = cleanText(raw.package ?? raw.name, 214);
+  const version = cleanText(raw.version, 64);
+  if (!isSafePackageName(packageName) || !isSafeVersion(version)) return null;
+
+  const description = cleanText(raw.description, 1200);
+  const detail = absoluteUrl(raw.detail, context.origin);
+  const homepage = absoluteUrl(raw.homepage, context.origin);
+  return {
+    package: packageName,
+    name: cleanText(raw.short_name, 80) || packageName.split('/').pop(),
+    title: cleanText(raw.title, 120),
+    version,
+    summary: cleanText(raw.summary, 300) || firstSentence(description),
+    description,
+    highlights: cleanList(raw.highlights),
+    tags: cleanList(raw.tags ?? raw.keywords, 8),
+    category: cleanText(raw.category, 40),
+    license: cleanText(raw.license, 40),
+    author: cleanText(raw.author, 80),
+    npm: cleanText(raw.npm, 300),
+    repository: cleanText(raw.repository, 300),
+    homepage,
+    detail,
+    requires: cleanText(raw.requires, 200),
+    enginesNode: cleanText(raw.engines_node, 40),
+    publishedAt: cleanText(raw.published_at, 40),
+    downloads: Number.isFinite(raw.downloads) ? raw.downloads : null,
+    stars: Number.isFinite(raw.stars) ? raw.stars : null,
+    minShell: cleanText(raw.minShell, 32),
+    group: context.group,
+  };
+}
+
+/**
  * Parse and validate a catalog payload.
  *
  * Anything unsafe or malformed is dropped rather than trusted: the catalog is
  * remote input that ends up on a command line.
  *
  * @param {string} text raw JSON body.
- * @returns {{schemaVersion: number, updatedAt: string, site: string, plugins: object[]}}
+ * @param {{origin?: string}} [options]
+ * @returns {{schemaVersion: number, updatedAt: string, site: string, plugins: object[],
+ *            groups: Record<string, object[]>, community: object|null}}
  * @throws {Error} when the payload is not a usable catalog at all.
  */
-function parseCatalog(text) {
+function parseCatalog(text, options = {}) {
   let payload;
   try {
     payload = JSON.parse(text);
   } catch (error) {
     throw new Error(`目录不是合法 JSON：${error instanceof Error ? error.message : String(error)}`);
   }
-  if (!payload || typeof payload !== 'object') throw new Error('目录结构无效');
-  const list = Array.isArray(payload.plugins) ? payload.plugins : null;
-  if (!list) throw new Error('目录缺少 plugins 数组');
 
-  const plugins = [];
-  const skipped = [];
-  for (const entry of list) {
-    if (!entry || typeof entry !== 'object') continue;
-    const packageName = cleanText(entry.package, 214);
-    const version = cleanText(entry.version, 64);
-    if (!isSafePackageName(packageName) || !isSafeVersion(version)) {
-      skipped.push(packageName || '(未命名)');
-      continue;
-    }
-    plugins.push({
-      package: packageName,
-      name: cleanText(entry.name, 80) || packageName.split('/').pop(),
-      version,
-      summary: cleanText(entry.summary, 300),
-      description: cleanText(entry.description, 1200),
-      highlights: cleanList(entry.highlights),
-      tags: cleanList(entry.tags, 8),
-      license: cleanText(entry.license, 40),
-      author: cleanText(entry.author, 80),
-      npm: cleanText(entry.npm, 300),
-      repository: cleanText(entry.repository, 300),
-      homepage: cleanText(entry.homepage, 300),
-      minShell: cleanText(entry.minShell, 32),
-    });
+  // A bare array is treated as the first-party list.
+  if (Array.isArray(payload)) payload = { plugins: payload };
+  if (!payload || typeof payload !== 'object') throw new Error('目录结构无效');
+
+  const origin = options.origin ?? (cleanText(payload.site, 200) || DEFAULT_MARKET_ORIGIN);
+  const communitySection = payload.community;
+  const communityList = Array.isArray(communitySection)
+    ? communitySection
+    : Array.isArray(communitySection?.plugins)
+      ? communitySection.plugins
+      : null;
+
+  if (!Array.isArray(payload.plugins) && !communityList) {
+    throw new Error('目录缺少 plugins / community 列表');
   }
+
+  const skipped = [];
+  const normalizeAll = (list, group) =>
+    (list ?? [])
+      .map((entry) => {
+        const normalized = normalizeCatalogEntry(entry, { group, origin });
+        if (!normalized) {
+          skipped.push(cleanText(entry?.package ?? entry?.name, 60) || '(未命名)');
+        }
+        return normalized;
+      })
+      .filter(Boolean);
+
+  const groups = {
+    'first-party': normalizeAll(payload.plugins, 'first-party'),
+    community: normalizeAll(communityList, 'community'),
+  };
+  const plugins = [...groups['first-party'], ...groups.community];
 
   if (plugins.length === 0 && skipped.length > 0) {
     throw new Error(`目录中的插件条目均无效：${skipped.slice(0, 3).join('、')}`);
   }
 
   return {
-    schemaVersion: Number(payload.schemaVersion ?? payload.version ?? 1) || 1,
-    updatedAt: cleanText(payload.updatedAt, 32),
+    schemaVersion: Number(payload.schemaVersion ?? payload.schema ?? payload.version ?? 1) || 1,
+    updatedAt: cleanText(payload.updatedAt ?? payload.updated_at, 40),
     site: cleanText(payload.site, 200),
+    registry: cleanText(payload.registry, 200),
     plugins,
+    groups,
+    community: communityList
+      ? {
+          note: cleanText(communitySection?.note, 400),
+          source: cleanText(communitySection?.source, 300),
+          metric: cleanText(communitySection?.metric, 80),
+          window: cleanText(communitySection?.window, 80),
+          verifiedAt: cleanText(communitySection?.verified_at, 40),
+        }
+      : null,
+    skipped,
   };
 }
 
-/** Download and parse the catalog. */
+/** Download and parse the catalog, falling back through the source list. */
 async function fetchCatalog(options = {}) {
-  const url = options.url ?? DEFAULT_MARKET_URL;
-  const requestUrl = `${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`;
-  try {
-    const text = await fetchText(requestUrl, {
-      timeoutMs: options.timeoutMs ?? CATALOG_TIMEOUT_MS,
-      signal: options.signal,
-    });
-    return { ok: true, catalog: parseCatalog(text), source: url, fetchedAt: Date.now() };
-  } catch (error) {
-    return {
-      ok: false,
-      source: url,
-      error: error instanceof Error ? error.message : String(error),
-    };
+  const urls = options.url ? [options.url] : options.urls ?? DEFAULT_MARKET_URLS;
+  const errors = [];
+  for (const url of urls) {
+    const requestUrl = `${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`;
+    try {
+      const text = await fetchText(requestUrl, {
+        timeoutMs: options.timeoutMs ?? CATALOG_TIMEOUT_MS,
+        signal: options.signal,
+      });
+      return { ok: true, catalog: parseCatalog(text), source: url, fetchedAt: Date.now() };
+    } catch (error) {
+      errors.push(`${url}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
+  return { ok: false, source: urls[0], error: errors.join('；'), tried: urls };
 }
 
 /** Read `<profile>/node_modules/<pkg>/package.json` for the installed version. */
@@ -378,19 +476,30 @@ function marketRows(catalog, installed) {
     rows,
     localOnly,
     updates: rows.filter((row) => row.status === 'update-available').length,
+    groupCounts: {
+      'first-party': rows.filter((row) => row.group === 'first-party').length,
+      community: rows.filter((row) => row.group === 'community').length,
+    },
   };
 }
 
 /**
- * Build the `dsh plugin` argv for an install/update.
+ * Build the `dsh plugin` argv for an install, update or uninstall.
  *
- * @param {{profile?: string, packageName: string, version?: string|null}} options
+ * @param {{profile?: string, packageName: string, version?: string|null, action?: 'add'|'remove'}} options
  * @returns {string[]} arguments for the dsh executable.
  */
 function buildPluginArgs(options) {
   const profile = options.profile ?? DEFAULT_PROFILE;
   const packageName = String(options.packageName ?? '');
   if (!isSafePackageName(packageName)) throw new Error(`不安全的包名：${packageName}`);
+
+  if (options.action === 'remove') {
+    // `pnpm remove` in the profile dir; dsh then drops the layer from
+    // `dsh.profile.bundles` while reconciling.
+    return ['plugin', '--profile', profile, 'remove', packageName];
+  }
+
   const version = options.version ? String(options.version) : '';
   if (version && !isSafeVersion(version)) throw new Error(`不安全的版本号：${version}`);
   const spec = version ? `${packageName}@${version}` : packageName;
@@ -518,7 +627,9 @@ async function ensurePnpm(options) {
 module.exports = {
   BUILTIN_PREFIX,
   CATALOG_TIMEOUT_MS,
+  DEFAULT_MARKET_ORIGIN,
   DEFAULT_MARKET_URL,
+  DEFAULT_MARKET_URLS,
   DEFAULT_PROFILE,
   INSTALL_TIMEOUT_MS,
   buildPluginArgs,
@@ -530,8 +641,11 @@ module.exports = {
   homedirOf,
   resolveDshHome,
   ensurePnpm,
+  absoluteUrl,
   fetchCatalog,
   findPnpm,
+  firstSentence,
+  normalizeCatalogEntry,
   isSafePackageName,
   isSafeVersion,
   marketRows,

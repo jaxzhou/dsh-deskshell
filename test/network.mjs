@@ -126,7 +126,7 @@ if (!runtime.ok) {
 
 console.log('\n6. 插件市场目录（客户端读取 dsh.textwork.cn）');
 const liveMarket = await market.fetchCatalog({});
-check('默认目录地址指向 dsh.textwork.cn', market.DEFAULT_MARKET_URL === 'https://dsh.textwork.cn/plugins/index.json', market.DEFAULT_MARKET_URL);
+check('默认目录地址指向 dsh.textwork.cn 的 plugins.json', market.DEFAULT_MARKET_URL === 'https://dsh.textwork.cn/plugins/plugins.json', market.DEFAULT_MARKET_URL);
 check('目录可下载并解析', liveMarket.ok === true, liveMarket.ok ? '' : liveMarket.error);
 if (liveMarket.ok) {
   const { catalog } = liveMarket;
@@ -137,6 +137,9 @@ if (liveMarket.ok) {
     catalog.plugins.every((plugin) => market.isSafePackageName(plugin.package) && market.isSafeVersion(plugin.version)),
     catalog.plugins.map((plugin) => `${plugin.package}@${plugin.version}`).join(', '),
   );
+  console.log(`    自身 ${catalog.groups['first-party'].length} 个 / 社区 ${catalog.groups.community.length} 个`);
+  check('目录包含自身与社区两组', catalog.groups['first-party'].length > 0 && catalog.groups.community.length > 0, JSON.stringify(market.marketRows(catalog, { plugins: [] }).groupCounts));
+  check('社区段带来源与统计口径', Boolean(catalog.community?.metric), JSON.stringify(catalog.community ?? null));
 
   // Drift check: the catalog is published by the site tooling, so a plugin that
   // moved on npm would leave the market offering an outdated version.

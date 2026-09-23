@@ -432,6 +432,8 @@ class ShellController extends EventEmitter {
       profile: this.profile,
       dshRuntime: this.describeDshRuntime(),
       pnpm: this.detection?.pnpm ? { ...this.detection.pnpm, failedReason: this.pnpmError } : null,
+      registry: catalog.ok ? catalog.catalog.registry : null,
+      community: catalog.ok ? catalog.catalog.community : null,
       installed,
       ...merged,
     };
@@ -448,8 +450,39 @@ class ShellController extends EventEmitter {
    * @param {{packageName: string, version?: string|null}} options
    */
   async installPlugin(options = {}) {
+    return this.#changePlugin({
+      kind: 'install',
+      packageName: String(options.packageName ?? ''),
+      version: options.version ? String(options.version) : null,
+    });
+  }
+
+  /**
+   * Uninstall one plugin from the profile and restart dsh.
+   *
+   * @param {{packageName: string}} options
+   */
+  async uninstallPlugin(options = {}) {
     const packageName = String(options.packageName ?? '');
-    const version = options.version ? String(options.version) : null;
+    if (!isSafePackageName(packageName)) {
+      return { ok: false, error: `非法的包名：${packageName || '(空)'}` };
+    }
+    const installed = this.getInstalledPlugins();
+    if (installed.exists && !installed.plugins.some((plugin) => plugin.package === packageName)) {
+      return { ok: false, error: `${packageName} 未安装在 profile「${this.profile}」中` };
+    }
+    return this.#changePlugin({ kind: 'uninstall', packageName, version: null });
+  }
+
+  /**
+   * Shared install/update/uninstall flow.
+   *
+   * @private
+   * @param {{kind: 'install'|'uninstall', packageName: string, version: string|null}} request
+   */
+  async #changePlugin(request) {
+    const { kind, packageName, version } = request;
+    const removing = kind === 'uninstall';
 
     if (this.pluginAction?.running) return { ok: false, error: '已有插件操作正在进行' };
     if (!isSafePackageName(packageName)) {
@@ -462,7 +495,18 @@ class ShellController extends EventEmitter {
       return { ok: false, error: '尚未安装 dsh，请先完成 dsh 安装' };
     }
 
-    const args = buildPluginArgs({ profile: this.profile, packageName, version });
+    let args;
+    try {
+      args = buildPluginArgs({
+        profile: this.profile,
+        packageName,
+        version,
+        action: removing ? 'remove' : 'add',
+      });
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+
     const started = Date.now();
     const setStep = (step, extra = {}) => {
       this.pluginAction = { ...this.pluginAction, ...extra, step, running: true };
@@ -471,8 +515,9 @@ class ShellController extends EventEmitter {
 
     this.pluginAction = {
       running: true,
+      kind,
       packages: packageName,
-      version,
+      version: removing ? null : version,
       profile: this.profile,
       step: '准备',
       ok: null,
@@ -492,10 +537,11 @@ class ShellController extends EventEmitter {
       onLog,
     });
     if (!pnpm.ok) {
-      return this.#failPlugin(pnpm.error ?? 'pnpm 不可用', started);
+      return this.#failPlugin(kind, pnpm.error ?? 'pnpm 不可用', started);
     }
 
-    setStep(version ? `正在安装 ${packageName}@${version}` : `正在安装 ${packageName}`);
+    const spec = version ? `${packageName}@${version}` : packageName;
+    setStep(removing ? `正在卸载 ${packageName}` : `正在安装 ${spec}`);
     const handle = this.runPluginCommand({
       dshCommand: this.detection.dsh.command,
       args,
@@ -515,21 +561,31 @@ class ShellController extends EventEmitter {
 
     if (!result.ok) {
       const tail = String(result.output ?? '').trim().split('\n').slice(-3).join(' / ');
-      return this.#failPlugin([result.error, tail].filter(Boolean).join(' — ') || '安装失败', started);
+      return this.#failPlugin(
+        kind,
+        [result.error, tail].filter(Boolean).join(' — ') || (removing ? '卸载失败' : '安装失败'),
+        started,
+      );
     }
 
-    // The plugin only becomes an active layer at boot: restart dsh, which also
+    // The profile layer list only changes at boot: restart dsh, which also
     // reloads the embedded DSH Web view.
-    setStep('重启 dsh 以加载插件');
-    this.pushLog({ stream: 'system', line: '插件已写入 profile，正在重启 dsh 使插件生效…' });
+    setStep(removing ? '重启 dsh 以移除插件' : '重启 dsh 以加载插件');
+    this.pushLog({
+      stream: 'system',
+      line: removing
+        ? '插件已从 profile 移除，正在重启 dsh 使改动生效…'
+        : '插件已写入 profile，正在重启 dsh 使插件生效…',
+    });
     await this.restart();
 
     const installed = this.getInstalledPlugins();
     const entry = installed.plugins.find((plugin) => plugin.package === packageName) ?? null;
     this.pluginAction = {
       running: false,
+      kind,
       packages: packageName,
-      version: entry?.version ?? version,
+      version: entry?.version ?? (removing ? null : version),
       profile: this.profile,
       step: '完成',
       ok: true,
@@ -539,17 +595,20 @@ class ShellController extends EventEmitter {
     };
     this.pushLog({
       stream: 'system',
-      line: `插件已就绪：${packageName}${entry?.version ? `@${entry.version}` : ''}（dsh 已重启，界面已刷新）`,
+      line: removing
+        ? `插件已卸载：${packageName}（dsh 已重启，界面已刷新）`
+        : `插件已就绪：${packageName}${entry?.version ? `@${entry.version}` : ''}（dsh 已重启，界面已刷新）`,
     });
     this.broadcast();
     return { ok: true, plugin: entry };
   }
 
   /** @private Record a plugin failure and surface it to the UI. */
-  #failPlugin(message, started) {
+  #failPlugin(kind, message, started) {
     this.pluginAction = {
       ...(this.pluginAction ?? { packages: '', profile: this.profile }),
       running: false,
+      kind, 
       step: '失败',
       ok: false,
       error: message,

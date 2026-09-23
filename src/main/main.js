@@ -131,8 +131,10 @@ function detachGuiView() {
  */
 function setGuiVisible(visible) {
   guiHiddenByUser = !visible;
-  if (!guiView) return guiHiddenByUser;
-  guiView.setVisible(Boolean(visible));
+  // Re-evaluate instead of trusting the request: the embedded view only belongs
+  // on the DSH tab while dsh runs, so a "show" request from another tab (or
+  // while a phase panel is up) must not reveal it.
+  syncGuiView(controller.getState());
   return guiHiddenByUser;
 }
 
@@ -320,6 +322,14 @@ function registerIpc() {
     return controller.getState();
   });
 
+  ipcMain.handle('market:uninstall', (_event, payload) => {
+    // Fire and forget: progress arrives through the state stream.
+    controller
+      .uninstallPlugin({ packageName: payload?.packageName })
+      .catch((error) => reportError('卸载插件失败', error));
+    return controller.getState();
+  });
+
   ipcMain.handle('market:cancel', () => {
     controller.cancelPluginAction();
     return controller.getState();
@@ -409,6 +419,60 @@ async function runSelfTest() {
     record('视图可隐藏', guiView.getVisible() === false);
 
     console.log('4. 工具栏：状态区与菜单');
+    // Real mouse input through the browser pipeline: a synthetic .click() would
+    // miss overlay/hit-test regressions, which is exactly how a visible but
+    // unclickable button slips through.
+    const menuButtonPoint = await win.webContents.executeJavaScript(
+      '(() => { const r = document.getElementById("menuBtn").getBoundingClientRect(); return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }; })()',
+    );
+    const hitTest = await win.webContents.executeJavaScript(
+      `(() => { const el = document.elementFromPoint(${menuButtonPoint.x}, ${menuButtonPoint.y}); return { tag: el?.tagName, id: el?.id, cls: el?.className, inMenuBtn: Boolean(el?.closest?.('#menuBtn')) }; })()`,
+    );
+    record('菜单按钮可被命中（无遮挡）', hitTest.inMenuBtn === true, JSON.stringify(hitTest));
+    win.webContents.sendInputEvent({ type: 'mouseDown', x: menuButtonPoint.x, y: menuButtonPoint.y, button: 'left', clickCount: 1 });
+    win.webContents.sendInputEvent({ type: 'mouseUp', x: menuButtonPoint.x, y: menuButtonPoint.y, button: 'left', clickCount: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const menuAfterClick = await win.webContents.executeJavaScript(
+      '(() => { const list = document.getElementById("menuList"); const r = list.getBoundingClientRect(); return { hidden: list.hidden, items: list.querySelectorAll(".menu-item").length, rect: { top: Math.round(r.top), height: Math.round(r.height) }, expanded: document.getElementById("menuBtn").getAttribute("aria-expanded"), visiblePx: Math.round(Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0)) }; })()',
+    );
+    record('点击 ⋮ 用真实输入可打开菜单', menuAfterClick.hidden === false && menuAfterClick.items > 0, JSON.stringify(menuAfterClick));
+    record('菜单展开后有可见区域', menuAfterClick.visiblePx > 0, JSON.stringify(menuAfterClick));
+    // The native dsh view would otherwise paint over the dropdown.
+    record(
+      '菜单展开时隐藏内嵌视图（避免被原生视图遮挡）',
+      !guiView || guiView.getVisible() === false,
+      `visible=${guiView ? guiView.getVisible() : 'no-view'}`,
+    );
+    win.webContents.sendInputEvent({ type: 'mouseDown', x: menuButtonPoint.x, y: menuButtonPoint.y, button: 'left', clickCount: 1 });
+    win.webContents.sendInputEvent({ type: 'mouseUp', x: menuButtonPoint.x, y: menuButtonPoint.y, button: 'left', clickCount: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const menuClosed = await win.webContents.executeJavaScript('document.getElementById("menuList").hidden');
+    record('再次点击可收起菜单', menuClosed === true, String(menuClosed));
+
+    // With dsh running, the view must come back once the menu closes. Main
+    // reads the controller's state for that decision, so the controller is
+    // made to report "running" for this sub-test.
+    const running = { ...controller.getState(), phase: 'running', server: { running: true, url: 'http://127.0.0.1:1/?token=x', port: 1 } };
+    const realGetState = controller.getState.bind(controller);
+    controller.getState = () => running;
+    await win.webContents.executeJavaScript(
+      `window.render(${JSON.stringify(running)}); true;`,
+    );
+    attachGuiView();
+    syncGuiView(running);
+    const viewVisibleBeforeMenu = guiView.getVisible();
+    await win.webContents.executeJavaScript('window.openMenu(true); true;');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const viewWhileMenu = guiView.getVisible();
+    await win.webContents.executeJavaScript('window.openMenu(false); true;');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const viewAfterMenu = guiView.getVisible();
+    controller.getState = realGetState;
+    record(
+      '运行中打开菜单：视图隐藏、关闭后恢复',
+      viewVisibleBeforeMenu === true && viewWhileMenu === false && viewAfterMenu === true,
+      `before=${viewVisibleBeforeMenu} whileMenu=${viewWhileMenu} after=${viewAfterMenu}`,
+    );
     const layout = await win.webContents.executeJavaScript(`(() => {
       // Render a synthetic "running" snapshot so the running menu is measured.
       window.render({
@@ -472,13 +536,23 @@ async function runSelfTest() {
     record('默认停在 DSH tab', initialPanels.market === false && Boolean(initialPanels.dsh), JSON.stringify(initialPanels));
 
     // A fixture catalog (served locally) keeps this test off the network.
+    // Mirrors the site's current plugins.json: first-party `plugins` plus a
+    // `community` section.
     const fixtureCatalog = {
-      schemaVersion: 1,
-      updatedAt: '2026-09-20',
+      schema: 1,
+      updated_at: '2026-09-23T02:52:42Z',
+      registry: 'https://registry.npmjs.org',
       plugins: [
-        { name: 'dsh-file-explorer', package: '@jaxzhou/dsh-file-explorer', version: '0.1.5', summary: '文件标签', tags: ['文件'], license: 'MIT' },
-        { name: 'dsh-mathmatic-symbol', package: '@jaxzhou/dsh-mathmatic-symbol', version: '0.1.2', summary: '公式图形', tags: ['公式'], license: 'MIT' },
+        { id: 'dsh-file-explorer', name: '@jaxzhou/dsh-file-explorer', short_name: 'dsh-file-explorer', title: '文件浏览器与多格式预览', description: '给 Harness 增加一个「文件」标签。', version: '0.1.5', license: 'MIT' },
+        { id: 'dsh-mathmatic-symbol', name: '@jaxzhou/dsh-mathmatic-symbol', short_name: 'dsh-mathmatic-symbol', title: '公式与图形工具', description: '把公式与图形变成图片。', version: '0.1.2', license: 'MIT' },
       ],
+      community: {
+        note: '社区热门插件（第三方），本站不维护，安装前请自行审阅源码。',
+        metric: '近 30 天 npm 下载量',
+        plugins: [
+          { id: 'dsh-better-sidebar', name: 'dsh-better-sidebar', title: '侧边栏工作台', category: '界面', version: '0.19.1', license: 'MIT', downloads: 293037, stars: 3705, description: '开放的侧边栏底座。' },
+        ],
+      },
     };
     const marketServer = http.createServer((_request, response) => {
       response.writeHead(200, { 'content-type': 'application/json' });
@@ -513,17 +587,30 @@ async function runSelfTest() {
         sub: document.getElementById('tabMarketSub').textContent,
         stats: document.getElementById('marketStats').textContent,
         updateButtons: Array.from(document.querySelectorAll('.plugin-card button[data-action="plugin-install"]')).map((b) => b.textContent),
+        sections: document.querySelectorAll('.market-section').length,
+        sectionTitles: Array.from(document.querySelectorAll('.market-section h3')).map((h) => h.textContent.trim()),
+        uninstallButtons: document.querySelectorAll('.plugin-card button[data-action="plugin-uninstall"]').length,
+        communityTags: Array.from(document.querySelectorAll('.plugin-card .plugin-tag')).map((t) => t.textContent),
       };
     })()`);
     record('切到插件市场后阶段面板隐藏', marketView.active === true && marketView.dshPanelHidden === true, JSON.stringify(marketView));
-    record('内嵌 dsh 视图在市场上隐藏', !guiView || guiView.getVisible() === false);
-    record('市场渲染目录卡片', marketView.cards === 2, `cards=${marketView.cards}`);
+    record(
+      '内嵌 dsh 视图在市场上隐藏',
+      !guiView || guiView.getVisible() === false,
+      `activeTab=${activeTab} visible=${guiView ? guiView.getVisible() : 'no-view'} guiHiddenByUser=${guiHiddenByUser}`,
+    );
+    record('市场渲染目录卡片（自身 + 社区）', marketView.cards === 3, `cards=${marketView.cards}`);
+    record('目录按自身/社区分组', marketView.sections === 2, `sections=${marketView.sections}`);
+    record('已安装插件显示卸载按钮', marketView.uninstallButtons >= 1, `uninstall=${marketView.uninstallButtons}`);
     record('市场展示本地已装插件', marketView.localRows === 2, `localRows=${marketView.localRows}`);
     record('市场 tab 副标题含统计', /可更新/.test(marketView.sub), marketView.sub);
+    record('分组标题为本站维护/社区插件', /本站维护/.test(marketView.sectionTitles.join()) && /社区插件/.test(marketView.sectionTitles.join()), marketView.sectionTitles.join());
+    record('社区条目展示下载量/星标', marketView.communityTags.some((t) => /月下载|★/.test(t)), marketView.communityTags.slice(0, 4).join());
     record('有更新的插件显示更新按钮', marketView.updateButtons.some((text) => /更新/.test(text)), JSON.stringify(marketView.updateButtons));
 
     const marketData = await controller.getMarket();
-    record('目录与本地状态合并正确', marketData.ok && marketData.rows.length === 2 && marketData.updates === 1, JSON.stringify({ ok: marketData.ok, updates: marketData.updates }));
+    record('目录与本地状态合并正确', marketData.ok && marketData.rows.length === 3 && marketData.updates === 1, JSON.stringify({ ok: marketData.ok, updates: marketData.updates, rows: marketData.rows.length }));
+    record('分组计数正确', marketData.groupCounts['first-party'] === 2 && marketData.groupCounts.community === 1, JSON.stringify(marketData.groupCounts));
     record('目录外本地插件单列', marketData.localOnly.length === 1 && marketData.localOnly[0].package === '@jaxzhou/dsh-proxy-client');
 
     // Install path with stubbed collaborators: no pnpm, no dsh, no restart.
@@ -534,10 +621,25 @@ async function runSelfTest() {
     };
     controller.runEnsurePnpm = async () => ({ ok: true, command: '/nonexistent/pnpm', installed: false, error: null });
     let pluginCommands = 0;
-    controller.runPluginCommand = () => {
+    const pluginArgs = [];
+    controller.runPluginCommand = (options) => {
       pluginCommands += 1;
+      pluginArgs.push(options.args.join(' '));
       return { promise: Promise.resolve({ ok: true, code: 0, output: 'added 1 package', error: null }), cancel: () => {} };
     };
+    // Uninstall must find the plugin installed in the fixture profile.
+    controller.runReadInstalled = () => ({
+      profile: 'web',
+      dir: '/tmp/self-test/profiles/web',
+      home: '/tmp/self-test',
+      exists: true,
+      bundles: ['@jaxzhou/dsh-file-explorer', 'dsh-better-sidebar'],
+      plugins: [
+        { package: '@jaxzhou/dsh-file-explorer', name: 'dsh-file-explorer', spec: '0.1.5', source: 'registry', version: '0.1.5', bundle: true },
+        { package: 'dsh-better-sidebar', name: 'dsh-better-sidebar', spec: '0.19.1', source: 'registry', version: '0.19.1', bundle: true },
+      ],
+      error: null,
+    });
     let restartCalls = 0;
     const originalRestart = controller.restart.bind(controller);
     controller.restart = async () => {
@@ -548,7 +650,11 @@ async function runSelfTest() {
     const installResult = await controller.installPlugin({ packageName: '@jaxzhou/dsh-file-explorer', version: '0.1.5' });
     installedFixtureVersion = '0.1.5';
     record('市场安装调用 dsh plugin', pluginCommands === 1 && installResult.ok === true, JSON.stringify(installResult));
-    record('安装后自动重启 dsh（刷新 DSH Web）', restartCalls === 1, `restartCalls=${restartCalls}`);
+    record('安装参数为 add <pkg>@<version>', pluginArgs.at(-1) === 'plugin --profile web add @jaxzhou/dsh-file-explorer@0.1.5', String(pluginArgs.at(-1)));
+    const uninstall = await controller.uninstallPlugin({ packageName: 'dsh-better-sidebar' });
+    record('市场卸载调用 dsh plugin remove', uninstall.ok === true && pluginArgs.at(-1) === 'plugin --profile web remove dsh-better-sidebar', String(pluginArgs.at(-1)));
+    record('卸载后同样自动重启 dsh', restartCalls === 2, `restartCalls=${restartCalls}`);
+    record('安装后自动重启 dsh（刷新 DSH Web）', restartCalls >= 1, `restartCalls=${restartCalls}`);
     record('安装完成后状态收敛', controller.getState().pluginAction?.ok === true);
 
     // Market identifies the dsh it acts on (path + profile dir + pnpm).
@@ -785,13 +891,17 @@ async function runUiCapture() {
   // Plugin market: render a synthetic catalog so the capture is deterministic
   // (no network, no dependence on what happens to be installed).
   const marketFixture = {
-    meta: { profile: 'web', updatedAt: '2026-09-20', source: 'https://dsh.textwork.cn/plugins/index.json' },
+    meta: { profile: 'web', updatedAt: '2026-09-23', source: 'https://dsh.textwork.cn/plugins/plugins.json' },
+    groups: { 'first-party': 2, community: 1 },
+    community: { note: '社区热门插件（第三方）：由本站按公开的 npm 下载量与 GitHub star 选出，已在 npm 发布并声明 dsh.bundle；本站不维护这些插件，安装前请自行审阅源码。', metric: '近 30 天 npm 下载量' },
     runtime: { profileDir: '~/.dsh/profiles/web', command: '/Users/you/.nvm/versions/node/v24.18.0/bin/dsh', version: '0.1.5-rc.2', private: false },
     installed: { profile: 'web', dir: '~/.dsh/profiles/web', exists: true, plugins: [] },
     rows: [
       {
         package: '@jaxzhou/dsh-file-explorer',
         name: 'dsh-file-explorer',
+        title: '文件浏览器与多格式预览',
+        group: 'first-party',
         version: '0.1.5',
         summary: '给 Harness 增加一个与「对话」「轨迹」并列的「文件」标签：左侧是工作区目录树，右侧按文件类型决定预览形态。',
         highlights: ['Markdown 渲染（GFM）、JSON 树、24 种语法高亮、图片与纯文本预览', 'HTML 在沙箱 iframe 中绘制，预览不执行脚本', '导出 PDF / Word；只读、无需配置、不落任何数据'],
@@ -805,6 +915,8 @@ async function runUiCapture() {
       {
         package: '@jaxzhou/dsh-mathmatic-symbol',
         name: 'dsh-mathmatic-symbol',
+        title: '公式与图形工具',
+        group: 'first-party',
         version: '0.1.2',
         summary: '给 agent 四个工具，把公式与图形变成可以直接放进报告、幻灯片、Word、PDF 的图片。',
         highlights: ['math_formula / math_figure / math_convert / math_document', '产物是自带字形轮廓的 SVG（不依赖字体）+ 可选 PNG'],
@@ -820,6 +932,24 @@ async function runUiCapture() {
       { package: '@jaxzhou/dsh-proxy-client', name: 'dsh-proxy-client', version: '0.4.1', spec: '0.4.1', source: 'registry', bundle: true },
     ],
   };
+  // A community row, so the capture shows both sections.
+  marketFixture.rows.push({
+    package: 'dsh-better-sidebar',
+    name: 'dsh-better-sidebar',
+    title: '侧边栏工作台',
+    group: 'community',
+    version: '0.19.1',
+    summary: '开放的侧边栏底座：内置文件渲染编辑、终端、Git 与子代理页面，并支持三方插件注册新的侧边栏 Tab。',
+    tags: ['界面'],
+    category: '界面',
+    downloads: 293037,
+    stars: 3705,
+    license: 'MIT',
+    homepage: 'https://github.com/omdsh-dev/DSH-better-sidebar',
+    repository: 'https://github.com/omdsh-dev/DSH-better-sidebar',
+    local: null,
+    status: 'not-installed',
+  });
   const runningSample = samples.find((sample) => sample.state.phase === 'running');
   const runningState = { hostname: base.hostname, ...(runningSample?.state ?? { phase: 'running', statusText: 'DSH 已启动' }) };
   await win.webContents.executeJavaScript(
@@ -829,6 +959,8 @@ async function runUiCapture() {
        market.rows = ${JSON.stringify(marketFixture.rows)};
        market.localOnly = ${JSON.stringify(marketFixture.localOnly)};
        market.meta = ${JSON.stringify(marketFixture.meta)};
+       market.groups = ${JSON.stringify(marketFixture.groups)};
+       market.community = ${JSON.stringify(marketFixture.community)};
        market.runtime = ${JSON.stringify(marketFixture.runtime)};
        market.installed = ${JSON.stringify(marketFixture.installed)};
        window.render({ ...${JSON.stringify(runningState)}, pnpm: { available: true, version: '12.5.1', command: '/usr/bin/pnpm', error: null } });
