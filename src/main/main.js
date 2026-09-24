@@ -15,6 +15,7 @@ const http = require('node:http');
 const { BrowserWindow, WebContentsView, app, ipcMain, shell } = require('electron');
 
 const { ShellController } = require('./controller');
+const { describeVendor, preparePnpmStore, resolveVendorDir, seedDshHome } = require('./offline');
 const { DEFAULT_MARKET_URL } = require('./plugin-market');
 
 const RENDERER_INDEX = path.join(__dirname, '..', 'renderer', 'index.html');
@@ -362,6 +363,57 @@ function registerIpc() {
     app.quit();
     return true;
   });
+}
+
+// --------------------------------------------------------- offline payload
+
+/**
+ * Activate the bundled offline payload, when this build ships one.
+ *
+ * The payload sits inside the (read-only) app bundle, so the harness home is
+ * expanded into the user-data directory once per payload build, and the pnpm
+ * store travels the same way. This runs before the first detection so the
+ * controller never considers downloading anything.
+ */
+function setupOfflinePayload() {
+  let vendorDir = null;
+  try {
+    vendorDir = resolveVendorDir({ resourcesPath: process.resourcesPath });
+  } catch (error) {
+    reportError('离线 payload 探测失败', error);
+    return;
+  }
+  if (!vendorDir) return;
+
+  const vendor = describeVendor({ vendorDir });
+  const log = (entry) => controller.pushLog(entry);
+  const homeDir = path.join(app.getPath('userData'), 'dsh-home');
+  const storeDir = path.join(app.getPath('userData'), 'pnpm-store');
+
+  const seeded = seedDshHome({ vendorDir, homeDir, manifest: vendor.manifest, onLog: log });
+  if (!seeded.ok) {
+    log({ stream: 'stderr', line: `离线 dsh home 展开失败：${seeded.error}` });
+  }
+  const store = preparePnpmStore({ vendor, targetDir: storeDir, onLog: log });
+  if (!store.ok && vendor.pnpmStore) {
+    log({ stream: 'stderr', line: `离线 pnpm store 展开失败：${store.error}` });
+  }
+
+  controller.offline = {
+    enabled: true,
+    vendor,
+    homeDir: seeded.dir ?? homeDir,
+    storeDir: store.dir ?? null,
+    seeded: seeded.seeded,
+    seedError: seeded.ok ? null : seeded.error,
+  };
+
+  const manifest = vendor.manifest ?? {};
+  log({
+    stream: 'system',
+    line: `离线自包含模式已启用：node ${manifest.node ?? '?'} · pnpm ${manifest.pnpm ?? '?'} · dsh ${manifest.dsh ?? '?'} · 插件 ${manifest.plugin ?? '?'}`,
+  });
+  log({ stream: 'system', line: `dsh home（可写）：${controller.offline.homeDir}` });
 }
 
 // ------------------------------------------------------------------ self-test
@@ -976,6 +1028,25 @@ async function runUiCapture() {
     console.log(`captured ${target} (${image.getSize().width}x${image.getSize().height})`);
   }
 
+  // Offline self-contained state: same market, served entirely from the payload.
+  await win.webContents.executeJavaScript(
+    `(() => {
+       window.render({ ...${JSON.stringify(runningState)},
+         offline: { enabled: true, dir: '/opt/DSH-D Offline/resources/vendor', home: '~/.config/DSH-D Offline/dsh-home',
+                    dsh: '0.1.5-rc.3', pnpm: '12.6.0', node: 'v24.21.0',
+                    plugin: '@jaxzhou/dsh-file-explorer@0.1.6', platform: 'linux-x64' },
+         pnpm: { available: true, version: '12.6.0', command: '/opt/vendor/node/bin/pnpm', error: null } });
+       return true;
+     })()`,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  {
+    const image = await win.webContents.capturePage();
+    const target = path.join(outDir, '10-offline-market.png');
+    fs.writeFileSync(target, image.toPNG());
+    console.log(`captured ${target} (${image.getSize().width}x${image.getSize().height})`);
+  }
+
   // Installing state: banner with progress + disabled buttons.
   await win.webContents.executeJavaScript(
     `(() => {
@@ -1038,6 +1109,8 @@ if (!gotLock) {
   app.whenReady().then(() => {
     wireController();
     registerIpc();
+    // Before the window (and the first detection) so nothing tries to download.
+    setupOfflinePayload();
     createWindow();
 
     // Start the flow only once the renderer can actually receive the state.

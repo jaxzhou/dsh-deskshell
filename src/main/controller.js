@@ -39,6 +39,7 @@ const {
   resolveDshHome,
   runPluginCommand,
 } = require('./plugin-market');
+const { applyOfflineEnv } = require('./offline');
 const { resolveShellEnv } = require('./shell-env');
 
 /** How many log lines to keep for a freshly-mounted renderer. */
@@ -83,6 +84,12 @@ class ShellController extends EventEmitter {
     this.runPluginCommand = options.pluginCommand ?? runPluginCommand;
     /** @type {object|null} current plugin install/update, surfaced to the UI. */
     this.pluginAction = null;
+    /**
+     * Offline self-contained payload (vendor dir beside the app): when present
+     * nothing is downloaded and the bundled dsh/plugin are used as-is.
+     * @type {{enabled: boolean, vendor: object, homeDir: string|null, storeDir: string|null}|null}
+     */
+    this.offline = options.offline ?? null;
     /** pnpm is a market dependency: attempted once per session, retryable. */
     this.pnpmAttempted = false;
     this.pnpmError = null;
@@ -158,6 +165,7 @@ class ShellController extends EventEmitter {
       // Where dsh actually is and where its profile lives — plugins must land
       // in the profile of the dsh the shell itself boots (possibly a private
       // install provisioned by this app).
+      offline: this.describeOffline(),
       dshRuntime: this.describeDshRuntime(),
       pnpm: this.detection?.pnpm
         ? { ...this.detection.pnpm, installing: this.pnpmInstalling, failedReason: this.pnpmError }
@@ -235,6 +243,15 @@ class ShellController extends EventEmitter {
     if (this.managedRuntime) {
       this.env = this.runtimeEnv(this.managedRuntime);
     }
+    // An offline payload outranks both: its bin dir leads PATH and its seeded
+    // harness home is what dsh runs against.
+    if (this.offline?.enabled) {
+      this.env = applyOfflineEnv(this.env, {
+        nodeBinDir: this.offline.vendor?.nodeBinDir,
+        homeDir: this.offline.homeDir,
+        storeDir: this.offline.storeDir,
+      });
+    }
     return true;
   }
 
@@ -267,6 +284,19 @@ class ShellController extends EventEmitter {
       ].filter(Boolean).join(' '),
     });
 
+    // Offline payload: everything is already on disk, so a gap means the
+    // payload itself is broken — never fall back to downloading.
+    if (ShellController.runtimeGap(detection) && this.offline?.enabled) {
+      this.pushLog({ stream: 'stderr', line: `离线 payload 中未找到可用的 node / npm：${this.offline.vendor?.dir}` });
+      this.error = {
+        message: '离线 payload 不完整：未找到可用的 node / npm',
+        hint: `请检查 ${this.offline.vendor?.dir ?? 'vendor'} 是否完整（可重新解压离线包）。`,
+      };
+      this.setPhase('no-node', '离线 payload 不可用');
+      this.broadcast();
+      return detection;
+    }
+
     // No usable runtime: fetch one instead of sending the user to nodejs.org.
     if (ShellController.runtimeGap(detection)) {
       const provisioned = await this.provisionRuntime(detection, token);
@@ -279,6 +309,7 @@ class ShellController extends EventEmitter {
     // startup check rather than surfacing on the first install click. It is
     // still non-fatal: without pnpm the market cannot install, but dsh runs.
     if (
+      !this.offline?.enabled &&
       detection.node.available &&
       detection.npm.available &&
       detection.pnpm &&
@@ -307,14 +338,36 @@ class ShellController extends EventEmitter {
 
   // ------------------------------------------------------------ plugin market
 
+  /** What the offline payload provides, for the UI. */
+  describeOffline() {
+    if (!this.offline?.enabled) return { enabled: false };
+    const manifest = this.offline.vendor?.manifest ?? null;
+    return {
+      enabled: true,
+      dir: this.offline.vendor?.dir ?? null,
+      home: this.offline.homeDir ?? null,
+      store: this.offline.storeDir ?? null,
+      seeded: Boolean(this.offline.seeded),
+      seedError: this.offline.seedError ?? null,
+      node: manifest?.node ?? null,
+      pnpm: manifest?.pnpm ?? null,
+      dsh: manifest?.dsh ?? null,
+      plugin: manifest?.plugin ?? null,
+      builtAt: manifest?.builtAt ?? null,
+      platform: manifest?.platform ?? null,
+    };
+  }
+
   /** Where dsh actually is and where its profile lives. */
   describeDshRuntime() {
     const env = this.env ?? process.env;
     const home = resolveDshHome(env);
+    const command = this.detection?.dsh?.command ?? null;
     return {
-      command: this.detection?.dsh?.command ?? null,
+      command,
       version: this.detection?.dsh?.version ?? null,
-      private: Boolean(this.managedRuntime && String(this.detection?.dsh?.command ?? '').startsWith(this.managedRuntime.dir)),
+      private: Boolean(this.managedRuntime && String(command ?? '').startsWith(this.managedRuntime.dir)),
+      bundled: Boolean(this.offline?.enabled && command && String(command).startsWith(String(this.offline.vendor?.dir ?? '\u0000'))),
       home,
       profile: this.profile,
       profileDir: path.join(home, 'profiles', this.profile),
@@ -423,6 +476,41 @@ class ShellController extends EventEmitter {
       Promise.resolve(this.getInstalledPlugins()),
     ]);
     const merged = marketRows(catalog.ok ? catalog.catalog : null, installed);
+
+    // Offline payloads cannot reach the catalog; listing what the payload
+    // already carries is far more useful than an empty error page.
+    if (!catalog.ok && this.offline?.enabled) {
+      const manifest = this.offline.vendor?.manifest ?? null;
+      const rows = installed.plugins.map((plugin) => ({
+        package: plugin.package,
+        name: plugin.name,
+        title: plugin.name,
+        version: plugin.version ?? '未知',
+        summary: plugin.spec ? `离线内置（${plugin.spec}）` : '离线内置',
+        group: 'bundled',
+        local: plugin,
+        status: plugin.version ? 'installed' : 'installed-unknown-version',
+      }));
+      return {
+        ok: false,
+        offlineCatalog: true,
+        error: catalog.error,
+        source: catalog.source,
+        updatedAt: null,
+        profile: this.profile,
+        dshRuntime: this.describeDshRuntime(),
+        pnpm: this.detection?.pnpm ? { ...this.detection.pnpm, failedReason: this.pnpmError } : null,
+        registry: null,
+        community: null,
+        bundledManifest: manifest,
+        installed,
+        rows,
+        localOnly: [],
+        updates: 0,
+        groupCounts: { 'first-party': 0, community: 0, bundled: rows.length },
+      };
+    }
+
     return {
       ok: catalog.ok,
       error: catalog.ok ? null : catalog.error,
@@ -430,6 +518,7 @@ class ShellController extends EventEmitter {
       fetchedAt: catalog.fetchedAt ?? null,
       updatedAt: catalog.ok ? catalog.catalog.updatedAt : null,
       profile: this.profile,
+      offline: this.describeOffline(),
       dshRuntime: this.describeDshRuntime(),
       pnpm: this.detection?.pnpm ? { ...this.detection.pnpm, failedReason: this.pnpmError } : null,
       registry: catalog.ok ? catalog.catalog.registry : null,

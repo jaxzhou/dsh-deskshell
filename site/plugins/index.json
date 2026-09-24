@@ -1,21 +1,21 @@
 {
   "schemaVersion": 1,
-  "updatedAt": "2026-09-22",
+  "updatedAt": "2026-09-24",
   "site": "https://dsh.textwork.cn",
   "profile": "web",
   "source": "https://dsh.textwork.cn/plugins/plugins.json",
-  "note": "DSH-D 插件市场目录。本文件由 dsh-site/plugins/plugins.json 自动生成（tools/gen-pages.py），请勿手工编辑；版本/说明等 npm 字段由 tools/sync-plugins.py 同步。页面 /plugins/ 与本目录始终同源。",
+  "note": "DSH-D 插件市场目录。本文件由 dsh-site/plugins/plugins.json 自动生成（tools/gen-pages.py），请勿手工编辑；版本/说明等 npm 字段由 tools/sync-plugins.py / sync-community.py 同步。页面 /plugins/ 与本目录始终同源。",
   "plugins": [
     {
       "name": "dsh-file-explorer",
       "package": "@jaxzhou/dsh-file-explorer",
-      "version": "0.1.5",
-      "summary": "给 Harness 增加一个与「对话」「轨迹」并列的「文件」标签：左侧是会话工作区的目录树，右侧按文件类型决定预览形态 —— 渲染 Markdown、JSON 折叠树、24 种语法高亮、图片与沙箱 HTML，并能把渲染结果导出为 PDF / Word。只读、无需配置、不落任何数据。",
-      "description": "给 Harness 增加一个与「对话」「轨迹」并列的「文件」标签：左侧是会话工作区的目录树，右侧按文件类型决定预览形态 —— 渲染 Markdown、JSON 折叠树、24 种语法高亮、图片与沙箱 HTML，并能把渲染结果导出为 PDF / Word。只读、无需配置、不落任何数据。",
+      "version": "0.1.6",
+      "summary": "给 Harness 增加一个与「对话」「轨迹」并列的「文件」标签：左侧是会话工作区的目录树，右侧按文件类型决定预览形态 —— 渲染 Markdown（含 Mermaid 图表）、JSON 折叠树、24 种语法高亮、图片、沙箱 HTML，以及 PDF 与解包后的 Word / Excel / PowerPoint；可导出 PDF / Word，也可直接下载原文件。只读、无需配置、不落任何数据。",
+      "description": "给 Harness 增加一个与「对话」「轨迹」并列的「文件」标签：左侧是会话工作区的目录树，右侧按文件类型决定预览形态 —— 渲染 Markdown（含 Mermaid 图表）、JSON 折叠树、24 种语法高亮、图片、沙箱 HTML，以及 PDF 与解包后的 Word / Excel / PowerPoint；可导出 PDF / Word，也可直接下载原文件。只读、无需配置、不落任何数据。",
       "highlights": [
-        "Markdown 渲染（GFM）、JSON 折叠树、24 种语法高亮、图片、纯文本",
-        "HTML 在沙箱 iframe 中绘制；导出 PDF / Word",
-        "只读、无需配置、不落任何数据"
+        "Markdown（含 Mermaid 图表）、JSON 折叠树、24 种语法高亮、图片、沙箱 HTML",
+        "PDF 预览（浏览器阅读器，文字可选中）+ Word / Excel / PowerPoint 页面内解包",
+        "导出 PDF / Word，预览窗格可下载原文件；只读、无需配置、不落任何数据"
       ],
       "tags": [
         "文件浏览",
@@ -73,6 +73,501 @@
       "npm": "https://www.npmjs.com/package/@jaxzhou/dsh-proxy-client",
       "repository": "https://github.com/jaxzhou/dsh-proxy",
       "homepage": "https://dsh.textwork.cn/plugins/dsh-proxy-client/",
+      "minShell": "0.1.2"
+    }
+  ],
+  "community": [
+    {
+      "name": "dsh-better-sidebar",
+      "package": "dsh-better-sidebar",
+      "version": "0.21.1",
+      "summary": "开放的侧边栏底座：内置文件渲染编辑、终端、Git 与子代理页面，并支持三方插件注册新的侧边栏 Tab。",
+      "description": "开放的侧边栏底座：内置文件渲染编辑、终端、Git 与子代理页面，并支持三方插件注册新的侧边栏 Tab。",
+      "highlights": [],
+      "tags": [
+        "UI 增强"
+      ],
+      "license": "MIT",
+      "author": "omdsh-dev",
+      "npm": "https://www.npmjs.com/package/dsh-better-sidebar",
+      "repository": "https://github.com/omdsh-dev/DSH-better-sidebar",
+      "homepage": "https://www.npmjs.com/package/dsh-better-sidebar",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@linxin666/dsh-remote-web-ui",
+      "package": "@linxin666/dsh-remote-web-ui",
+      "version": "0.4.1",
+      "summary": "手机或 PC 远程操控 dsh web 工作区：扫码配对、令牌门控通道与 SSE 实时同步，提供移动端与完整桌面两种远程形态。",
+      "description": "手机或 PC 远程操控 dsh web 工作区：扫码配对、令牌门控通道与 SSE 实时同步，提供移动端与完整桌面两种远程形态。",
+      "highlights": [],
+      "tags": [
+        "远程与移动端"
+      ],
+      "license": "Apache-2.0",
+      "author": "zhu1090093659",
+      "npm": "https://www.npmjs.com/package/@linxin666/dsh-remote-web-ui",
+      "repository": "https://github.com/zhu1090093659/dsh-web/tree/main/packages/dsh-remote-web-ui",
+      "homepage": "https://www.npmjs.com/package/@linxin666/dsh-remote-web-ui",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@linxin666/dsh-client-ui-skill-explorer",
+      "package": "@linxin666/dsh-client-ui-skill-explorer",
+      "version": "0.4.1",
+      "summary": "按来源分级浏览已加载的全部 skill，可启用/禁用模型调用、创建新技能，删除进可恢复回收站。",
+      "description": "按来源分级浏览已加载的全部 skill，可启用/禁用模型调用、创建新技能，删除进可恢复回收站。",
+      "highlights": [],
+      "tags": [
+        "技能包"
+      ],
+      "license": "BSD-3-Clause",
+      "author": "zhu1090093659",
+      "npm": "https://www.npmjs.com/package/@linxin666/dsh-client-ui-skill-explorer",
+      "repository": "https://github.com/zhu1090093659/dsh-web/tree/main/packages/dsh-skill-explorer",
+      "homepage": "https://www.npmjs.com/package/@linxin666/dsh-client-ui-skill-explorer",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@linxin666/dsh-client-ui-task-board",
+      "package": "@linxin666/dsh-client-ui-task-board",
+      "version": "0.4.1",
+      "summary": "侧边栏多列任务看板：卡片直接交给真实的 DSH 智能体会话执行，支持 cron 定时（到点在 Host 侧执行，关掉浏览器也照跑）。",
+      "description": "侧边栏多列任务看板：卡片直接交给真实的 DSH 智能体会话执行，支持 cron 定时（到点在 Host 侧执行，关掉浏览器也照跑）。",
+      "highlights": [],
+      "tags": [
+        "UI 增强"
+      ],
+      "license": "Apache-2.0",
+      "author": "zhu1090093659",
+      "npm": "https://www.npmjs.com/package/@linxin666/dsh-client-ui-task-board",
+      "repository": "https://github.com/zhu1090093659/dsh-web",
+      "homepage": "https://www.npmjs.com/package/@linxin666/dsh-client-ui-task-board",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@linxin666/dsh-client-ui-git-graph",
+      "package": "@linxin666/dsh-client-ui-git-graph",
+      "version": "0.4.1",
+      "summary": "输入框上方选择 Git 分支，并把分支泳道与提交历史画成图谱，沿时间线定位任意变更。",
+      "description": "输入框上方选择 Git 分支，并把分支泳道与提交历史画成图谱，沿时间线定位任意变更。",
+      "highlights": [],
+      "tags": [
+        "Git 与代码评审"
+      ],
+      "license": "Apache-2.0",
+      "author": "zhu1090093659",
+      "npm": "https://www.npmjs.com/package/@linxin666/dsh-client-ui-git-graph",
+      "repository": "https://github.com/zhu1090093659/dsh-web/tree/main/packages/dsh-git-graph",
+      "homepage": "https://www.npmjs.com/package/@linxin666/dsh-client-ui-git-graph",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "billion-context",
+      "package": "billion-context",
+      "version": "0.1.142",
+      "summary": "上下文压缩插件：把长会话压到小窗口也够用，显著省 token，适合长期跑的长任务会话。",
+      "description": "上下文压缩插件：把长会话压到小窗口也够用，显著省 token，适合长期跑的长任务会话。",
+      "highlights": [],
+      "tags": [
+        "会话与消息"
+      ],
+      "license": "MIT",
+      "author": "ranxianglei",
+      "npm": "https://www.npmjs.com/package/billion-context",
+      "repository": "https://github.com/ranxianglei/billion-context",
+      "homepage": "https://www.npmjs.com/package/billion-context",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "dsh-context",
+      "package": "dsh-context",
+      "version": "0.55.0",
+      "summary": "Context 仪表盘 + /context 命令 + Context 浏览器：看清当前上下文由什么组成、占了多少，再决定压什么。",
+      "description": "Context 仪表盘 + /context 命令 + Context 浏览器：看清当前上下文由什么组成、占了多少，再决定压什么。",
+      "highlights": [],
+      "tags": [
+        "用量与计费"
+      ],
+      "license": "Apache-2.0",
+      "author": "bowenliang123",
+      "npm": "https://www.npmjs.com/package/dsh-context",
+      "repository": "https://github.com/bowenliang123/dsh-context",
+      "homepage": "https://www.npmjs.com/package/dsh-context",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@liustack/modlens",
+      "package": "@liustack/modlens",
+      "version": "3.26.3",
+      "summary": "为纯文本模型架起视觉桥梁：粘贴图片即输出结构化 JSON 证据（OCR、版面、语义），无需换多模态模型。",
+      "description": "为纯文本模型架起视觉桥梁：粘贴图片即输出结构化 JSON 证据（OCR、版面、语义），无需换多模态模型。",
+      "highlights": [],
+      "tags": [
+        "视觉与多模态"
+      ],
+      "license": "MIT",
+      "author": "liustack",
+      "npm": "https://www.npmjs.com/package/@liustack/modlens",
+      "repository": "https://github.com/liustack/modlens",
+      "homepage": "https://www.npmjs.com/package/@liustack/modlens",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "dsh-univer-office",
+      "package": "dsh-univer-office",
+      "version": "0.3.3",
+      "summary": "把 Univer 办公套件搬进 Harness：电子表格、文档与演示，适合让智能体直接产出可编辑的办公文件。",
+      "description": "把 Univer 办公套件搬进 Harness：电子表格、文档与演示，适合让智能体直接产出可编辑的办公文件。",
+      "highlights": [],
+      "tags": [
+        "文档与渲染"
+      ],
+      "license": "Apache-2.0",
+      "author": "dream-num",
+      "npm": "https://www.npmjs.com/package/dsh-univer-office",
+      "repository": "https://github.com/dream-num/dsh-univer-office",
+      "homepage": "https://www.npmjs.com/package/dsh-univer-office",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "dsh-cost-meter",
+      "package": "dsh-cost-meter",
+      "version": "1.7.35",
+      "summary": "会话与当日 API 费用统计、预算进度、官方余额，支持峰谷计价与官方价格一键同步。",
+      "description": "会话与当日 API 费用统计、预算进度、官方余额，支持峰谷计价与官方价格一键同步。",
+      "highlights": [],
+      "tags": [
+        "用量与计费"
+      ],
+      "license": "MIT",
+      "author": "Han-1413141",
+      "npm": "https://www.npmjs.com/package/dsh-cost-meter",
+      "repository": "https://github.com/Han-1413141/dsh-cost-meter",
+      "homepage": "https://www.npmjs.com/package/dsh-cost-meter",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@michengai/dsh-codex-ui",
+      "package": "@michengai/dsh-codex-ui",
+      "version": "1.1.16",
+      "summary": "为 Harness 网页端重构 Codex 风格侧栏、工作区会话树、全局搜索与轮次导航。",
+      "description": "为 Harness 网页端重构 Codex 风格侧栏、工作区会话树、全局搜索与轮次导航。",
+      "highlights": [],
+      "tags": [
+        "UI 增强"
+      ],
+      "license": "Apache-2.0",
+      "author": "MichengAI",
+      "npm": "https://www.npmjs.com/package/@michengai/dsh-codex-ui",
+      "repository": "https://github.com/MichengAI/dsh-codex-ui",
+      "homepage": "https://www.npmjs.com/package/@michengai/dsh-codex-ui",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@michengai/dsh-archive-manager",
+      "package": "@michengai/dsh-archive-manager",
+      "version": "1.0.4",
+      "summary": "在设置里新增已归档会话页，可按工作区搜索、恢复与删除归档会话。",
+      "description": "在设置里新增已归档会话页，可按工作区搜索、恢复与删除归档会话。",
+      "highlights": [],
+      "tags": [
+        "会话与消息"
+      ],
+      "license": "Apache-2.0",
+      "author": "MichengAI",
+      "npm": "https://www.npmjs.com/package/@michengai/dsh-archive-manager",
+      "repository": "https://github.com/MichengAI/dsh-archive-manager",
+      "homepage": "https://www.npmjs.com/package/@michengai/dsh-archive-manager",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@michengai/dsh-skills-manager",
+      "package": "@michengai/dsh-skills-manager",
+      "version": "1.1.3",
+      "summary": "在设置里管理本地 DSH 技能，并只读查看公共 Agent 技能。",
+      "description": "在设置里管理本地 DSH 技能，并只读查看公共 Agent 技能。",
+      "highlights": [],
+      "tags": [
+        "开发与运行时"
+      ],
+      "license": "Apache-2.0",
+      "author": "MichengAI",
+      "npm": "https://www.npmjs.com/package/@michengai/dsh-skills-manager",
+      "repository": "https://github.com/MichengAI/dsh-skills-manager",
+      "homepage": "https://www.npmjs.com/package/@michengai/dsh-skills-manager",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@michengai/dsh-agency-agents",
+      "package": "@michengai/dsh-agency-agents",
+      "version": "1.0.3",
+      "summary": "提供可召唤的领域专家名单，专家以子代理运行，主会话只保留任务与最终答复。",
+      "description": "提供可召唤的领域专家名单，专家以子代理运行，主会话只保留任务与最终答复。",
+      "highlights": [],
+      "tags": [
+        "技能包"
+      ],
+      "license": "Apache-2.0",
+      "author": "MichengAI",
+      "npm": "https://www.npmjs.com/package/@michengai/dsh-agency-agents",
+      "repository": "https://github.com/MichengAI/dsh-agency-agents",
+      "homepage": "https://www.npmjs.com/package/@michengai/dsh-agency-agents",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@nanmicoder/dsh-agent-teams",
+      "package": "@nanmicoder/dsh-agent-teams",
+      "version": "0.1.20",
+      "summary": "AgentTeams：把多个领域的子智能体编成团队，主会话只保留任务与最终答复。",
+      "description": "AgentTeams：把多个领域的子智能体编成团队，主会话只保留任务与最终答复。",
+      "highlights": [],
+      "tags": [
+        "工作流与自动化"
+      ],
+      "license": "MIT",
+      "author": "NanmiCoder",
+      "npm": "https://www.npmjs.com/package/@nanmicoder/dsh-agent-teams",
+      "repository": "https://github.com/NanmiCoder/dsh-agent-teams",
+      "homepage": "https://www.npmjs.com/package/@nanmicoder/dsh-agent-teams",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@vectorize-io/hindsight-coding-agents",
+      "package": "@vectorize-io/hindsight-coding-agents",
+      "version": "0.6.1",
+      "summary": "会学习的 Agent 长期记忆：自动召回与保存、知识页、深度反思，并按仓库隔离记忆库。",
+      "description": "会学习的 Agent 长期记忆：自动召回与保存、知识页、深度反思，并按仓库隔离记忆库。",
+      "highlights": [],
+      "tags": [
+        "记忆"
+      ],
+      "license": "MIT",
+      "author": "vectorize-io",
+      "npm": "https://www.npmjs.com/package/@vectorize-io/hindsight-coding-agents",
+      "repository": "https://github.com/vectorize-io/hindsight",
+      "homepage": "https://www.npmjs.com/package/@vectorize-io/hindsight-coding-agents",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@xmanrui/dsh-im",
+      "package": "@xmanrui/dsh-im",
+      "version": "4.28.0",
+      "summary": "用二维码或机器人凭据把 IM 接入 Harness，支持飞书、微信、钉钉、企业微信、QQ、Slack、Telegram、Discord、WhatsApp。",
+      "description": "用二维码或机器人凭据把 IM 接入 Harness，支持飞书、微信、钉钉、企业微信、QQ、Slack、Telegram、Discord、WhatsApp。",
+      "highlights": [],
+      "tags": [
+        "通知与集成"
+      ],
+      "license": "MIT",
+      "author": "xmanrui",
+      "npm": "https://www.npmjs.com/package/@xmanrui/dsh-im",
+      "repository": "https://github.com/xmanrui/dsh-im",
+      "homepage": "https://www.npmjs.com/package/@xmanrui/dsh-im",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@michengai/dsh-im-connect",
+      "package": "@michengai/dsh-im-connect",
+      "version": "0.1.54",
+      "summary": "把微信、企业微信、钉钉、飞书、Lark、QQ、Telegram 接到本机 Harness，每个 IM 聊天对应一条独立工作区频道。",
+      "description": "把微信、企业微信、钉钉、飞书、Lark、QQ、Telegram 接到本机 Harness，每个 IM 聊天对应一条独立工作区频道。",
+      "highlights": [],
+      "tags": [
+        "通知与集成"
+      ],
+      "license": "Apache-2.0",
+      "author": "MichengAI",
+      "npm": "https://www.npmjs.com/package/@michengai/dsh-im-connect",
+      "repository": "https://github.com/MichengAI/dsh-im-connect",
+      "homepage": "https://www.npmjs.com/package/@michengai/dsh-im-connect",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@michengai/dsh-automation",
+      "package": "@michengai/dsh-automation",
+      "version": "0.1.49",
+      "summary": "在独立会话里按计划执行编码任务，可在设置页或对话里管理。",
+      "description": "在独立会话里按计划执行编码任务，可在设置页或对话里管理。",
+      "highlights": [],
+      "tags": [
+        "工作流与自动化"
+      ],
+      "license": "Apache-2.0",
+      "author": "MichengAI",
+      "npm": "https://www.npmjs.com/package/@michengai/dsh-automation",
+      "repository": "https://github.com/MichengAI/dsh-automation",
+      "homepage": "https://www.npmjs.com/package/@michengai/dsh-automation",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "dsh-whale-widget",
+      "package": "dsh-whale-widget",
+      "version": "0.3.11",
+      "summary": "右下角常驻挂件：余额、今日已用与每轮消耗（含峰谷价）、余额预警与预算泡泡；内置 30+ 厂商模板，数据全在本机。",
+      "description": "右下角常驻挂件：余额、今日已用与每轮消耗（含峰谷价）、余额预警与预算泡泡；内置 30+ 厂商模板，数据全在本机。",
+      "highlights": [],
+      "tags": [
+        "UI 增强"
+      ],
+      "license": "MIT",
+      "author": "MeteorNOX",
+      "npm": "https://www.npmjs.com/package/dsh-whale-widget",
+      "repository": "https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget",
+      "homepage": "https://www.npmjs.com/package/dsh-whale-widget",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@liustack/modsearch",
+      "package": "@liustack/modsearch",
+      "version": "5.10.4",
+      "summary": "纯文本 agent 的联网搜索桥：搜索网页与 X，返回带引用的结构化 JSON 证据。",
+      "description": "纯文本 agent 的联网搜索桥：搜索网页与 X，返回带引用的结构化 JSON 证据。",
+      "highlights": [],
+      "tags": [
+        "浏览器与网页"
+      ],
+      "license": "MIT",
+      "author": "liustack",
+      "npm": "https://www.npmjs.com/package/@liustack/modsearch",
+      "repository": "https://github.com/liustack/modsearch",
+      "homepage": "https://www.npmjs.com/package/@liustack/modsearch",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "dsh-vision-router",
+      "package": "dsh-vision-router",
+      "version": "2.2.1",
+      "summary": "为纯文本 Agent 提供视觉能力：免 Key 视觉链 + 看图问答、定位、裁剪、取色、OCR、矢量化、抠图、截图等像素级工具。",
+      "description": "为纯文本 Agent 提供视觉能力：免 Key 视觉链 + 看图问答、定位、裁剪、取色、OCR、矢量化、抠图、截图等像素级工具。",
+      "highlights": [],
+      "tags": [
+        "视觉与多模态"
+      ],
+      "license": "MIT",
+      "author": "ysr666",
+      "npm": "https://www.npmjs.com/package/dsh-vision-router",
+      "repository": "https://github.com/ysr666/dsh-vision-router",
+      "homepage": "https://www.npmjs.com/package/dsh-vision-router",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "dsh-mnemon",
+      "package": "dsh-mnemon",
+      "version": "0.5.13",
+      "summary": "本地优先的持久记忆：在支持 Mnemon 的 Agent 间共享长期记忆，提供运行时记忆、可检索项目档案、语义召回与知识图谱。",
+      "description": "本地优先的持久记忆：在支持 Mnemon 的 Agent 间共享长期记忆，提供运行时记忆、可检索项目档案、语义召回与知识图谱。",
+      "highlights": [],
+      "tags": [
+        "记忆"
+      ],
+      "license": "MIT",
+      "author": "omdsh-dev",
+      "npm": "https://www.npmjs.com/package/dsh-mnemon",
+      "repository": "https://github.com/omdsh-dev/dsh-mnemon",
+      "homepage": "https://www.npmjs.com/package/dsh-mnemon",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@deepseek-harness-tui/dsh-tui",
+      "package": "@deepseek-harness-tui/dsh-tui",
+      "version": "0.10.2",
+      "summary": "Claude Code 风格的全屏终端界面：像素鲸鱼顶栏、实时工作状态行与思考流式展开。",
+      "description": "Claude Code 风格的全屏终端界面：像素鲸鱼顶栏、实时工作状态行与思考流式展开。",
+      "highlights": [],
+      "tags": [
+        "UI 增强"
+      ],
+      "license": "MIT",
+      "author": "ccch1mneyyy",
+      "npm": "https://www.npmjs.com/package/@deepseek-harness-tui/dsh-tui",
+      "repository": "https://github.com/ccch1mneyyy/dsh-TUI",
+      "homepage": "https://www.npmjs.com/package/@deepseek-harness-tui/dsh-tui",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "dsh-token-usage-stats",
+      "package": "dsh-token-usage-stats",
+      "version": "0.3.13",
+      "summary": "仿官方 Token 统计：跨会话消耗、请求次数与峰谷分时费用看板。",
+      "description": "仿官方 Token 统计：跨会话消耗、请求次数与峰谷分时费用看板。",
+      "highlights": [],
+      "tags": [
+        "用量与计费"
+      ],
+      "license": "MIT",
+      "author": "jkStars",
+      "npm": "https://www.npmjs.com/package/dsh-token-usage-stats",
+      "repository": "https://github.com/jkStars/dsh-token-usage-stats",
+      "homepage": "https://www.npmjs.com/package/dsh-token-usage-stats",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "dsh-dream-skin",
+      "package": "dsh-dream-skin",
+      "version": "9.23.0",
+      "summary": "8 套原创主题与背景壁纸（透明度/模糊）、强调色、主题包导入导出与分享链接、收藏与随机。",
+      "description": "8 套原创主题与背景壁纸（透明度/模糊）、强调色、主题包导入导出与分享链接、收藏与随机。",
+      "highlights": [],
+      "tags": [
+        "主题与外观"
+      ],
+      "license": "MIT",
+      "author": "RevolutionLA",
+      "npm": "https://www.npmjs.com/package/dsh-dream-skin",
+      "repository": "https://github.com/RevolutionLA/dsh-dream-skin",
+      "homepage": "https://www.npmjs.com/package/dsh-dream-skin",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "dsh-pocket",
+      "package": "dsh-pocket",
+      "version": "2.10.6",
+      "summary": "手机远程访问 DSH Web：扫码即用局域网或 cloudflared 公网隧道，实时同屏并适配移动端布局。",
+      "description": "手机远程访问 DSH Web：扫码即用局域网或 cloudflared 公网隧道，实时同屏并适配移动端布局。",
+      "highlights": [],
+      "tags": [
+        "通知与集成"
+      ],
+      "license": "GPL-2.0",
+      "author": "shaobeichen",
+      "npm": "https://www.npmjs.com/package/dsh-pocket",
+      "repository": "https://github.com/shaobeichen/dsh-pocket",
+      "homepage": "https://www.npmjs.com/package/dsh-pocket",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "@changfenhuang/dsh-genui",
+      "package": "@changfenhuang/dsh-genui",
+      "version": "0.11.0",
+      "summary": "在助手回复里渲染交互式 UI 组件：布局、图表、表单、测验、mermaid、3D 场景与回传事件循环。",
+      "description": "在助手回复里渲染交互式 UI 组件：布局、图表、表单、测验、mermaid、3D 场景与回传事件循环。",
+      "highlights": [],
+      "tags": [
+        "UI 增强"
+      ],
+      "license": "MIT",
+      "author": "omdsh-dev",
+      "npm": "https://www.npmjs.com/package/@changfenhuang/dsh-genui",
+      "repository": "https://github.com/omdsh-dev/dsh-genui",
+      "homepage": "https://www.npmjs.com/package/@changfenhuang/dsh-genui",
+      "minShell": "0.1.2"
+    },
+    {
+      "name": "dsh-pet",
+      "package": "dsh-pet",
+      "version": "0.2.11",
+      "summary": "DSH Web 桌宠：25 个透明动画、屏幕漫游、点击反应与拖拽，并附可复现的素材生成链。",
+      "description": "DSH Web 桌宠：25 个透明动画、屏幕漫游、点击反应与拖拽，并附可复现的素材生成链。",
+      "highlights": [],
+      "tags": [
+        "娱乐"
+      ],
+      "license": "MIT",
+      "author": "PC2005-cloud",
+      "npm": "https://www.npmjs.com/package/dsh-pet",
+      "repository": "https://github.com/PC2005-cloud/dsh-pet/tree/main/dsh-pet",
+      "homepage": "https://www.npmjs.com/package/dsh-pet",
       "minShell": "0.1.2"
     }
   ]

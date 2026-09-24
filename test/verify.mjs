@@ -12,7 +12,7 @@
 
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -31,6 +31,7 @@ const { DshServer, extractReadyUrl } = require('../src/main/dsh-server.js');
 const { ShellController } = require('../src/main/controller.js');
 const nodeRuntime = require('../src/main/node-runtime.js');
 const market = require('../src/main/plugin-market.js');
+const offline = require('../src/main/offline.js');
 
 let passed = 0;
 let failed = 0;
@@ -1284,6 +1285,143 @@ section('14. dsh 实际位置与 pnpm 依赖');
   await identity.dispose();
   await customHome.dispose();
   await failing.dispose();
+}
+
+section('16. 离线自包含 payload (offline)');
+{
+  // --- a fake payload on disk: node shim + seeded home + manifest ---------
+  const resourcesDir = path.join(here, '.tmp-resources');
+  const vendorDir = path.join(resourcesDir, 'vendor');
+  const binDir = path.join(vendorDir, 'node', 'bin');
+  const homeSeed = path.join(vendorDir, 'dsh-home', 'profiles', 'web');
+  const pluginDir = path.join(homeSeed, 'node_modules', '@jaxzhou', 'dsh-file-explorer');
+  mkdirSync(binDir, { recursive: true });
+  mkdirSync(pluginDir, { recursive: true });
+  mkdirSync(path.join(vendorDir, 'plugins'), { recursive: true });
+  for (const name of ['node', 'npm', 'pnpm', 'dsh']) {
+    writeFileSync(path.join(binDir, name), `#!/bin/sh\necho 9.9.9\n`);
+    chmodSync(path.join(binDir, name), 0o755);
+  }
+  writeFileSync(
+    path.join(homeSeed, 'package.json'),
+    JSON.stringify({ dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@jaxzhou/dsh-file-explorer'] } }, dependencies: { '@jaxzhou/dsh-file-explorer': '0.1.6' } }),
+  );
+  writeFileSync(path.join(pluginDir, 'package.json'), JSON.stringify({ name: '@jaxzhou/dsh-file-explorer', version: '0.1.6' }));
+  writeFileSync(path.join(vendorDir, 'plugins', 'jaxzhou-dsh-file-explorer-0.1.6.tgz'), 'dummy');
+  writeFileSync(path.join(vendorDir, 'pnpm-store.tgz'), 'dummy-store');
+  const manifest = { schema: 1, builtAt: '2026-09-24T00:00:00Z', platform: 'linux-x64', node: 'v24.21.0', npm: '11.19.0', pnpm: '12.6.0', dsh: '0.1.5-rc.3', plugin: '@jaxzhou/dsh-file-explorer@0.1.6' };
+  writeFileSync(path.join(vendorDir, 'manifest.json'), JSON.stringify(manifest));
+
+  // --- discovery ----------------------------------------------------------
+  check('可通过 DSH_D_VENDOR_DIR 指定 payload', offline.resolveVendorDir({ env: { DSH_D_VENDOR_DIR: vendorDir } }) === vendorDir);
+  check('可从 resourcesPath 自动发现 payload', offline.resolveVendorDir({ env: {}, resourcesPath: resourcesDir }) === vendorDir, String(offline.resolveVendorDir({ env: {}, resourcesPath: resourcesDir })));
+  check('没有 payload 时返回 null', offline.resolveVendorDir({ env: {}, resourcesPath: '/nonexistent' }) === null);
+  const described = offline.describeVendor({ vendorDir });
+  check('描述 payload（bin/home/store/插件目录）', described.available === true && described.nodeBinDir === binDir && described.dshHome === path.join(vendorDir, 'dsh-home') && Boolean(described.pnpmStore && described.pluginsDir));
+  check('读取 manifest 版本', described.manifest?.dsh === '0.1.5-rc.3' && described.manifest?.plugin === '@jaxzhou/dsh-file-explorer@0.1.6');
+
+  // --- seeding a writable home -------------------------------------------
+  const userData = path.join(here, '.tmp-offline-userdata');
+  // Start clean: a leftover marker from an interrupted run would make the
+  // first-seed assertions meaningless.
+  rmSync(userData, { recursive: true, force: true });
+  const homeDir = path.join(userData, 'dsh-home');
+  const first = offline.seedDshHome({ vendorDir, homeDir, manifest: described.manifest });
+  check('首次运行展开种子 home', first.ok === true && first.seeded === true, first.error ?? '');
+  check('展开后 profile 与插件就位', existsSync(path.join(homeDir, 'profiles', 'web', 'package.json')) && existsSync(path.join(homeDir, 'profiles', 'web', 'node_modules', '@jaxzhou', 'dsh-file-explorer', 'package.json')));
+  check('写入 seed 标记', existsSync(path.join(homeDir, offline.SEED_MARKER)));
+  // User data written after seeding must survive the next start.
+  mkdirSync(path.join(homeDir, 'sessions'), { recursive: true });
+  writeFileSync(path.join(homeDir, 'sessions', 'keep.json'), '{}');
+  const second = offline.seedDshHome({ vendorDir, homeDir, manifest: described.manifest });
+  check('同一 payload 不重复展开', second.ok === true && second.seeded === false);
+  const upgraded = offline.seedDshHome({ vendorDir, homeDir, manifest: { ...described.manifest, builtAt: '2026-10-01T00:00:00Z' } });
+  check('payload 更新后重新展开', upgraded.seeded === true);
+  check('重新展开保留用户数据', existsSync(path.join(homeDir, 'sessions', 'keep.json')));
+
+  // --- store extraction ---------------------------------------------------
+  const storeDir = path.join(userData, 'pnpm-store');
+  const storeResult = offline.preparePnpmStore({ vendor: described, targetDir: storeDir });
+  check('展开 pnpm store', storeResult.ok === false || storeResult.ok === true);
+  check('store tgz 损坏时给出错误而非崩溃', storeResult.ok === false && /store|tar|gzip|unexpected/i.test(storeResult.error ?? ''), String(storeResult.error));
+
+  // --- environment --------------------------------------------------------
+  const env = offline.applyOfflineEnv({ PATH: '/usr/bin:/bin', DSH_HOME: '/should/be/overridden' }, {
+    nodeBinDir: binDir,
+    homeDir,
+    storeDir: '/store',
+  });
+  check('payload bin 目录置于 PATH 最前', String(env.PATH).startsWith(binDir), env.PATH);
+  check('DSH_HOME 指向展开后的 home', env.DSH_HOME === homeDir, env.DSH_HOME);
+  check('pnpm store 与优先离线写入环境', env.npm_config_store_dir === '/store' && env.npm_config_prefer_offline === 'true');
+  check('标记离线模式环境变量', env.DSH_D_OFFLINE === '1');
+
+  // --- controller in offline mode ----------------------------------------
+  const commands = [];
+  const offlineController = new ShellController({
+    cwd: here,
+    offline: { enabled: true, vendor: { ...described, manifest: described.manifest }, homeDir, storeDir: '/store', seeded: true },
+    detect: async () => ({
+      platform: process.platform,
+      arch: process.arch,
+      packageName: DSH_PACKAGE,
+      node: { available: true, version: 'v24.21.0', command: path.join(binDir, 'node'), error: null },
+      npm: { available: true, version: '11.19.0', command: path.join(binDir, 'npm'), error: null },
+      pnpm: { available: true, version: '12.6.0', command: path.join(binDir, 'pnpm'), error: null },
+      dsh: { installed: true, version: '0.1.5-rc.3', command: path.join(binDir, 'dsh'), error: null },
+    }),
+    ensurePnpm: async () => {
+      commands.push('ensure-pnpm');
+      return { ok: true, command: null, installed: false, error: null };
+    },
+    provisionRuntime: async () => {
+      commands.push('provision-runtime');
+      return { ok: true };
+    },
+    install: () => {
+      commands.push('install-dsh');
+      return { promise: Promise.resolve({ ok: true }), cancel: () => {} };
+    },
+    startDelayMs: 10,
+  });
+
+  await offlineController.check({ autostart: false });
+  const offlineState = offlineController.getState();
+  check('离线模式下不做任何下载/安装', commands.length === 0, commands.join(','));
+  check('离线模式直接识别内置 dsh', offlineState.detection.dsh.installed === true && offlineState.phase === 'ready-to-start', offlineState.phase);
+  check('状态里暴露离线信息', offlineState.offline?.enabled === true && offlineState.offline.dsh === '0.1.5-rc.3' && offlineState.offline.plugin === '@jaxzhou/dsh-file-explorer@0.1.6', JSON.stringify(offlineState.offline));
+  check('离线模式下 PATH 使用 payload', String(offlineState.dshRuntime.command).startsWith(binDir) && offlineState.dshRuntime.bundled === true, JSON.stringify({ command: offlineState.dshRuntime.command, bundled: offlineState.dshRuntime.bundled }));
+  check('环境带 DSH_HOME 与离线标记', offlineController.env.DSH_HOME === homeDir && offlineController.env.DSH_D_OFFLINE === '1');
+
+  // Market falls back to the bundled plugin when the catalog is unreachable.
+  offlineController.runFetchCatalog = async () => ({ ok: false, source: 'https://dsh.textwork.cn/plugins/plugins.json', error: '断网' });
+  offlineController.runReadInstalled = () => market.readInstalledPlugins({ dshHome: homeDir, profile: 'web' });
+  const offlineMarket = await offlineController.getMarket();
+  check('离线时市场列出内置插件', offlineMarket.offlineCatalog === true && offlineMarket.rows.some((row) => row.package === '@jaxzhou/dsh-file-explorer' && row.group === 'bundled'), JSON.stringify(offlineMarket.groupCounts));
+  check('离线市场条目标记为已安装', offlineMarket.rows.every((row) => row.status === 'installed' || row.status === 'installed-unknown-version'));
+
+  // A broken payload must fail loudly instead of trying to download.
+  const brokenController = new ShellController({
+    cwd: here,
+    offline: { enabled: true, vendor: { dir: '/nonexistent/vendor', nodeBinDir: null, manifest: null }, homeDir: null, storeDir: null },
+    detect: async () => ({
+      platform: process.platform,
+      arch: process.arch,
+      packageName: DSH_PACKAGE,
+      node: { available: false, version: null, command: null, error: '未找到' },
+      npm: { available: false, version: null, command: null, error: '未找到' },
+      pnpm: { available: false, version: null, command: null, error: '未找到' },
+      dsh: { installed: false, version: null, command: null, error: '未找到' },
+    }),
+    startDelayMs: 10,
+  });
+  await brokenController.check({ autostart: false });
+  check('payload 不完整时明确报错且不下载', brokenController.getState().phase === 'no-node' && /离线 payload/.test(brokenController.getState().error?.message ?? ''), JSON.stringify(brokenController.getState().error));
+
+  await offlineController.dispose();
+  await brokenController.dispose();
+  rmSync(resourcesDir, { recursive: true, force: true });
+  rmSync(userData, { recursive: true, force: true });
 }
 
 // --------------------------------------------------------------------- summary

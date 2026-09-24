@@ -396,6 +396,9 @@ function renderMarket(next) {
   if (runtimeInfo.profileDir) runtimeParts.push(`profile ${runtimeInfo.profileDir}`);
   if (runtimeInfo.command) runtimeParts.push(`dsh ${runtimeInfo.command}${runtimeInfo.version ? ` (v${runtimeInfo.version})` : ''}`);
   if (runtimeInfo.private) runtimeParts.push('私有安装');
+  if (next.offline?.enabled) {
+    runtimeParts.push(`离线内置${next.offline.dsh ? ` dsh ${next.offline.dsh}` : ''}`);
+  }
   const pnpm = next.pnpm;
   if (pnpm) runtimeParts.push(pnpm.available ? `pnpm ${pnpm.version ?? '可用'}` : 'pnpm 不可用');
   setText(el.marketRuntime, runtimeParts.join(' · '));

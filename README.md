@@ -10,6 +10,30 @@
 3. **启动**：安装完成后自动重新检测，并启动 `dsh web --no-open`。
 4. **加载**：解析 dsh 打印的带鉴权 token 的地址，在窗口内嵌的 `WebContentsView` 中加载运行中的 dsh 界面。
 
+### 完全离线的 Linux 版
+
+常规 Linux 包在首次运行时会按需联网（缺 Node 时下载官方 LTS、缺插件时从 npm 安装）。离线版把这一切预先装进包里，**首次运行到启动 Harness 全程不需要网络**：
+
+| 随包内容 | 说明 |
+| --- | --- |
+| `resources/vendor/node/` | Linux x64 Node 运行时 + npm + **pnpm** + **dsh**（含其全部依赖，含原生模块） |
+| `resources/vendor/dsh-home/` | DSH_HOME 种子：`web` profile 里 **已装好 `@jaxzhou/dsh-file-explorer`** 并列入 bundles 层 |
+| `resources/vendor/pnpm-store.tgz` | pnpm store，插件安装/更新在离线时也能走本地 |
+| `resources/vendor/plugins/` | 插件 tarball，便于离线重装 |
+| `resources/vendor/manifest.json` | 打包内容与版本（客户端据此显示"离线内置"） |
+
+首次运行时应用会把种子 home 展开到用户数据目录（保留已有 sessions/凭据），把 pnpm store 解到同处，并把 `DSH_HOME` 指向它——`dsh` 与插件都从包内加载，不做任何下载；市场页的"运行信息"行会标出 `离线内置 dsh …`。
+
+产物（`release-offline/`）：
+
+| 文件 | 说明 |
+| --- | --- |
+| `DSH-D-Offline-<版本>-linux-x64.tar.gz` | 便携版（解压即用，约 260 MB） |
+| `DSH-D-Offline-<版本>-linux-x64.AppImage` | 单文件版（chmod +x 直接运行） |
+
+> 构建在 Linux 容器内完成（`scripts/build-offline-linux.sh`）——macOS 上跨装依赖树会挑到 darwin 二进制，而 dsh 的依赖里有原生模块（node-pty）。
+> 两个可复跑的验证脚本：`scripts/verify-offline-linux.sh`（断网容器里验证 payload：版本可用、插件就位、`dsh web` 能起并服务 Web UI、客户端逻辑零下载）与 `scripts/verify-offline-app.sh`（把打包好的离线应用放进容器，在只保留 loopback 的命名空间里跑它自己的 `--self-test`）。
+
 ### 顶部大 tab
 
 两个大 tab 与品牌、状态、操作同在**顶栏一行内**（不另起一行）；内嵌的 dsh 界面从顶栏下方开始。
@@ -41,6 +65,10 @@ npm run dist:mac     # macOS: dmg + zip（未签名，本机可直接运行）
 npm run dist:win     # Windows: NSIS 安装包 + 免安装 zip（在 macOS/Linux 上同样可用）
 npm run dist:linux   # Linux: AppImage + deb + tar.gz（在 macOS 上交叉构建同样可用）
 npm run pack         # 只产出当前平台的应用目录（最快，双击即可运行）
+
+# 完全离线的 Linux 版（自包含 Node/pnpm/dsh/插件，见下文）
+scripts/build-offline-linux.sh
+npx electron-builder --config electron-builder.offline.yml --linux
 ```
 
 网络受限时（GitHub Releases 不可达）交叉构建 Windows 的完整命令：
@@ -126,6 +154,9 @@ npx electron-builder --win
 | `npm run self-test` | Electron 运行时冒烟测试：窗口、preload 桥、界面、内嵌视图、工具栏、IPC；**不会启动 dsh** |
 | `npm run test:network` | 实网验证：真实下载 Node.js LTS、确认 npm 全局目录落在托管目录内、真实安装一次 dsh，以及校验线上插件目录（两组齐全 / 条目合法 / 与 npm 版本一致） |
 | `npm run diagnose` | 运行时配置诊断：模拟一台没有 Node 的机器跑完整流程，逐条打印 node/npm 检查结果（排查环境问题用） |
+| `scripts/build-offline-linux.sh` | 构建离线自包含 payload（在 Linux 容器内装 Node/pnpm/dsh/插件） |
+| `scripts/verify-offline-linux.sh` | 断网容器验证 payload（含用 payload 的 node 跑客户端离线逻辑） |
+| `scripts/verify-offline-app.sh` | 在断网容器里运行**打包后的**离线应用自检（xvfb） |
 | `npm run capture-ui` | 把各阶段界面渲染成 `ui-preview/*.png`（含打开的 ⋮ 菜单） |
 | `npm run pack` / `npm run dist` | 打包桌面应用 |
 
@@ -176,12 +207,13 @@ test/              验证脚本与 fixture（伪 npm、伪 dsh）
 | `DSH_D_USER_DATA` | 覆盖 Electron 用户数据目录（便携 / 测试用），托管运行时位于其下的 `runtime/` |
 | `DSH_D_NODE_MIRROR` | Node.js 发行版镜像（如 `https://registry.npmmirror.com/-/binary/node`），自动配置运行时时优先使用 |
 | `DSH_D_NODE_VERSION` | 固定要安装的 Node.js 版本（如 `v24.21.0`），默认取官方最新 LTS |
-| `DSH_D_MARKET_URL` | 插件市场目录地址，默认 `https://dsh.textwork.cn/plugins/index.json` |
+| `DSH_D_MARKET_URL` | 插件市场目录地址，默认 `https://dsh.textwork.cn/plugins/plugins.json` |
+| `DSH_D_VENDOR_DIR` | 离线 payload 目录（离线版自动从应用资源目录发现，一般无需设置） |
 | `DSH_D_PROFILE` | 插件安装到哪个 dsh profile，默认 `web`（与外壳启动的 profile 一致） |
 
 ## 已验证内容
 
-`npm test`（203 项）覆盖：登录环境解析、检测、进度模型、`dsh web: <url>` 解析、安装成功/失败与提示、服务启停生命周期、状态机端到端（未安装 → 安装 → 启动 → 运行 → 重启 → 停止，使用 fixture 注入，不触碰真实 npm/dsh），**模拟 `win32` 的 Windows 代码路径**（`.cmd` 是否走 shell、含空格路径的引号处理、PATH 分号分隔、PATHEXT 解析、Windows 全局目录推断），**运行时自动配置**（发行版地址解析、LTS 选择、下载进度、真实 tar 解压、复用与取消、托管环境 prefix/cache 锁定、控制器"缺 Node → 自动配置 → 进入安装 dsh"流程与失败兜底），**插件市场**（新目录 schema：自身/社区分组、`name`/`package` 兼容、站点相对链接补全、社区 downloads/stars、semver 比较含预发布、包名/版本白名单、目录解析与非法条目丢弃、profile 已装插件读取与版本来源、目录与本地状态合并、pnpm 自举、安装参数构造、控制器"安装 → 自动重启 dsh → 版本更新"与失败不重启），以及**dsh 实际位置与 pnpm 依赖**（按环境解析 home：posix `HOME` / Windows `USERPROFILE`/`HOMEDRIVE+HOMEPATH`/`DSH_HOME` 含 `~` 展开、profile 缺失时列出实际存在的 profile、pnpm 纳入检测、启动时自动安装 pnpm 且失败不阻塞、私有安装识别、市场读数与安装使用同一 home）。
+`npm test`（228 项）覆盖：登录环境解析、检测、进度模型、`dsh web: <url>` 解析、安装成功/失败与提示、服务启停生命周期、状态机端到端（未安装 → 安装 → 启动 → 运行 → 重启 → 停止，使用 fixture 注入，不触碰真实 npm/dsh），**模拟 `win32` 的 Windows 代码路径**（`.cmd` 是否走 shell、含空格路径的引号处理、PATH 分号分隔、PATHEXT 解析、Windows 全局目录推断），**运行时自动配置**（发行版地址解析、LTS 选择、下载进度、真实 tar 解压、复用与取消、托管环境 prefix/cache 锁定、控制器"缺 Node → 自动配置 → 进入安装 dsh"流程与失败兜底），**插件市场**（新目录 schema：自身/社区分组、`name`/`package` 兼容、站点相对链接补全、社区 downloads/stars、semver 比较含预发布、包名/版本白名单、目录解析与非法条目丢弃、profile 已装插件读取与版本来源、目录与本地状态合并、pnpm 自举、安装参数构造、控制器"安装 → 自动重启 dsh → 版本更新"与失败不重启），以及**dsh 实际位置与 pnpm 依赖**（按环境解析 home：posix `HOME` / Windows `USERPROFILE`/`HOMEDRIVE+HOMEPATH`/`DSH_HOME` 含 `~` 展开、profile 缺失时列出实际存在的 profile、pnpm 纳入检测、启动时自动安装 pnpm 且失败不阻塞、私有安装识别、市场读数与安装使用同一 home）。
 
 `npm run test:network`（12 项）在真实网络上验证：下载 Node.js LTS（约 52 MB）→ 解压校验 → `npm prefix -g` 落在托管目录 → 真实执行 `npm install -g @deepseek-ai/dsh` 并运行托管目录内的 dsh。
 

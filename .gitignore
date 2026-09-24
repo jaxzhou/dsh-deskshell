@@ -10,3 +10,7 @@ dist/
 .build-home/
 test/.tmp-*/
 test/.network-runtime/
+
+# 离线 bundle 构建产物（数百 MB，不入库）
+vendor/
+release-offline/

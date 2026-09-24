@@ -1,0 +1,43 @@
+# Offline, self-contained Linux build.
+#
+# Extends the normal configuration with the pre-built vendor payload
+# (scripts/build-offline-linux.sh): a Linux Node runtime, npm, pnpm, dsh and a
+# seeded DSH_HOME whose web profile already contains
+# @jaxzhou/dsh-file-explorer. The app then needs no network at all on first run.
+#
+# Build:
+#   scripts/build-offline-linux.sh
+#   npx electron-builder --config electron-builder.offline.yml --linux
+#
+extends: ./electron-builder.yml
+
+appId: com.deepseek.dsh.desktop.offline
+productName: DSH-D Offline
+
+directories:
+  output: release-offline
+  buildResources: assets
+
+# The payload: ~510 MB of runtime + harness home, copied verbatim into resources/.
+extraResources:
+  - from: vendor
+    to: vendor
+    filter:
+      - '**/*'
+
+linux:
+  icon: assets/icons
+  category: Development
+  executableName: dsh-d-offline
+  syncDesktopName: true
+  artifactName: DSH-D-Offline-${version}-linux-x64.${ext}
+  desktop:
+    entry:
+      Name: DSH-D Offline
+      Comment: DeepSeek Harness 桌面外壳（离线自包含版）
+  target:
+    - tar.gz
+    - AppImage
+
+appImage:
+  artifactName: DSH-D-Offline-${version}-linux-x64.${ext}
