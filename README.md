@@ -10,6 +10,26 @@
 3. **启动**：安装完成后自动重新检测，并启动 `dsh web --no-open`。
 4. **加载**：解析 dsh 打印的带鉴权 token 的地址，在窗口内嵌的 `WebContentsView` 中加载运行中的 dsh 界面。
 
+### 打印
+
+外壳自己拥有打印链路，**不依赖页面里是否存在打印按钮**：
+
+| 入口 | 行为 |
+| --- | --- |
+| ⋮ 菜单 →「打印当前页面」 | 调起**系统打印面板**（`webContents.print({ silent: false })`） |
+| 内嵌界面里按 Cmd/Ctrl+P | 同上（快捷键由外壳接管） |
+| ⋮ 菜单 →「导出为 PDF…」 | `printToPDF` + 系统保存对话框，导出当前 dsh 页面 |
+
+`scripts/print-probe.cjs` 是这件事的实测依据（Electron 43 / macOS）：
+
+| 场景 | `window.print()` 结果 |
+| --- | --- |
+| 顶层页面（内嵌视图） | ✅ 打开系统打印面板（渲染进程被阻塞） |
+| 同源 iframe（无 sandbox） | ✅ 打开系统打印面板 |
+| `sandbox="allow-scripts"` / `+ allow-modals` / `+ allow-same-origin` | ❌ 调用立即返回，被 Chromium 忽略 |
+
+也就是说：**页面顶层的打印可用；但任何 `sandbox=` 的 iframe 里的打印调用都会被浏览器拦掉**，外壳无法从外部代它调用（跨域 + 沙箱）。`@jaxzhou/dsh-file-explorer` 的 HTML 预览正是渲染在沙箱 iframe 中，所以它的打印要靠外壳入口或插件自带的「导出 PDF / 导出 Word」（页面内 Blob 导出，不经过打印对话框）。运行 `./node_modules/.bin/electron scripts/print-probe.cjs --no-sandbox --disable-gpu [--dialog]` 可复现上表（`--dialog` 会短暂打开真实的系统打印面板）。
+
 ### 完全离线的 Linux 版
 
 常规 Linux 包在首次运行时会按需联网（缺 Node 时下载官方 LTS、缺插件时从 npm 安装）。离线版把这一切预先装进包里，**首次运行到启动 Harness 全程不需要网络**：
@@ -152,6 +172,7 @@ npx electron-builder --win
 | `npm run dev` | 启动并打开开发者工具 |
 | `npm test` / `npm run verify` | 纯 Node 逻辑验证（检测、进度模型、安装流程、服务生命周期、状态机端到端） |
 | `npm run self-test` | Electron 运行时冒烟测试：窗口、preload 桥、界面、内嵌视图、工具栏、IPC；**不会启动 dsh** |
+| `scripts/print-probe.cjs` | 打印链路实测：打印机/printToPDF/window.print()/沙箱 iframe/外壳 printPage（`--dialog` 会打开系统面板） |
 | `npm run test:network` | 实网验证：真实下载 Node.js LTS、确认 npm 全局目录落在托管目录内、真实安装一次 dsh，以及校验线上插件目录（两组齐全 / 条目合法 / 与 npm 版本一致） |
 | `npm run diagnose` | 运行时配置诊断：模拟一台没有 Node 的机器跑完整流程，逐条打印 node/npm 检查结果（排查环境问题用） |
 | `scripts/build-offline-linux.sh` | 构建离线自包含 payload（在 Linux 容器内装 Node/pnpm/dsh/插件） |
@@ -213,11 +234,11 @@ test/              验证脚本与 fixture（伪 npm、伪 dsh）
 
 ## 已验证内容
 
-`npm test`（228 项）覆盖：登录环境解析、检测、进度模型、`dsh web: <url>` 解析、安装成功/失败与提示、服务启停生命周期、状态机端到端（未安装 → 安装 → 启动 → 运行 → 重启 → 停止，使用 fixture 注入，不触碰真实 npm/dsh），**模拟 `win32` 的 Windows 代码路径**（`.cmd` 是否走 shell、含空格路径的引号处理、PATH 分号分隔、PATHEXT 解析、Windows 全局目录推断），**运行时自动配置**（发行版地址解析、LTS 选择、下载进度、真实 tar 解压、复用与取消、托管环境 prefix/cache 锁定、控制器"缺 Node → 自动配置 → 进入安装 dsh"流程与失败兜底），**插件市场**（新目录 schema：自身/社区分组、`name`/`package` 兼容、站点相对链接补全、社区 downloads/stars、semver 比较含预发布、包名/版本白名单、目录解析与非法条目丢弃、profile 已装插件读取与版本来源、目录与本地状态合并、pnpm 自举、安装参数构造、控制器"安装 → 自动重启 dsh → 版本更新"与失败不重启），以及**dsh 实际位置与 pnpm 依赖**（按环境解析 home：posix `HOME` / Windows `USERPROFILE`/`HOMEDRIVE+HOMEPATH`/`DSH_HOME` 含 `~` 展开、profile 缺失时列出实际存在的 profile、pnpm 纳入检测、启动时自动安装 pnpm 且失败不阻塞、私有安装识别、市场读数与安装使用同一 home）。
+`npm test`（246 项）覆盖：登录环境解析、检测、进度模型、`dsh web: <url>` 解析、安装成功/失败与提示、服务启停生命周期、状态机端到端（未安装 → 安装 → 启动 → 运行 → 重启 → 停止，使用 fixture 注入，不触碰真实 npm/dsh），**模拟 `win32` 的 Windows 代码路径**（`.cmd` 是否走 shell、含空格路径的引号处理、PATH 分号分隔、PATHEXT 解析、Windows 全局目录推断），**运行时自动配置**（发行版地址解析、LTS 选择、下载进度、真实 tar 解压、复用与取消、托管环境 prefix/cache 锁定、控制器"缺 Node → 自动配置 → 进入安装 dsh"流程与失败兜底），**插件市场**（新目录 schema：自身/社区分组、`name`/`package` 兼容、站点相对链接补全、社区 downloads/stars、semver 比较含预发布、包名/版本白名单、目录解析与非法条目丢弃、profile 已装插件读取与版本来源、目录与本地状态合并、pnpm 自举、安装参数构造、控制器"安装 → 自动重启 dsh → 版本更新"与失败不重启），**打印与 PDF 导出**（Cmd/Ctrl+P 判定、系统面板调用与回调、用户取消、页面不可用/抛错、PDF 落盘与取消保存、写入失败），以及**dsh 实际位置与 pnpm 依赖**（按环境解析 home：posix `HOME` / Windows `USERPROFILE`/`HOMEDRIVE+HOMEPATH`/`DSH_HOME` 含 `~` 展开、profile 缺失时列出实际存在的 profile、pnpm 纳入检测、启动时自动安装 pnpm 且失败不阻塞、私有安装识别、市场读数与安装使用同一 home）。
 
 `npm run test:network`（12 项）在真实网络上验证：下载 Node.js LTS（约 52 MB）→ 解压校验 → `npm prefix -g` 落在托管目录 → 真实执行 `npm install -g @deepseek-ai/dsh` 并运行托管目录内的 dsh。
 
-`npm run self-test`（53 项）在真实 Electron 中验证：窗口与界面渲染、preload 桥、IPC 往返、剪贴板 API、主进程检测、`WebContentsView` 创建/尺寸/隐藏，工具栏（菜单可展开、不遮挡退出按钮、运行阶段无内联调试按钮、状态区显示机器名与 dsh 版本且不含端口），**顶部 tab 与插件市场**（两个大 tab、切换后阶段面板让位、内嵌视图在市场上隐藏、用本地 fixture 目录渲染卡片与本地已装列表、有更新时出现更新按钮、安装会调用 dsh plugin 并自动重启、切回 DSH tab 恢复），**实际位置与 pnpm 告警**（市场显示 profile 目录与 dsh 路径、pnpm 不可用时给出告警与"自动配置 pnpm"入口、点击后触发配置且告警消失），以及**菜单与层级**（用真实鼠标输入点击 ⋮ 验证可命中/展开/收起，菜单展开时内嵌视图隐藏、关闭后恢复，市场 tab 不显示视图）、**分组与卸载**（自身/社区两个分组、分组计数、已安装项出现卸载按钮、卸载走 dsh plugin remove 并同样重启）。
+`npm run self-test`（55 项）在真实 Electron 中验证：窗口与界面渲染、preload 桥、IPC 往返、剪贴板 API、主进程检测、`WebContentsView` 创建/尺寸/隐藏，工具栏（菜单可展开、不遮挡退出按钮、运行阶段无内联调试按钮、状态区显示机器名与 dsh 版本且不含端口），**顶部 tab 与插件市场**（两个大 tab、切换后阶段面板让位、内嵌视图在市场上隐藏、用本地 fixture 目录渲染卡片与本地已装列表、有更新时出现更新按钮、安装会调用 dsh plugin 并自动重启、切回 DSH tab 恢复），**菜单与打印入口**（菜单项含打印/导出 PDF）、**实际位置与 pnpm 告警**（市场显示 profile 目录与 dsh 路径、pnpm 不可用时给出告警与"自动配置 pnpm"入口、点击后触发配置且告警消失），以及**菜单与层级**（用真实鼠标输入点击 ⋮ 验证可命中/展开/收起，菜单展开时内嵌视图隐藏、关闭后恢复，市场 tab 不显示视图）、**分组与卸载**（自身/社区两个分组、分组计数、已安装项出现卸载按钮、卸载走 dsh plugin remove 并同样重启）。
 
 > 在受限环境（容器、外层的进程沙箱、CI）中，Chromium 自身的沙箱可能无法初始化，此时可加 `--no-sandbox --disable-gpu` 运行自检：
 > ```bash

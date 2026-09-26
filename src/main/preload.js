@@ -39,6 +39,10 @@ contextBridge.exposeInMainWorld('dshShell', {
   retry: () => ipcRenderer.invoke('dsh:retry'),
   /** Reload the embedded DSH GUI. */
   reloadGui: () => ipcRenderer.invoke('dsh:reload-gui'),
+  /** Print the embedded dsh page through the system print dialog. */
+  printGui: () => ipcRenderer.invoke('dsh:print-gui'),
+  /** Export the embedded dsh page to PDF (save dialog). */
+  exportGuiPdf: () => ipcRenderer.invoke('dsh:export-gui-pdf'),
   /** Show/hide the embedded GUI (hidden = read the shell's log panel). */
   setGuiVisible: (visible) => ipcRenderer.invoke('dsh:set-gui-visible', visible),
   /** Switch the shell's top tab: 'dsh' (embedded Web) or 'market'. */

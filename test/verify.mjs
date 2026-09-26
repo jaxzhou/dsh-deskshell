@@ -32,6 +32,7 @@ const { ShellController } = require('../src/main/controller.js');
 const nodeRuntime = require('../src/main/node-runtime.js');
 const market = require('../src/main/plugin-market.js');
 const offline = require('../src/main/offline.js');
+const printing = require('../src/main/printing.js');
 
 let passed = 0;
 let failed = 0;
@@ -1422,6 +1423,77 @@ section('16. 离线自包含 payload (offline)');
   await brokenController.dispose();
   rmSync(resourcesDir, { recursive: true, force: true });
   rmSync(userData, { recursive: true, force: true });
+}
+
+section('17. 打印与 PDF 导出 (printing)');
+{
+  // --- shortcut detection -------------------------------------------------
+  const shortcutCases = [
+    [{ type: 'keyDown', key: 'p', meta: true }, 'darwin', true],
+    [{ type: 'keyDown', key: 'P', meta: true }, 'darwin', true],
+    [{ type: 'keyDown', key: 'p', control: true }, 'darwin', false],
+    [{ type: 'keyDown', key: 'p', control: true }, 'win32', true],
+    [{ type: 'keyDown', key: 'p', meta: true }, 'win32', false],
+    [{ type: 'keyDown', key: 'p', control: true, alt: true }, 'win32', false],
+    [{ type: 'keyUp', key: 'p', control: true }, 'win32', false],
+    [{ type: 'keyDown', key: 'p' }, 'win32', false],
+    [{ type: 'keyDown', key: 's', control: true }, 'win32', false],
+  ];
+  for (const [input, platform, expected] of shortcutCases) {
+    check(
+      `快捷键判定 ${platform} ${JSON.stringify(input)}`,
+      printing.isPrintShortcut(input, platform) === expected,
+      String(printing.isPrintShortcut(input, platform)),
+    );
+  }
+
+  // --- printPage ----------------------------------------------------------
+  const printed = [];
+  const fakeContents = {
+    isDestroyed: () => false,
+    print: (options, callback) => {
+      printed.push(options);
+      callback(true, '');
+    },
+  };
+  const okResult = await printing.printPage(fakeContents);
+  check('printPage 打开系统面板并回调成功', okResult.ok === true && printed.at(-1)?.silent === false, JSON.stringify(okResult));
+  check('默认打印背景色', printed.at(-1)?.printBackground === true, JSON.stringify(printed.at(-1)));
+
+  const failResult = await printing.printPage({
+    isDestroyed: () => false,
+    print: (_options, callback) => callback(false, 'Print job canceled'),
+  });
+  check('用户取消时上报原因', failResult.ok === false && /canceled/i.test(failResult.reason ?? ''), JSON.stringify(failResult));
+  check('页面不可用时直接返回失败', (await printing.printPage({ isDestroyed: () => true })).ok === false);
+  check('print 抛错时不崩溃', (await printing.printPage({ isDestroyed: () => false, print: () => { throw new Error('boom'); } })).reason === 'boom');
+
+  // --- PDF export ---------------------------------------------------------
+  const pdfDir = path.join(here, '.tmp-pdf');
+  rmSync(pdfDir, { recursive: true, force: true });
+  mkdirSync(pdfDir, { recursive: true });
+  const target = path.join(pdfDir, 'page.pdf');
+  const exported = await printing.exportPageAsPdf(
+    { isDestroyed: () => false },
+    {
+      defaultPath: target,
+      choosePath: async () => target,
+      printToPDF: async () => Buffer.from('%PDF-1.4 probe'),
+    },
+  );
+  check('导出 PDF 写入文件', exported.ok === true && existsSync(target), JSON.stringify(exported));
+  check('PDF 内容正确落盘', readFileSync(target, 'utf8').startsWith('%PDF-1.4'), readFileSync(target, 'utf8'));
+  const cancelled = await printing.exportPageAsPdf(
+    { isDestroyed: () => false },
+    { defaultPath: target, choosePath: async () => null },
+  );
+  check('取消保存时不落盘', cancelled.ok === false && cancelled.reason === 'cancelled', JSON.stringify(cancelled));
+  const broken = await printing.exportPageAsPdf(
+    { isDestroyed: () => false },
+    { defaultPath: path.join(pdfDir, 'nope', 'x.pdf'), choosePath: async () => path.join(pdfDir, 'nope', 'x.pdf'), printToPDF: async () => Buffer.from('x') },
+  );
+  check('写入失败时返回错误', broken.ok === false && Boolean(broken.reason), JSON.stringify(broken));
+  rmSync(pdfDir, { recursive: true, force: true });
 }
 
 // --------------------------------------------------------------------- summary

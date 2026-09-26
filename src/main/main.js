@@ -12,10 +12,11 @@ const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
 
-const { BrowserWindow, WebContentsView, app, ipcMain, shell } = require('electron');
+const { BrowserWindow, WebContentsView, app, dialog, ipcMain, shell } = require('electron');
 
 const { ShellController } = require('./controller');
 const { describeVendor, preparePnpmStore, resolveVendorDir, seedDshHome } = require('./offline');
+const { exportPageAsPdf, isPrintShortcut, printPage } = require('./printing');
 const { DEFAULT_MARKET_URL } = require('./plugin-market');
 
 const RENDERER_INDEX = path.join(__dirname, '..', 'renderer', 'index.html');
@@ -112,6 +113,14 @@ function attachGuiView() {
     guiView.webContents.on('render-process-gone', (_event, details) => {
       controller.pushLog({ stream: 'stderr', line: `DSH 界面渲染进程退出：${details.reason}` });
     });
+    // Cmd/Ctrl+P belongs to the shell: the embedded page prints through
+    // `webContents.print()`, which is the same system dialog `window.print()`
+    // opens from the top frame (a sandboxed iframe cannot open it at all).
+    guiView.webContents.on('before-input-event', (event, input) => {
+      if (!isPrintShortcut(input)) return;
+      event.preventDefault();
+      void printEmbeddedPage();
+    });
   }
   if (!guiAttached) {
     win.contentView.addChildView(guiView);
@@ -137,6 +146,53 @@ function setGuiVisible(visible) {
   // while a phase panel is up) must not reveal it.
   syncGuiView(controller.getState());
   return guiHiddenByUser;
+}
+
+/**
+ * Print the embedded dsh page (system dialog) and report into the shell log.
+ * @returns {Promise<{ok: boolean, reason: string|null}>}
+ */
+async function printEmbeddedPage() {
+  if (!guiView || guiView.webContents.isDestroyed()) {
+    return { ok: false, reason: 'DSH 界面尚未加载' };
+  }
+  controller.pushLog({ stream: 'system', line: '正在打开系统打印面板…' });
+  const result = await printPage(guiView.webContents, { silent: false, printBackground: true });
+  controller.pushLog({
+    stream: result.ok ? 'system' : 'stderr',
+    line: result.ok
+      ? '打印任务已提交（若你在面板中取消，属正常操作）'
+      : `打印未完成：${result.reason ?? '未知原因'}`,
+  });
+  return result;
+}
+
+/** Export the embedded dsh page to a PDF the user picks. */
+async function exportEmbeddedPdf() {
+  if (!guiView || guiView.webContents.isDestroyed()) {
+    return { ok: false, reason: 'DSH 界面尚未加载' };
+  }
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  const result = await exportPageAsPdf(guiView.webContents, {
+    defaultPath: path.join(app.getPath('documents'), `dsh-page-${stamp}.pdf`),
+    choosePath: async (defaultPath) => {
+      const picked = await dialog.showSaveDialog(win, {
+        title: '导出为 PDF',
+        defaultPath,
+        filters: [{ name: 'PDF', extensions: ['pdf'] }],
+      });
+      return picked.canceled || !picked.filePath ? null : picked.filePath;
+    },
+  });
+  controller.pushLog({
+    stream: result.ok ? 'system' : 'stderr',
+    line: result.ok
+      ? `已导出 PDF：${result.path}`
+      : result.reason === 'cancelled'
+        ? '已取消导出'
+        : `导出 PDF 失败：${result.reason ?? '未知原因'}`,
+  });
+  return result;
 }
 
 /** Load the authenticated dsh URL into the embedded view. */
@@ -289,6 +345,24 @@ function registerIpc() {
   });
 
   ipcMain.handle('dsh:set-gui-visible', (_event, visible) => setGuiVisible(Boolean(visible)));
+
+  ipcMain.handle('dsh:print-gui', async () => {
+    try {
+      return await printEmbeddedPage();
+    } catch (error) {
+      reportError('打印失败', error);
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+  });
+
+  ipcMain.handle('dsh:export-gui-pdf', async () => {
+    try {
+      return await exportEmbeddedPdf();
+    } catch (error) {
+      reportError('导出 PDF 失败', error);
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+    }
+  });
 
   ipcMain.handle('dsh:set-active-tab', (_event, tab) => {
     activeTab = tab === 'market' ? 'market' : 'dsh';
@@ -559,6 +633,14 @@ async function runSelfTest() {
       return result;
     })()`);
     record('菜单可展开且有操作项', layout.open === true && layout.items >= 6, `items=${layout.items}`);
+    const menuActions = await win.webContents.executeJavaScript(
+      'Array.from(document.querySelectorAll("#menuList .menu-item")).map((b) => b.dataset.action)',
+    );
+    record(
+      '运行菜单含打印与导出 PDF',
+      menuActions.includes('print-gui') && menuActions.includes('export-pdf'),
+      menuActions.join(','),
+    );
     record('菜单不超出窗口', layout.menu.right <= layout.toolbar.right && layout.menu.left >= 0, JSON.stringify(layout.menu));
     record(
       '菜单不遮挡退出按钮',

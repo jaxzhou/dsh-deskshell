@@ -617,6 +617,8 @@ const MENU_SPECS = {
     { label: () => (guiHidden ? '返回 DSH 界面' : '查看日志'), action: 'toggle-gui' },
     { label: '重新加载界面', action: 'reload' },
     { label: '在浏览器中打开', action: 'open-browser' },
+    { label: '打印当前页面', action: 'print-gui' },
+    { label: '导出为 PDF…', action: 'export-pdf' },
     { separator: true },
     { label: '重启 dsh', action: 'restart' },
     { label: '停止 dsh', action: 'stop' },
@@ -813,6 +815,19 @@ const ACTIONS = {
     renderToolbarActions(state?.phase ?? 'running');
   },
   'open-browser': () => api.openExternal(),
+  'print-gui': async () => {
+    // The system panel is modal; feedback lands in the log panel.
+    const result = await api.printGui();
+    if (result && result.ok === false && result.reason && result.reason !== 'cancelled') {
+      appendLog({ ts: Date.now(), stream: 'stderr', line: `打印未完成：${result.reason}` });
+    }
+  },
+  'export-pdf': async () => {
+    const result = await api.exportGuiPdf();
+    if (result?.ok) {
+      appendLog({ ts: Date.now(), stream: 'system', line: `已导出 PDF：${result.path}` });
+    }
+  },
   'market-refresh': () => loadMarket(),
   'market-open-site': () => api.openExternal('https://dsh.textwork.cn/plugins/'),
   'plugin-install': (button) =>
