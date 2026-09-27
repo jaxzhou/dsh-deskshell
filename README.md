@@ -197,6 +197,7 @@ npx electron-builder --win
 | `scripts/print-probe.cjs` | 打印链路实测：打印机/printToPDF/window.print()/沙箱 iframe/外壳 printPage（`--dialog` 会打开系统面板） |
 | `npm run test:update` | 自更新线上验证：真实下载本机对应的包、比对 SHA-256、解开确认包内版本号与 appId，并打印会执行的替换计划（不真的替换） |
 | `scripts/publish-update-manifest.mjs` | 生成自更新发布清单 `latest.json`（版本 + 各平台文件 + 大小 + SHA-256） |
+| `scripts/verify-update-apply.sh` | 替换演练：在临时目录里用**本地构建的包**真实执行辅助脚本（mac 占位 `.app` → 0.1.8、AppImage 覆盖并保持可执行），验证"退出后替换"这一环 |
 | `npm run test:network` | 实网验证：真实下载 Node.js LTS、确认 npm 全局目录落在托管目录内、真实安装一次 dsh，以及校验线上插件目录（两组齐全 / 条目合法 / 与 npm 版本一致） |
 | `npm run diagnose` | 运行时配置诊断：模拟一台没有 Node 的机器跑完整流程，逐条打印 node/npm 检查结果（排查环境问题用） |
 | `scripts/build-offline-linux.sh` | 构建离线自包含 payload（在 Linux 容器内装 Node/pnpm/dsh/插件） |
@@ -267,7 +268,9 @@ test/              验证脚本与 fixture（伪 npm、伪 dsh）
 
 `npm run test:network`（26 项）在真实网络上验证：下载 Node.js LTS（约 52 MB）→ 解压校验 → `npm prefix -g` 落在托管目录 → 真实执行 `npm install -g @deepseek-ai/dsh` 并运行托管目录内的 dsh；并校验线上插件目录与**自更新发布清单**（可解析、覆盖 win/mac/linux 与离线变体、每个包的直链 HEAD 大小与清单一致、不可达时优雅报错）。
 
-`npm run test:update`（12 项）在真实网络上跑完自更新的下载链路：取线上清单 → 为本机选包 → 下载（本次实测 126 MB / 101 秒）→ 比对清单里的 SHA-256 → 解开 `.app` 确认 `CFBundleShortVersionString` 与 `CFBundleIdentifier` → 打印替换计划与辅助脚本。
+`npm run test:update`（14 项）在真实网络上跑完自更新的下载链路：取线上清单 → 为本机选包 → 下载（本次实测 126 MB / 96 秒）→ 比对清单里的 SHA-256 → 解开 `.app` 确认 `CFBundleShortVersionString`、`CFBundleIdentifier`，并确认 `app.asar` 里确实带着 `update-manager.js`/`updater.js` → 打印替换计划与辅助脚本。
+
+`scripts/verify-update-apply.sh`（7 项）把"退出后替换"这一环真的跑一遍：写一个版本号为 `0.0.1-stub` 的占位 `.app`，用本机构建出的 `DSH-D-<版本>-mac.zip` 执行 mac 辅助脚本（`kill -0 999999` 代表外壳已退出），替换后版本变为 `0.1.8`、appId 正确、主程序可执行；AppImage 辅助脚本同样演练（内容替换 + 权限保持）。
 
 `npm run self-test`（69 项）在真实 Electron 中验证：窗口与界面渲染、preload 桥、IPC 往返、剪贴板 API、主进程检测、`WebContentsView` 创建/尺寸/隐藏，工具栏（菜单可展开、不遮挡退出按钮、运行阶段无内联调试按钮、状态区显示机器名与 dsh 版本且不含端口），**顶部 tab 与插件市场**（两个大 tab、切换后阶段面板让位、内嵌视图在市场上隐藏、用本地 fixture 目录渲染卡片与本地已装列表、有更新时出现更新按钮、安装会调用 dsh plugin 并自动重启、切回 DSH tab 恢复），**菜单与打印入口**（菜单项含打印/导出 PDF）、**实际位置与 pnpm 告警**（市场显示 profile 目录与 dsh 路径、pnpm 不可用时给出告警与"自动配置 pnpm"入口、点击后触发配置且告警消失），**外壳自更新界面**（默认不显示更新条、菜单含"检查更新"入口、用合成快照渲染出更新条/版本与大小/进度百分比/重启并安装、更新条高度计入内嵌视图内边距、稍后收起、未下载时拒绝应用以免误重启，且自检期间不联网），以及**菜单与层级**（用真实鼠标输入点击 ⋮ 验证可命中/展开/收起，菜单展开时内嵌视图隐藏、关闭后恢复，市场 tab 不显示视图）、**分组与卸载**（自身/社区两个分组、分组计数、已安装项出现卸载按钮、卸载走 dsh plugin remove 并同样重启）。
 

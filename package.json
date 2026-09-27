@@ -26,7 +26,8 @@
     "dist:mac": "electron-builder --mac",
     "dist:win": "electron-builder --win",
     "dist:linux": "node scripts/build-linux.mjs",
-    "test:update": "node test/update-live.mjs"
+    "test:update": "node test/update-live.mjs",
+    "verify:update-apply": "sh scripts/verify-update-apply.sh"
   },
   "keywords": [
     "electron",
