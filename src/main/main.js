@@ -11,6 +11,7 @@
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
+const { spawn } = require('node:child_process');
 
 const { BrowserWindow, WebContentsView, app, dialog, ipcMain, shell } = require('electron');
 
@@ -18,6 +19,8 @@ const { ShellController } = require('./controller');
 const { describeVendor, preparePnpmStore, resolveVendorDir, seedDshHome } = require('./offline');
 const { exportPageAsPdf, isPrintShortcut, printPage } = require('./printing');
 const { DEFAULT_MARKET_URL } = require('./plugin-market');
+const { DEFAULT_CHECK_INTERVAL_MS, createUpdateManager } = require('./update-manager');
+const { DEFAULT_MANIFEST_URL: DEFAULT_UPDATE_MANIFEST } = require('./updater');
 
 const RENDERER_INDEX = path.join(__dirname, '..', 'renderer', 'index.html');
 const PRELOAD = path.join(__dirname, 'preload.js');
@@ -490,6 +493,140 @@ function setupOfflinePayload() {
   log({ stream: 'system', line: `dsh home（可写）：${controller.offline.homeDir}` });
 }
 
+// ---------------------------------------------------------- shell self-update
+
+/**
+ * The shell updates itself from a single release manifest that is published
+ * beside the download files (see `scripts/publish-update-manifest.mjs`).
+ *
+ * Nothing long-running is involved: one HTTP GET shortly after start, then a
+ * timer every few hours, plus a manual "检查更新" in the ⋮ menu. Downloading and
+ * replacing happen only after the user asks for them, and the replacement is
+ * performed by a detached helper that waits for this process to exit.
+ *
+ * @type {ReturnType<typeof createUpdateManager>|null}
+ */
+let updateManager = null;
+
+function updateDownloadDir() {
+  return path.join(app.getPath('userData'), 'updates');
+}
+
+function broadcastUpdate(state) {
+  if (!win || win.isDestroyed()) return;
+  win.webContents.send('dsh:update-state', state);
+}
+
+/** The `.app` bundle that contains the running executable (macOS). */
+function macBundlePath() {
+  try {
+    return path.resolve(path.dirname(app.getPath('exe')), '..', '..');
+  } catch {
+    return null;
+  }
+}
+
+/** Periodic checks are opt-out (DSH_D_UPDATE_CHECK=0) and never run in tests. */
+function autoCheckEnabled() {
+  if (SELF_TEST || CAPTURE_UI || !app.isPackaged) return false;
+  return !/^(0|off|false|no)$/i.test(String(process.env.DSH_D_UPDATE_CHECK ?? ''));
+}
+
+/**
+ * Is this the self-contained offline build?
+ *
+ * `DSH_D_OFFLINE` is only exported into the dsh child's environment, so the
+ * payload the main process expanded is the authoritative signal here.
+ */
+function isOfflineBuild() {
+  return Boolean(controller.offline?.enabled) || process.env.DSH_D_OFFLINE === '1';
+}
+
+function createUpdater() {
+  const minutes = Number(process.env.DSH_D_UPDATE_INTERVAL_MIN ?? 0);
+  try {
+    updateManager = createUpdateManager({
+      currentVersion: app.getVersion(),
+      platform: process.platform,
+      arch: process.arch,
+      // The offline bundle has its own artifacts in the same manifest.
+      variant: isOfflineBuild() ? 'offline' : null,
+      manifestUrl: process.env.DSH_D_UPDATE_MANIFEST || DEFAULT_UPDATE_MANIFEST,
+      isPackaged: app.isPackaged,
+      appPath: process.platform === 'darwin' ? macBundlePath() : app.getPath('exe'),
+      appImagePath: process.env.APPIMAGE || null,
+      downloadDir: updateDownloadDir(),
+      autoCheck: autoCheckEnabled(),
+      checkIntervalMs: minutes > 0 ? minutes * 60_000 : DEFAULT_CHECK_INTERVAL_MS,
+      log: (line) => controller.pushLog({ stream: 'system', line }),
+      onState: broadcastUpdate,
+    });
+  } catch (error) {
+    reportError('更新器初始化失败', error);
+    return null;
+  }
+  updateManager.startAutoCheck();
+  return updateManager;
+}
+
+/**
+ * Run the planned update and quit so the helper can replace the app.
+ *
+ * The IPC reply is sent before the quit, hence the short delay; `before-quit`
+ * then disposes the controller (stopping dsh) exactly as a manual quit does.
+ */
+function applyUpdate() {
+  if (!updateManager) return { ok: false, error: '更新器未初始化' };
+  const decision = updateManager.apply();
+  if (!decision.ok) {
+    const plan = decision.plan;
+    if (plan && !plan.applicable && plan.target && fs.existsSync(plan.target)) {
+      try {
+        shell.showItemInFolder(plan.target);
+      } catch {
+        /* opening the folder is a convenience only */
+      }
+    }
+    return { ok: false, error: decision.error ?? '无法自动更新', plan: plan ?? null };
+  }
+
+  const { plan, context, script } = decision;
+  try {
+    if (plan.kind === 'run-installer') {
+      const installer = spawn(context.newFile, plan.args ?? [], { detached: true, stdio: 'ignore' });
+      installer.unref();
+    } else {
+      const scriptPath = path.join(updateDownloadDir(), 'apply-update.sh');
+      fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
+      fs.writeFileSync(scriptPath, script, { mode: 0o700 });
+      const helper = spawn('/bin/sh', [scriptPath], { detached: true, stdio: 'ignore' });
+      helper.unref();
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, error: `启动更新程序失败：${message}`, plan };
+  }
+
+  controller.pushLog({ stream: 'system', line: `开始应用更新 ${plan.kind}，本进程即将退出以便替换：${plan.note}` });
+  setTimeout(() => app.quit(), 1200);
+  return { ok: true, plan, restarting: true };
+}
+
+function registerUpdateIpc() {
+  ipcMain.handle('update:state', () => updateManager?.getState() ?? null);
+  ipcMain.handle('update:check', async () => {
+    if (!updateManager) return null;
+    await updateManager.checkNow().catch((error) => reportError('检查更新失败', error));
+    return updateManager.getState();
+  });
+  ipcMain.handle('update:download', async () => {
+    if (!updateManager) return null;
+    await updateManager.download().catch((error) => reportError('下载更新失败', error));
+    return updateManager.getState();
+  });
+  ipcMain.handle('update:apply', () => applyUpdate());
+}
+
 // ------------------------------------------------------------------ self-test
 
 /**
@@ -657,6 +794,107 @@ async function runSelfTest() {
       '状态区不显示端口',
       !layout.meta.includes('51234') && !layout.statusText.includes('51234'),
       `${layout.statusText} | ${layout.meta}`,
+    );
+
+    console.log('4b. 外壳自更新（检查/提示/菜单，不发网络请求）');
+    record(
+      '更新器已初始化且测试时不自动联网',
+      Boolean(updateManager) && updateManager.getState().autoCheck === false,
+      JSON.stringify(updateManager?.getState?.().phase),
+    );
+    const bridgeUpdate = await win.webContents.executeJavaScript(
+      'typeof window.dshShell.checkUpdate === "function" && typeof window.dshShell.applyUpdate === "function" && typeof window.dshShell.onUpdateState === "function"',
+    );
+    record('preload 暴露自更新接口', bridgeUpdate === true);
+    const ipcUpdate = await win.webContents.executeJavaScript(
+      'window.dshShell.updateState().then((s) => (s ? s.currentVersion : null))',
+    );
+    record('自更新状态可通过 IPC 读取', ipcUpdate === app.getVersion(), `${ipcUpdate} / ${app.getVersion()}`);
+
+    const idleBar = await win.webContents.executeJavaScript(
+      '({ hidden: document.getElementById("updateBar").hidden, dot: document.getElementById("menuBtn").classList.contains("has-update"), menu: Array.from(document.querySelectorAll("#menuList .menu-item")).map((b) => b.dataset.action) })',
+    );
+    record('默认不显示更新条', idleBar.hidden === true, JSON.stringify(idleBar.hidden));
+    record('菜单内含“检查更新”入口', idleBar.menu.includes('update-check'), idleBar.menu.join(','));
+
+    // A synthetic "update available" snapshot: exercises the real render path
+    // and the real dropdown, without any network access.
+    const syntheticUpdate = {
+      phase: 'available',
+      currentVersion: app.getVersion(),
+      latestVersion: '99.9.9',
+      notes: '自更新自检快照',
+      releasedAt: '2026-01-01T00:00:00Z',
+      file: 'DSH-D-99.9.9-mac.zip',
+      size: 104857600,
+      progress: null,
+      downloadedPath: null,
+      plan: { kind: 'replace-bundle', applicable: true, note: '退出后替换 .app' },
+      error: null,
+      source: 'https://dsh.textwork.cn/download/latest.json',
+    };
+    await win.webContents.executeJavaScript(`window.renderUpdate(${JSON.stringify(syntheticUpdate)}); true;`);
+    const availableBar = await win.webContents.executeJavaScript(
+      '(() => { const bar = document.getElementById("updateBar"); const r = bar.getBoundingClientRect(); const menu = Array.from(document.querySelectorAll("#menuList .menu-item")); return { hidden: bar.hidden, phase: bar.dataset.phase, title: document.getElementById("updateTitle").textContent, note: document.getElementById("updateNote").textContent, primary: document.getElementById("updatePrimary").textContent, height: Math.round(r.height), dot: document.getElementById("menuBtn").classList.contains("has-update"), menuItem: menu[menu.length - 1]?.textContent, menuAction: menu[menu.length - 1]?.dataset.action }; })()',
+    );
+    record('发现更新时显示更新条', availableBar.hidden === false && availableBar.height > 0, `h=${availableBar.height}`);
+    record('更新条标明新版本与当前版本', availableBar.title.includes('99.9.9') && availableBar.title.includes(app.getVersion()), availableBar.title);
+    record('更新条显示包体大小', availableBar.note.includes('100 MB'), availableBar.note);
+    record('⋯ 按钮出现更新提示点', availableBar.dot === true);
+    record(
+      '菜单项变为“下载更新”',
+      availableBar.menuAction === 'update-primary' && availableBar.menuItem.includes('99.9.9'),
+      `${availableBar.menuAction} / ${availableBar.menuItem}`,
+    );
+    const barHeights = await win.webContents.executeJavaScript(
+      '(() => { window.reportInset(); const toolbar = document.getElementById("toolbar").getBoundingClientRect().height; const bar = document.getElementById("updateBar").getBoundingClientRect().height; return { toolbar: Math.round(toolbar), bar: Math.round(bar) }; })()',
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    record(
+      '更新条高度计入内嵌视图内边距',
+      guiInset.top === barHeights.toolbar + barHeights.bar && barHeights.bar > 0,
+      `inset=${guiInset.top} toolbar=${barHeights.toolbar} bar=${barHeights.bar}`,
+    );
+
+    await win.webContents.executeJavaScript(
+      `window.renderUpdate(${JSON.stringify({ ...syntheticUpdate, phase: 'downloading', progress: { received: 10485760, total: 104857600, percent: 10 } })}); true;`,
+    );
+    const downloadingBar = await win.webContents.executeJavaScript(
+      '({ progress: document.getElementById("updateProgress").hidden, width: document.getElementById("updateBarFill").style.width, percent: document.getElementById("updatePercent").textContent })',
+    );
+    record(
+      '下载中显示百分比进度',
+      downloadingBar.progress === false && downloadingBar.width === '10%' && downloadingBar.percent === '10%',
+      JSON.stringify(downloadingBar),
+    );
+
+    await win.webContents.executeJavaScript(
+      `window.renderUpdate(${JSON.stringify({ ...syntheticUpdate, phase: 'ready', downloadedPath: '/tmp/DSH-D-99.9.9-mac.zip' })}); true;`,
+    );
+    const readyBar = await win.webContents.executeJavaScript(
+      'document.getElementById("updatePrimary").textContent',
+    );
+    record('下载完成后按钮变为“重启并安装”', readyBar === '重启并安装', readyBar);
+
+    // 稍后 should hide the bar for that version only.
+    await win.webContents.executeJavaScript(
+      'document.getElementById("updateLater").click(); true;',
+    );
+    const afterLater = await win.webContents.executeJavaScript(
+      '({ hidden: document.getElementById("updateBar").hidden, dot: document.getElementById("menuBtn").classList.contains("has-update") })',
+    );
+    record('点击“稍后”收起更新条', afterLater.hidden === true, JSON.stringify(afterLater));
+
+    // The apply path is guarded: nothing has been downloaded for this shell.
+    const applyGuard = await win.webContents.executeJavaScript('window.dshShell.applyUpdate()');
+    record(
+      '未下载时拒绝应用更新（不误重启）',
+      applyGuard && applyGuard.ok === false,
+      String(applyGuard?.error ?? ''),
+    );
+
+    await win.webContents.executeJavaScript(
+      `window.renderUpdate(${JSON.stringify({ phase: 'idle', currentVersion: app.getVersion(), autoCheck: false })}); window.openMenu(false); window.dshShell.setViewInset({ top: ${layout.toolbar.height} }); true;`,
     );
 
     console.log('5. 顶部 tab 与插件市场');
@@ -1162,6 +1400,45 @@ async function runUiCapture() {
     console.log(`captured ${target} (${image.getSize().width}x${image.getSize().height})`);
   }
 
+  // Self-update: the bar only exists while something is pending, so it gets its
+  // own capture (menu open, so the update entry is visible next to it).
+  {
+    const runningForCapture = { hostname: base.hostname, ...(running?.state ?? { phase: 'running', statusText: 'DSH 已启动' }) };
+    const synthetic = {
+      phase: 'available',
+      currentVersion: app.getVersion(),
+      latestVersion: '0.1.9',
+      notes: '自更新：定期检查、下载校验、退出后替换并重启',
+      file: process.platform === 'win32' ? 'DSH-D-Setup-0.1.9.exe' : 'DSH-D-0.1.9-mac.zip',
+      size: 128 * 1024 * 1024,
+      progress: null,
+      downloadedPath: null,
+      plan: { kind: 'replace-bundle', applicable: true, note: '退出后替换 .app 并重新启动' },
+      error: null,
+      reason: 'manual',
+      source: 'https://dsh.textwork.cn/download/latest.json',
+    };
+    await win.webContents.executeJavaScript(
+      `window.render(${JSON.stringify(runningForCapture)}); window.renderUpdate(${JSON.stringify(synthetic)}); window.openMenu(true); true;`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const image = await win.webContents.capturePage();
+    const target = path.join(outDir, '11-update.png');
+    fs.writeFileSync(target, image.toPNG());
+    console.log(`captured ${target} (${image.getSize().width}x${image.getSize().height})`);
+
+    // And the download-progress state of the same bar.
+    await win.webContents.executeJavaScript(
+      `window.renderUpdate(${JSON.stringify({ ...synthetic, phase: 'downloading', progress: { received: 41 * 1024 * 1024, total: 128 * 1024 * 1024, percent: 32 } })}); window.openMenu(false); true;`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const progressImage = await win.webContents.capturePage();
+    const progressTarget = path.join(outDir, '12-update-downloading.png');
+    fs.writeFileSync(progressTarget, progressImage.toPNG());
+    console.log(`captured ${progressTarget} (${progressImage.getSize().width}x${progressImage.getSize().height})`);
+    await win.webContents.executeJavaScript('window.renderUpdate({ phase: "idle" }); true;');
+  }
+
   app.exit(0);
 }
 
@@ -1191,9 +1468,13 @@ if (!gotLock) {
   app.whenReady().then(() => {
     wireController();
     registerIpc();
+    registerUpdateIpc();
     // Before the window (and the first detection) so nothing tries to download.
     setupOfflinePayload();
     createWindow();
+    // The updater is independent of the dsh lifecycle: it only needs the
+    // renderer to exist so state changes have somewhere to go.
+    createUpdater();
 
     // Start the flow only once the renderer can actually receive the state.
     win.webContents.once('did-finish-load', () => {
@@ -1230,6 +1511,7 @@ if (!gotLock) {
   app.on('before-quit', (event) => {
     if (quitRequested) return;
     quitRequested = true;
+    updateManager?.dispose();
     event.preventDefault();
     Promise.resolve(controller.dispose())
       .catch(() => {})

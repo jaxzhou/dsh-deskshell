@@ -66,6 +66,16 @@ contextBridge.exposeInMainWorld('dshShell', {
   setViewInset: (inset) => ipcRenderer.invoke('dsh:set-view-inset', inset),
   /** Quit the desktop shell (and its dsh child). */
   quit: () => ipcRenderer.invoke('dsh:quit'),
+  // --- the shell's own updates (independent of dsh and of the plugin market) ---
+  /** Last known self-update state (`null` before the updater is ready). */
+  updateState: () => ipcRenderer.invoke('update:state'),
+  /** Ask the release manifest whether a newer shell exists. */
+  checkUpdate: () => ipcRenderer.invoke('update:check'),
+  /** Download the pending update and verify its published SHA-256. */
+  downloadUpdate: () => ipcRenderer.invoke('update:download'),
+  /** Apply the downloaded update: replace the app and restart the shell. */
+  applyUpdate: () => ipcRenderer.invoke('update:apply'),
+  onUpdateState: (listener) => subscribe('dsh:update-state', listener),
   onState: (listener) => subscribe('dsh:state', listener),
   onLog: (listener) => subscribe('dsh:log', listener),
 });

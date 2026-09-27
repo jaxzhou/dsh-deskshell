@@ -1496,6 +1496,443 @@ section('17. 打印与 PDF 导出 (printing)');
   rmSync(pdfDir, { recursive: true, force: true });
 }
 
+section('18. 外壳自更新 (updater / update-manager)');
+{
+  const updater = require('../src/main/updater.js');
+  const { createUpdateManager, canWrite } = require('../src/main/update-manager.js');
+  const { createHash } = await import('node:crypto');
+
+  const manifestFor = (overrides = {}) => ({
+    schema: 1,
+    version: '9.9.9',
+    releasedAt: '2026-01-01T00:00:00Z',
+    site: 'https://dsh.textwork.cn',
+    notes: '测试版本：修复若干问题',
+    assets: [
+      { platform: 'win32', arch: 'x64', kind: 'nsis', file: 'DSH-D-Setup-9.9.9.exe', sha256: 'a'.repeat(64), size: 1000 },
+      { platform: 'win32', arch: 'x64', kind: 'zip', file: 'DSH-D-9.9.9-win.zip', sha256: 'b'.repeat(64), size: 2000 },
+      { platform: 'darwin', arch: 'x64', kind: 'zip', file: 'DSH-D-9.9.9-mac.zip', sha256: 'c'.repeat(64), size: 3000 },
+      { platform: 'linux', arch: 'x64', kind: 'appimage', file: 'DSH-D-9.9.9.AppImage', sha256: 'd'.repeat(64), size: 4000 },
+      { platform: 'linux', arch: 'x64', kind: 'deb', file: 'dsh-d_9.9.9_amd64.deb', sha256: 'e'.repeat(64), size: 5000 },
+      {
+        platform: 'linux-offline',
+        arch: 'x64',
+        kind: 'appimage',
+        file: 'DSH-D-Offline-9.9.9-linux-x64.AppImage',
+        sha256: 'f'.repeat(64),
+        size: 6000,
+      },
+    ],
+    ...overrides,
+  });
+
+  // --- 清单解析与校验 ---
+  const parsed = updater.parseManifest(JSON.stringify(manifestFor()));
+  check('解析发布清单', parsed.version === '9.9.9' && parsed.assets.length === 6, `${parsed.version}/${parsed.assets.length}`);
+  check(
+    '缺少 url 时按 site 拼出绝对地址',
+    parsed.assets[0].url === 'https://dsh.textwork.cn/download/DSH-D-Setup-9.9.9.exe',
+    parsed.assets[0].url,
+  );
+  const rejects = [
+    ['非 JSON', 'not json at all'],
+    ['版本号非法', JSON.stringify(manifestFor({ version: 'latest' }))],
+    ['assets 为空', JSON.stringify(manifestFor({ assets: [] }))],
+    ['缺少 sha256', JSON.stringify(manifestFor({ assets: [{ platform: 'linux', kind: 'appimage', file: 'x', size: 1 }] }))],
+    ['sha256 长度不对', JSON.stringify(manifestFor({ assets: [{ platform: 'linux', kind: 'appimage', file: 'x', sha256: 'abc', size: 1 }] }))],
+    ['缺少大小', JSON.stringify(manifestFor({ assets: [{ platform: 'linux', kind: 'appimage', file: 'x', sha256: 'a'.repeat(64) }] }))],
+    [
+      'http 明文地址（非本机）',
+      JSON.stringify(
+        manifestFor({ assets: [{ platform: 'linux', kind: 'appimage', file: 'x', sha256: 'a'.repeat(64), size: 1, url: 'http://evil.example.com/x' }] }),
+      ),
+    ],
+    ['未知包类型', JSON.stringify(manifestFor({ assets: [{ platform: 'linux', kind: 'msi', file: 'x', sha256: 'a'.repeat(64), size: 1 }] }))],
+  ];
+  for (const [name, body] of rejects) {
+    let threw = false;
+    try {
+      updater.parseManifest(body);
+    } catch {
+      threw = true;
+    }
+    check(`拒绝${name}的清单`, threw === true, name);
+  }
+  const loopback = updater.parseManifest(
+    JSON.stringify(
+      manifestFor({
+        assets: [
+          { platform: 'linux', kind: 'appimage', file: 'x', sha256: 'a'.repeat(64), size: 1, url: 'http://127.0.0.1:8080/x' },
+        ],
+      }),
+    ),
+  );
+  check('允许本机 http（便于离线/自测）', loopback.assets.length === 1, loopback.assets[0]?.url ?? '');
+
+  // --- 版本比较 ---
+  check('较新版本可识别', updater.isNewer('0.1.8', '0.1.7') === true);
+  check('同版本不算更新', updater.isNewer('0.1.7', '0.1.7') === false);
+  check('更旧版本不算更新', updater.isNewer('0.1.6', '0.1.7') === false);
+  check('预发布版本不高于正式版', updater.isNewer('0.1.7-rc.1', '0.1.7') === false);
+  check('版本格式校验', updater.isVersion('0.1.7-rc.1') === true && updater.isVersion('v0.1.7') === false);
+
+  // --- 平台选择（含离线变体） ---
+  for (const [platform, kind, file] of [
+    ['win32', 'nsis', 'DSH-D-Setup-9.9.9.exe'],
+    ['darwin', 'zip', 'DSH-D-9.9.9-mac.zip'],
+    ['linux', 'appimage', 'DSH-D-9.9.9.AppImage'],
+  ]) {
+    const asset = updater.selectAsset(parsed, { platform, arch: 'x64' });
+    check(`${platform} 选择 ${kind} 包`, asset?.kind === kind && asset?.file === file, asset?.file ?? 'null');
+  }
+  const offlineAsset = updater.selectAsset(parsed, { platform: 'linux', arch: 'x64', variant: 'offline' });
+  check('离线版选择自己的 AppImage', offlineAsset?.file === 'DSH-D-Offline-9.9.9-linux-x64.AppImage', offlineAsset?.file ?? 'null');
+  check(
+    '无离线产物时回退到普通包',
+    updater.selectAsset(parsed, { platform: 'win32', arch: 'x64', variant: 'offline' })?.kind === 'nsis',
+  );
+  const anyArch = updater.parseManifest(
+    JSON.stringify(manifestFor({ assets: [{ platform: 'linux', arch: 'any', kind: 'appimage', file: 'a', sha256: 'a'.repeat(64), size: 1 }] })),
+  );
+  check('arch=any 也可匹配', updater.selectAsset(anyArch, { platform: 'linux', arch: 'arm64' })?.file === 'a');
+  check('没有对应平台的包时返回 null', updater.selectAsset(anyArch, { platform: 'darwin', arch: 'x64' }) === null);
+
+  // --- 安装方式决策 ---
+  const nsisAsset = updater.selectAsset(parsed, { platform: 'win32', arch: 'x64' });
+  const zipAsset = updater.selectAsset(parsed, { platform: 'darwin', arch: 'x64' });
+  const appImageAsset = updater.selectAsset(parsed, { platform: 'linux', arch: 'x64' });
+  const debAsset = parsed.assets.find((asset) => asset.kind === 'deb');
+
+  const winPlan = updater.planUpdate({ platform: 'win32', asset: nsisAsset, isPackaged: true });
+  check(
+    'Windows 走静默安装并重启',
+    winPlan.kind === 'run-installer' && winPlan.applicable === true && winPlan.args.join(' ') === '/S --force-run',
+    JSON.stringify(winPlan),
+  );
+  const macPlan = updater.planUpdate({
+    platform: 'darwin',
+    asset: zipAsset,
+    isPackaged: true,
+    appPath: '/Applications/DSH-D.app',
+    directoryWritable: true,
+  });
+  check('macOS 退出后替换 .app', macPlan.kind === 'replace-bundle' && macPlan.target === '/Applications/DSH-D.app', JSON.stringify(macPlan));
+  const macRO = updater.planUpdate({
+    platform: 'darwin',
+    asset: zipAsset,
+    isPackaged: true,
+    appPath: '/Applications/DSH-D.app',
+    directoryWritable: false,
+  });
+  check('macOS 目录不可写时给出人工指引', macRO.applicable === false && /手动/.test(macRO.note), macRO.note);
+  const linPlan = updater.planUpdate({
+    platform: 'linux',
+    asset: appImageAsset,
+    isPackaged: true,
+    appImagePath: '/opt/DSH-D.AppImage',
+    directoryWritable: true,
+  });
+  check('Linux AppImage 原地替换', linPlan.kind === 'replace-appimage' && linPlan.target === '/opt/DSH-D.AppImage', JSON.stringify(linPlan));
+  const linNoAppImage = updater.planUpdate({ platform: 'linux', asset: appImageAsset, isPackaged: true, appImagePath: null });
+  check('非 AppImage 运行方式转人工', linNoAppImage.applicable === false && linNoAppImage.kind === 'manual', linNoAppImage.note);
+  const linDeb = updater.planUpdate({ platform: 'linux', asset: debAsset, isPackaged: true, appImagePath: '/opt/x.AppImage' });
+  check('deb 不做原地替换', linDeb.kind === 'manual' && linDeb.applicable === false, linDeb.note);
+  const devPlan = updater.planUpdate({ platform: 'darwin', asset: zipAsset, isPackaged: false });
+  check('开发模式不自动替换', devPlan.kind === 'manual' && devPlan.applicable === false, devPlan.note);
+
+  // --- 辅助脚本 ---
+  const appImageScript = updater.helperScriptFor(linPlan, {
+    newFile: '/tmp/new.AppImage',
+    target: '/opt/DSH-D.AppImage',
+    pid: 4242,
+    relaunch: true,
+    unpackDir: '/tmp/unpack',
+  });
+  check(
+    'AppImage 辅助脚本等待进程退出后再替换并重启',
+    appImageScript.includes('kill -0 4242') && appImageScript.includes('mv -f "/tmp/new.AppImage" "/opt/DSH-D.AppImage"') && appImageScript.includes('chmod +x'),
+    appImageScript.split('\n').length + ' 行',
+  );
+  const bundleScript = updater.helperScriptFor(macPlan, {
+    newFile: '/tmp/new.zip',
+    target: '/Applications/DSH-D.app',
+    pid: 4242,
+    relaunch: true,
+    unpackDir: '/tmp/unpack',
+  });
+  check(
+    'macOS 辅助脚本解压并替换 .app',
+    bundleScript.includes('ditto -x -k') && bundleScript.includes('cp -R "$APP" "/Applications/DSH-D.app"') && bundleScript.includes('open '),
+  );
+  check('安装程序无需辅助脚本', updater.helperScriptFor(winPlan, {}) === null);
+
+  // --- 校验和 ---
+  const hashDir = path.join(os.tmpdir(), `dsh-d-update-${process.pid}`);
+  rmSync(hashDir, { recursive: true, force: true });
+  mkdirSync(hashDir, { recursive: true });
+  const payload = Buffer.from('DSH-D 自更新测试包 payload\n');
+  const payloadSha = createHash('sha256').update(payload).digest('hex');
+  const payloadFile = path.join(hashDir, 'artifact.bin');
+  writeFileSync(payloadFile, payload);
+  check('sha256 校验通过', updater.verifySha256(payloadFile, payloadSha).ok === true);
+  check('sha256 不符时失败并给出实际值', updater.verifySha256(payloadFile, 'a'.repeat(64)).actual === payloadSha);
+  check('文件不存在时返回错误', updater.verifySha256(path.join(hashDir, 'nope.bin'), payloadSha).ok === false);
+  check('目录可写探测', canWrite(hashDir) === true && canWrite(path.join(hashDir, 'missing', 'deep')) === false);
+
+  // --- 本地 HTTP 端到端：检查 → 下载 → 校验 → 计划 ---
+  const buildManifest = (sha, size, port, version = '9.9.9') => {
+    const kinds = { win32: 'nsis', darwin: 'zip', linux: 'appimage' };
+    const files = { win32: 'DSH-D-Setup', darwin: 'DSH-D-mac', linux: 'DSH-D' };
+    return {
+      schema: 1,
+      version,
+      site: `http://127.0.0.1:${port}`,
+      notes: '端到端测试',
+      assets: [
+        {
+          platform: process.platform,
+          arch: 'x64',
+          kind: kinds[process.platform],
+          file: `${files[process.platform]}-${version}.bin`,
+          url: `http://127.0.0.1:${port}/artifact.bin`,
+          sha256: sha,
+          size,
+        },
+      ],
+    };
+  };
+
+  let servedManifest = null;
+  const server = createServer((request, response) => {
+    if (request.url.startsWith('/latest.json')) {
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify(servedManifest));
+      return;
+    }
+    if (request.url.startsWith('/artifact.bin')) {
+      response.end(payload);
+      return;
+    }
+    response.statusCode = 404;
+    response.end('nope');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  const manifestUrl = `http://127.0.0.1:${port}/latest.json`;
+  servedManifest = buildManifest(payloadSha, payload.length, port);
+
+  const downloadDir = path.join(hashDir, 'downloads');
+  const seenPhases = [];
+  const manager = createUpdateManager({
+    currentVersion: '0.1.0',
+    platform: process.platform,
+    arch: 'x64',
+    manifestUrl,
+    isPackaged: true,
+    appPath: path.join(hashDir, 'DSH-D.app'),
+    appImagePath: path.join(hashDir, 'DSH-D.AppImage'),
+    downloadDir,
+    autoCheck: false,
+    log: () => {},
+    onState: (snapshot) => seenPhases.push(snapshot.phase),
+  });
+  const checked = await manager.checkNow();
+  check('检查到新版本并给出可安装计划', checked.phase === 'available' && checked.latestVersion === '9.9.9', `${checked.phase}/${checked.latestVersion}`);
+  check('计划包含本平台安装方式', checked.plan?.applicable === true, JSON.stringify(checked.plan));
+  check('记录检查时间与来源', Number.isFinite(checked.lastCheckedAt) && checked.source === manifestUrl);
+
+  const downloading = manager.download();
+  const ready = await downloading;
+  check('下载并校验后进入待安装', ready.phase === 'ready' && existsSync(path.join(downloadDir, servedManifest.assets[0].file)), ready.phase);
+  check('落盘字节数与清单一致', statSync(ready.downloadedPath).size === payload.length, String(statSync(ready.downloadedPath).size));
+  check('进度到达 100%', ready.progress?.percent === 100, JSON.stringify(ready.progress));
+  check(
+    '状态依次推送（界面可见检查/下载/完成）',
+    seenPhases.includes('checking') && seenPhases.includes('available') && seenPhases.includes('downloading') && seenPhases.includes('ready'),
+    seenPhases.join('→'),
+  );
+
+  const applied = manager.apply();
+  check('应用计划可执行', applied.ok === true && Boolean(applied.plan), JSON.stringify(applied.plan ?? applied.error));
+  if (process.platform === 'win32') {
+    check('Windows 计划带静默参数', applied.plan.args.join(' ') === '/S --force-run', applied.plan.args.join(' '));
+  } else {
+    check('辅助脚本等待本进程退出', applied.script.includes(`kill -0 ${process.pid}`), applied.script.split('\n')[2] ?? '');
+    check('辅助脚本指向下载的更新包', applied.script.includes(applied.context.newFile), 'ok');
+  }
+
+  // 离线变体：同一份清单里要用 linux-offline 的包
+  {
+    const offlineManifest = {
+      schema: 1,
+      version: '9.9.9',
+      site: `http://127.0.0.1:${port}`,
+      notes: '离线变体测试',
+      assets: [
+        { platform: 'linux', arch: 'x64', kind: 'appimage', file: 'plain.AppImage', url: `http://127.0.0.1:${port}/artifact.bin`, sha256: payloadSha, size: payload.length },
+        { platform: 'linux-offline', arch: 'x64', kind: 'appimage', file: 'offline.AppImage', url: `http://127.0.0.1:${port}/artifact.bin`, sha256: payloadSha, size: payload.length },
+      ],
+    };
+    const offlineServer = createServer((request, response) => {
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify(offlineManifest));
+    });
+    await new Promise((resolve) => offlineServer.listen(0, '127.0.0.1', resolve));
+    const offlineUrl = `http://127.0.0.1:${offlineServer.address().port}/latest.json`;
+    const offlineVariant = createUpdateManager({
+      currentVersion: '0.1.0',
+      platform: 'linux',
+      arch: 'x64',
+      variant: 'offline',
+      manifestUrl: offlineUrl,
+      downloadDir,
+      autoCheck: false,
+      isPackaged: true,
+      appImagePath: path.join(hashDir, 'DSH-D.AppImage'),
+      log: () => {},
+    });
+    const offlineState = await offlineVariant.checkNow();
+    check('离线版选中 linux-offline 产物', offlineState.file === 'offline.AppImage', String(offlineState.file));
+    check('离线版状态里带有变体标记', offlineState.variant === 'offline', String(offlineState.variant));
+
+    const normalVariant = createUpdateManager({
+      currentVersion: '0.1.0',
+      platform: 'linux',
+      arch: 'x64',
+      manifestUrl: offlineUrl,
+      downloadDir,
+      autoCheck: false,
+      isPackaged: true,
+      appImagePath: path.join(hashDir, 'DSH-D.AppImage'),
+      log: () => {},
+    });
+    const normalState = await normalVariant.checkNow();
+    check('普通版仍选普通产物', normalState.file === 'plain.AppImage', String(normalState.file));
+    await new Promise((resolve) => offlineServer.close(resolve));
+  }
+
+  // 已是最新
+  const currentManager = createUpdateManager({
+    currentVersion: '9.9.9',
+    manifestUrl,
+    downloadDir,
+    autoCheck: false,
+    isPackaged: false,
+    log: () => {},
+  });
+  check('已是最新版本时状态为 current', (await currentManager.checkNow()).phase === 'current');
+
+  // 校验失败
+  servedManifest = buildManifest('b'.repeat(64), payload.length, port);
+  const badHash = createUpdateManager({
+    currentVersion: '0.1.0',
+    manifestUrl,
+    downloadDir,
+    autoCheck: false,
+    isPackaged: true,
+    appPath: path.join(hashDir, 'DSH-D.app'),
+    appImagePath: path.join(hashDir, 'DSH-D.AppImage'),
+    log: () => {},
+  });
+  await badHash.checkNow();
+  const failed = await badHash.download();
+  check('校验失败进入 error 并说明原因', failed.phase === 'error' && /校验失败/.test(failed.error ?? ''), failed.error ?? '');
+  check('校验失败会删除下载文件', !existsSync(path.join(downloadDir, servedManifest.assets[0].file)));
+
+  // 下载 404
+  servedManifest = buildManifest(payloadSha, payload.length + 1, port);
+  servedManifest.assets[0].url = `http://127.0.0.1:${port}/missing.bin`;
+  const missing = createUpdateManager({
+    currentVersion: '0.1.0',
+    manifestUrl,
+    downloadDir,
+    autoCheck: false,
+    isPackaged: true,
+    appPath: path.join(hashDir, 'DSH-D.app'),
+    appImagePath: path.join(hashDir, 'DSH-D.AppImage'),
+    log: () => {},
+  });
+  await missing.checkNow();
+  const missingResult = await missing.download();
+  check('下载失败进入 error', missingResult.phase === 'error' && /下载更新失败/.test(missingResult.error ?? ''), missingResult.error ?? '');
+
+  // 没有可下载内容时不能应用
+  const fresh = createUpdateManager({
+    currentVersion: '0.1.0',
+    manifestUrl,
+    downloadDir,
+    autoCheck: false,
+    isPackaged: true,
+    log: () => {},
+  });
+  const guarded = fresh.apply();
+  check('未检查/未下载时应用被拒绝', guarded.ok === false && /尚未下载/.test(guarded.error ?? ''), guarded.error ?? '');
+
+  // 并发检查只发一次请求
+  let fetchCount = 0;
+  const countingServer = createServer((request, response) => {
+    fetchCount += 1;
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify(buildManifest(payloadSha, payload.length, port, '9.9.9')));
+  });
+  await new Promise((resolve) => countingServer.listen(0, '127.0.0.1', resolve));
+  const countingManager = createUpdateManager({
+    currentVersion: '0.1.0',
+    manifestUrl: `http://127.0.0.1:${countingServer.address().port}/latest.json`,
+    downloadDir,
+    autoCheck: false,
+    isPackaged: true,
+    log: () => {},
+  });
+  const [first, second] = await Promise.all([countingManager.check(), countingManager.check()]);
+  check('并发检查只请求一次', fetchCount === 1 && first.phase === 'available' && second.phase === 'available', `请求 ${fetchCount} 次`);
+
+  // 定期检查：到点自动跑一次，dispose 之后不再跑
+  let timerChecks = 0;
+  const timedManager = createUpdateManager({
+    currentVersion: '0.1.0',
+    manifestUrl: `http://127.0.0.1:${countingServer.address().port}/latest.json`,
+    downloadDir,
+    autoCheck: true,
+    checkIntervalMs: 60,
+    startupDelayMs: 10,
+    isPackaged: true,
+    log: () => {},
+  });
+  const originalFetch = timedManager.getState;
+  timerChecks = 0;
+  const before = fetchCount;
+  timedManager.startAutoCheck();
+  await new Promise((resolve) => setTimeout(resolve, 220));
+  timerChecks = fetchCount - before;
+  check('定期检查会自动执行（无需常驻进程）', timerChecks >= 2, `${timerChecks} 次`);
+  timedManager.dispose();
+  const afterDispose = fetchCount;
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  check('dispose 后不再检查', fetchCount === afterDispose, `${afterDispose} → ${fetchCount}`);
+  check('状态快照包含开关信息', typeof originalFetch().autoCheck === 'boolean');
+
+  // 离线/无网络：优雅失败，不阻塞外壳
+  const offlineManager = createUpdateManager({
+    currentVersion: '0.1.0',
+    manifestUrl: 'http://127.0.0.1:1/latest.json',
+    downloadDir,
+    autoCheck: false,
+    isPackaged: true,
+    log: () => {},
+  });
+  const offlineResult = await offlineManager.checkNow();
+  check(
+    '无网络时返回可读错误（离线版不崩）',
+    offlineResult.phase === 'error' && /检查更新失败/.test(offlineResult.error ?? ''),
+    offlineResult.error ?? '',
+  );
+
+  await new Promise((resolve) => server.close(resolve));
+  await new Promise((resolve) => countingServer.close(resolve));
+  rmSync(hashDir, { recursive: true, force: true });
+}
+
 // --------------------------------------------------------------------- summary
 
 console.log(`\n${'─'.repeat(58)}`);

@@ -57,6 +57,22 @@
         <button class="icon-btn" id="quitBtn" title="退出应用" aria-label="退出应用">✕</button>
       </header>
 
+      <!-- 外壳自身的更新：只有发现新版本/下载/出错时才出现，平时不占空间 -->
+      <div class="update-bar" id="updateBar" hidden>
+        <span class="update-tag" id="updateTag">外壳更新</span>
+        <div class="update-copy">
+          <span class="update-title" id="updateTitle"></span>
+          <span class="update-note" id="updateNote"></span>
+        </div>
+        <div class="update-progress" id="updateProgress" hidden>
+          <div class="bar"><div class="bar-fill" id="updateBarFill" style="width: 0%"></div></div>
+          <span class="update-percent" id="updatePercent">0%</span>
+        </div>
+        <button class="btn btn-primary btn-compact" id="updatePrimary" data-action="update-primary">更新</button>
+        <button class="btn btn-compact" id="updateLater" data-action="update-later">稍后</button>
+        <button class="icon-btn" id="updateClose" data-action="update-later" title="关闭提示" aria-label="关闭提示">✕</button>
+      </div>
+
       <main class="stage" id="stage">
         <!-- 1. 检测中 -->
         <section class="panel" data-phase="checking">

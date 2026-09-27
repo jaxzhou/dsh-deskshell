@@ -63,6 +63,16 @@ const el = {
   logToggle: document.getElementById('logToggle'),
   logBody: document.getElementById('logBody'),
   logCount: document.getElementById('logCount'),
+  // 外壳自身更新
+  updateBar: document.getElementById('updateBar'),
+  updateTag: document.getElementById('updateTag'),
+  updateTitle: document.getElementById('updateTitle'),
+  updateNote: document.getElementById('updateNote'),
+  updateProgress: document.getElementById('updateProgress'),
+  updateBarFill: document.getElementById('updateBarFill'),
+  updatePercent: document.getElementById('updatePercent'),
+  updatePrimary: document.getElementById('updatePrimary'),
+  updateLater: document.getElementById('updateLater'),
 };
 
 /** @type {object|null} */
@@ -652,7 +662,11 @@ function renderToolbarActions(phase) {
 function renderMenu(phase) {
   const specs = MENU_SPECS[phase] ?? [];
   el.menuList.replaceChildren();
-  for (const spec of specs) {
+  const updateSpec = updateMenuSpec();
+  // The shell's own update entry is appended to every phase menu: updating the
+  // shell is independent of what dsh is doing (even of dsh being installed).
+  const all = [...specs, { separator: true }, updateSpec];
+  for (const spec of all) {
     if (spec.separator) {
       const rule = document.createElement('div');
       rule.className = 'menu-sep';
@@ -662,6 +676,7 @@ function renderMenu(phase) {
     const item = document.createElement('button');
     item.className = 'menu-item';
     item.dataset.action = spec.action;
+    if (spec.action.startsWith('update-')) item.classList.add('menu-item-update');
     item.setAttribute('role', 'menuitem');
     item.textContent = typeof spec.label === 'function' ? spec.label() : spec.label;
     el.menuList.append(item);
@@ -686,6 +701,176 @@ function openMenu(open) {
   if (shouldOpen !== wasOpen) {
     api.setGuiVisible(shouldOpen ? false : !guiHidden).catch(() => {});
   }
+}
+
+// ------------------------------------------------------- 外壳自身更新（自更新）
+
+/**
+ * Self-update state pushed by main on its own channel.
+ *
+ * It is kept apart from the dsh state on purpose: the shell's own version has
+ * nothing to do with whether the Harness is installed or running, and the
+ * updater must stay usable while dsh is in any phase (including `error`).
+ *
+ * @type {object|null}
+ */
+let updateState = null;
+/** Version the user dismissed with 稍后, so the bar does not reappear by itself. */
+let updateDismissed = null;
+/** `已是最新版本` style notices auto-hide after this timestamp. */
+let updateNoticeUntil = 0;
+
+function formatSize(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return '';
+  const mb = value / (1024 * 1024);
+  return `${mb >= 100 ? mb.toFixed(0) : mb.toFixed(1)} MB`;
+}
+
+/** Label + action for the ⋮ menu entry (it doubles as the update entry point). */
+function updateMenuSpec() {
+  const phase = updateState?.phase ?? 'idle';
+  const latest = updateState?.latestVersion ?? '';
+  const current = updateState?.currentVersion ?? '';
+  switch (phase) {
+    case 'available':
+      return { label: `下载更新 v${latest}`, action: 'update-primary' };
+    case 'downloading':
+      return { label: `正在下载更新 v${latest}…`, action: 'update-primary' };
+    case 'ready':
+      return { label: `重启并安装 v${latest}`, action: 'update-primary' };
+    case 'manual':
+      return {
+        label: updateState?.downloadedPath ? `打开更新包 v${latest}` : `下载更新包 v${latest}`,
+        action: 'update-primary',
+      };
+    case 'error':
+      return { label: '检查更新（上次失败，重试）', action: 'update-check' };
+    default:
+      return { label: `检查更新（当前 v${current || '?'}）`, action: 'update-check' };
+  }
+}
+
+/** Paint the update bar (and the menu badge) from the latest snapshot. */
+function renderUpdate(next) {
+  if (next) updateState = next;
+  const snapshot = updateState;
+  const phase = snapshot?.phase ?? 'idle';
+  const latest = snapshot?.latestVersion ?? '';
+  const current = snapshot?.currentVersion ?? '';
+  // `reason` says why the last check ran: only a check the user asked for (or a
+  // download they started) may put something on screen by itself.
+  const asked = snapshot?.reason === 'manual' || snapshot?.reason === 'download';
+  const hasUpdate = Boolean(latest) && latest !== current;
+  const pending = hasUpdate && (phase === 'available' || phase === 'ready');
+
+  el.menuBtn.classList.toggle('has-update', pending);
+  el.menuBtn.title = pending ? `有可用更新 v${latest}（打开菜单）` : '菜单';
+
+  if (asked && phase === 'current') {
+    if (!updateNoticeUntil) updateNoticeUntil = Date.now() + 6000;
+  } else if (phase !== 'idle') {
+    updateNoticeUntil = 0;
+  }
+
+  // 稍后 hides *this version*; a running download is never hidden, and the
+  // ⋮ menu keeps offering the update afterwards.
+  const dismissed = hasUpdate && updateDismissed === latest && phase !== 'downloading';
+  const persistent =
+    (hasUpdate && ['available', 'ready', 'manual'].includes(phase)) ||
+    phase === 'downloading' ||
+    phase === 'applying' ||
+    (phase === 'error' && asked);
+  const toast = asked && phase === 'current' && Date.now() < updateNoticeUntil;
+  const show = (persistent && !dismissed) || toast;
+  const wasHidden = el.updateBar.hidden;
+
+  el.updateBar.hidden = !show;
+  el.updateBar.dataset.phase = phase;
+  el.updateProgress.hidden = phase !== 'downloading';
+
+  if (show) {
+    // 离线版有自己的产物（linux-offline），标签上标出来避免误会。
+    const offlineTag = snapshot?.variant === 'offline' ? '离线版 · ' : '';
+    const size = formatSize(snapshot?.size);
+    const file = snapshot?.file ?? '';
+    const notes = String(snapshot?.notes ?? '').trim().split('\n')[0];
+    switch (phase) {
+      case 'available':
+        setText(el.updateTag, `${offlineTag}有可用更新`);
+        setText(el.updateTitle, `发现新版本 v${latest}（当前 v${current}）`);
+        setText(el.updateNote, [notes, file && size ? `${file} · ${size}` : file].filter(Boolean).join(' · '));
+        setText(el.updatePrimary, '下载更新');
+        el.updatePrimary.hidden = false;
+        el.updateLater.hidden = false;
+        break;
+      case 'downloading': {
+        const percent = snapshot?.progress?.percent;
+        setText(el.updateTag, `${offlineTag}下载中`);
+        setText(el.updateTitle, `正在下载 v${latest}`);
+        setText(
+          el.updateNote,
+          `${formatSize(snapshot?.progress?.received ?? 0)} / ${size || '—'}${
+            snapshot?.source ? ` · ${snapshot.source.replace(/^https?:\/\//, '')}` : ''
+          }`,
+        );
+        el.updateBarFill.style.width = `${percent ?? 0}%`;
+        setText(el.updatePercent, percent == null ? '…' : `${percent}%`);
+        el.updatePrimary.hidden = true;
+        el.updateLater.hidden = true;
+        break;
+      }
+      case 'ready':
+        setText(el.updateTag, `${offlineTag}待安装`);
+        setText(el.updateTitle, `v${latest} 已下载并通过 SHA-256 校验`);
+        setText(el.updateNote, '点击后外壳会退出，由辅助程序替换文件并重新启动（dsh 会一起重启）');
+        setText(el.updatePrimary, '重启并安装');
+        el.updatePrimary.hidden = false;
+        el.updateLater.hidden = false;
+        break;
+      case 'manual':
+        setText(el.updateTag, `${offlineTag}需手动安装`);
+        setText(el.updateTitle, `v${latest} 可用，但当前安装方式无法自动替换`);
+        setText(el.updateNote, snapshot?.plan?.note ?? '请手动安装下载的包');
+        setText(el.updatePrimary, snapshot?.downloadedPath ? '打开所在目录' : '下载安装包');
+        el.updatePrimary.hidden = false;
+        el.updateLater.hidden = false;
+        break;
+      case 'applying':
+        setText(el.updateTag, '安装中');
+        setText(el.updateTitle, '正在应用更新，外壳即将重启…');
+        setText(el.updateNote, snapshot?.plan?.note ?? '');
+        el.updatePrimary.hidden = true;
+        el.updateLater.hidden = true;
+        break;
+      case 'error':
+        setText(el.updateTag, '更新失败');
+        setText(el.updateTitle, '无法完成外壳更新');
+        setText(el.updateNote, snapshot?.error ?? '未知错误');
+        setText(el.updatePrimary, latest ? '重试' : '重新检查');
+        el.updatePrimary.hidden = false;
+        el.updateLater.hidden = false;
+        break;
+      default:
+        setText(el.updateTag, '更新');
+        setText(el.updateTitle, `已是最新版本 v${current}`);
+        setText(el.updateNote, '外壳会定期检查更新，也可以随时在右上角菜单里手动检查');
+        el.updatePrimary.hidden = true;
+        el.updateLater.hidden = true;
+        break;
+    }
+    if (toast && !renderUpdate.noticeTimer) {
+      renderUpdate.noticeTimer = setTimeout(() => {
+        renderUpdate.noticeTimer = null;
+        if (updateState?.phase === 'current') renderUpdate();
+      }, 6200);
+    }
+  }
+
+  if (wasHidden !== el.updateBar.hidden) reportInset();
+  // The ⋮ entry doubles as the update entry point, so its label/action follow
+  // this state (idle → 检查更新, available → 下载更新, ready → 重启并安装).
+  renderMenu(state?.phase ?? 'checking');
 }
 
 // -------------------------------------------------------------------- render
@@ -862,6 +1047,34 @@ const ACTIONS = {
     }
   },
   'open-nodejs': () => api.openExternal('https://nodejs.org/zh-cn/download'),
+  // --- 外壳自更新 ---
+  'update-check': async () => {
+    el.updateLater.hidden = false;
+    const snapshot = await api.checkUpdate();
+    updateNoticeUntil = 0;
+    renderUpdate(snapshot ?? updateState);
+  },
+  'update-primary': async () => {
+    const phase = updateState?.phase;
+    const downloaded = Boolean(updateState?.downloadedPath);
+    if (phase === 'ready' || (phase === 'manual' && downloaded)) {
+      const result = await api.applyUpdate();
+      if (result && result.ok === false) {
+        // Applying failed (or needs a manual step): surface it instead of
+        // pretending the restart happened.
+        appendLog({ ts: Date.now(), stream: 'stderr', line: `应用更新失败：${result.error}` });
+        renderUpdate({ ...(updateState ?? {}), phase: 'manual', error: null, plan: result.plan ?? updateState?.plan });
+      }
+      return result;
+    }
+    const snapshot = await api.downloadUpdate();
+    renderUpdate(snapshot ?? updateState);
+  },
+  'update-later': () => {
+    updateDismissed = updateState?.latestVersion ?? null;
+    updateNoticeUntil = 0;
+    renderUpdate();
+  },
   'copy-cmd': (button) => copyText(button, document.getElementById('installCmd')?.textContent ?? ''),
   'copy-log': (button) =>
     copyText(button, [...el.logBody.querySelectorAll('.log-line .msg')].map((node) => node.textContent).join('\n')),
@@ -948,8 +1161,11 @@ el.logToggle.addEventListener('click', () => {
 // Keep the embedded GUI view aligned with our own toolbar height.
 function reportInset() {
   // The tabs live inside the top bar now, so the embedded view starts right
-  // below that single row.
-  const height = Math.round(el.toolbar.getBoundingClientRect().height);
+  // below that single row — plus the update bar whenever it is showing (the
+  // native view is painted above this renderer, so it must not overlap it).
+  const toolbarHeight = Math.round(el.toolbar.getBoundingClientRect().height);
+  const updateHeight = el.updateBar.hidden ? 0 : Math.round(el.updateBar.getBoundingClientRect().height);
+  const height = toolbarHeight + updateHeight;
   if (height > 0) api.setViewInset({ top: height });
 }
 
@@ -957,6 +1173,7 @@ function reportInset() {
 
 api.onState(render);
 api.onLog(appendLog);
+api.onUpdateState((snapshot) => renderUpdate(snapshot));
 api.setActiveTab('dsh').catch(() => {});
 
 window.addEventListener('resize', reportInset);
@@ -973,3 +1190,10 @@ api
   .catch((error) => {
     appendLog({ ts: Date.now(), stream: 'stderr', line: `初始化失败：${error?.message ?? error}` });
   });
+
+// The updater may already know about an update (its first check can finish
+// before the renderer is ready), so pull the current snapshot once.
+api
+  .updateState()
+  .then((snapshot) => renderUpdate(snapshot))
+  .catch(() => {});

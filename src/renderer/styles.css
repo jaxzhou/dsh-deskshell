@@ -1065,3 +1065,127 @@ code {
   background: #3a1c1f;
   border-color: #6d3030;
 }
+
+/* ------------------------------------------------- 外壳自身更新（update-bar） */
+
+/* Appears between the top bar and the stage only while something is pending;
+   the renderer includes its height in the inset it reports to main, so the
+   embedded native view never covers it. */
+.update-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 14px;
+  background: linear-gradient(90deg, rgba(77, 141, 253, 0.16), rgba(124, 92, 255, 0.12));
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+
+.update-bar[hidden] {
+  display: none;
+}
+
+.update-tag {
+  flex: none;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: #dce8ff;
+  background: rgba(77, 141, 253, 0.28);
+  border: 1px solid rgba(124, 92, 255, 0.4);
+}
+
+.update-bar[data-phase='error'] .update-tag {
+  color: #ffe2e2;
+  background: rgba(248, 113, 113, 0.24);
+  border-color: rgba(248, 113, 113, 0.45);
+}
+
+.update-bar[data-phase='ready'] .update-tag,
+.update-bar[data-phase='applying'] .update-tag {
+  color: #d9fbe9;
+  background: rgba(52, 211, 153, 0.22);
+  border-color: rgba(52, 211, 153, 0.45);
+}
+
+.update-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.update-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.update-note {
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.update-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 220px;
+  flex: none;
+}
+
+.update-progress[hidden] {
+  display: none;
+}
+
+.update-progress .bar {
+  flex: 1 1 auto;
+}
+
+.update-percent {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  min-width: 34px;
+  text-align: right;
+}
+
+.btn-compact {
+  padding: 6px 12px;
+  font-size: 12px;
+  flex: none;
+}
+
+/* The ⋮ button carries a dot while an update is waiting. */
+.menu-btn.has-update {
+  position: relative;
+  border-color: rgba(124, 92, 255, 0.6);
+}
+
+.menu-btn.has-update::after {
+  content: '';
+  position: absolute;
+  top: -2px;
+  right: -2px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 2px #0f1a2e;
+}
+
+.menu-item-update {
+  font-weight: 600;
+}
+
+@media (max-width: 1080px) {
+  .update-progress {
+    display: none;
+  }
+}

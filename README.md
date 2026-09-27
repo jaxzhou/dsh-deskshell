@@ -70,6 +70,28 @@
 > 现成安装包发布在 **<https://dsh.textwork.cn>**（Windows / macOS / Linux），
 > 校验清单：<https://dsh.textwork.cn/download/SHA256SUMS>
 
+### 外壳自更新
+
+桌面壳**自己的更新**与插件市场是两条独立链路：插件更新的是 dsh 里的插件，自更新换掉的是外壳本身。检查方式、状态与入口都不共用。
+
+- **一份发布清单**：`https://dsh.textwork.cn/download/latest.json` 由 `scripts/publish-update-manifest.mjs` 随产物一起生成，列出最新版本、说明与**各平台包的文件名 / 大小 / SHA-256**（Windows `nsis`+`zip`、macOS `zip`、Linux `appimage`/`deb`/`tar.gz`，以及离线版的 `linux-offline` 包）。
+- **不常驻**：启动后 8 秒查一次（静默，失败只记日志），之后每 6 小时一次；没有后台守护进程，定时器 `unref` 后不影响退出。也可以在右上角 **⋮ 菜单 →「检查更新」** 手动触发。
+- **发现更新才出现**：顶栏下方弹出更新条（含新版本号、当前版本、包体大小），⋮ 按钮上加一个小圆点；用户可以「更新」或「稍后」（稍后只对当前这个版本静默，菜单里的入口仍然保留）。
+- **下载即校验**：点击「更新」后显示百分比进度，落盘后按清单里的 SHA-256 复核，**不一致就删除文件并报错**，不会安装来历不明的包。
+- **替换后自动重启**：外壳先退出（顺带结束 dsh），再由辅助程序完成替换并重新启动：
+
+| 平台 | 安装方式 | 说明 |
+| --- | --- | --- |
+| Windows | NSIS 安装包 `DSH-D-Setup-<版本>.exe /S --force-run` | 静默安装并在完成后拉起新版本 |
+| macOS | 辅助脚本 `ditto -x -k` 解压后替换 `.app` | 若应用所在目录不可写（例如非管理员装的 `/Applications`），则转为**人工指引**并打开下载位置，不会尝试半套替换 |
+| Linux（AppImage） | 辅助脚本 `mv` 覆盖 `$APPIMAGE` 并 `chmod +x` | 仅当确实以 AppImage 方式运行时 |
+| Linux（deb / tar.gz） | 人工安装 | 交给包管理器，外壳只负责下载、校验并打开所在目录 |
+| 开发模式 | 不自动替换 | `app.isPackaged === false` 时只提示 |
+
+辅助脚本都会先 `kill -0 <pid>` 等待外壳退出，再去动文件，因此不会替换正在运行的程序；脚本在替换完成后重新启动外壳（dsh 会随之重新拉起）。
+
+离线版（`DSH-D Offline`）用自己的 `linux-offline` 产物：清单里若没有对应条目就回到普通的 Linux 包或人工指引；**断网时检查只会留下一条可读日志，不会阻塞启动**（`DSH_D_UPDATE_CHECK=0` 可完全关闭自动检查）。
+
 ## 快速开始
 
 ```bash
@@ -173,6 +195,8 @@ npx electron-builder --win
 | `npm test` / `npm run verify` | 纯 Node 逻辑验证（检测、进度模型、安装流程、服务生命周期、状态机端到端） |
 | `npm run self-test` | Electron 运行时冒烟测试：窗口、preload 桥、界面、内嵌视图、工具栏、IPC；**不会启动 dsh** |
 | `scripts/print-probe.cjs` | 打印链路实测：打印机/printToPDF/window.print()/沙箱 iframe/外壳 printPage（`--dialog` 会打开系统面板） |
+| `npm run test:update` | 自更新线上验证：真实下载本机对应的包、比对 SHA-256、解开确认包内版本号与 appId，并打印会执行的替换计划（不真的替换） |
+| `scripts/publish-update-manifest.mjs` | 生成自更新发布清单 `latest.json`（版本 + 各平台文件 + 大小 + SHA-256） |
 | `npm run test:network` | 实网验证：真实下载 Node.js LTS、确认 npm 全局目录落在托管目录内、真实安装一次 dsh，以及校验线上插件目录（两组齐全 / 条目合法 / 与 npm 版本一致） |
 | `npm run diagnose` | 运行时配置诊断：模拟一台没有 Node 的机器跑完整流程，逐条打印 node/npm 检查结果（排查环境问题用） |
 | `scripts/build-offline-linux.sh` | 构建离线自包含 payload（在 Linux 容器内装 Node/pnpm/dsh/插件） |
@@ -193,6 +217,8 @@ src/main/
   progress.js      npm 输出 → 进度模型
   dsh-server.js    dsh web 进程监管 + 带 token 地址解析
   plugin-market.js 插件市场：目录抓取/校验、已装插件扫描、pnpm 自举、安装命令
+  updater.js       自更新：发布清单解析/校验、平台包选择、替换方案与辅助脚本（纯逻辑）
+  update-manager.js 自更新状态机：检查/下载/校验/计划，定期检查与并发保护（纯逻辑）
   process-tree.js  子进程终止与行缓冲
   preload.js       contextBridge 安全桥（渲染进程仅能调用白名单方法）
 src/renderer/      界面：顶部大 tab（DSH 运行信息 / 插件市场）+ 阶段面板 + 日志面板
@@ -231,14 +257,19 @@ test/              验证脚本与 fixture（伪 npm、伪 dsh）
 | `DSH_D_MARKET_URL` | 插件市场目录地址，默认 `https://dsh.textwork.cn/plugins/plugins.json` |
 | `DSH_D_VENDOR_DIR` | 离线 payload 目录（离线版自动从应用资源目录发现，一般无需设置） |
 | `DSH_D_PROFILE` | 插件安装到哪个 dsh profile，默认 `web`（与外壳启动的 profile 一致） |
+| `DSH_D_UPDATE_CHECK` | 设为 `0`/`off` 关闭外壳自动检查更新（手动菜单仍然可用） |
+| `DSH_D_UPDATE_INTERVAL_MIN` | 自动检查间隔（分钟），默认 `360`（6 小时） |
+| `DSH_D_UPDATE_MANIFEST` | 自更新发布清单地址，默认 `https://dsh.textwork.cn/download/latest.json`（自测/灰度可用本地地址） |
 
 ## 已验证内容
 
-`npm test`（246 项）覆盖：登录环境解析、检测、进度模型、`dsh web: <url>` 解析、安装成功/失败与提示、服务启停生命周期、状态机端到端（未安装 → 安装 → 启动 → 运行 → 重启 → 停止，使用 fixture 注入，不触碰真实 npm/dsh），**模拟 `win32` 的 Windows 代码路径**（`.cmd` 是否走 shell、含空格路径的引号处理、PATH 分号分隔、PATHEXT 解析、Windows 全局目录推断），**运行时自动配置**（发行版地址解析、LTS 选择、下载进度、真实 tar 解压、复用与取消、托管环境 prefix/cache 锁定、控制器"缺 Node → 自动配置 → 进入安装 dsh"流程与失败兜底），**插件市场**（新目录 schema：自身/社区分组、`name`/`package` 兼容、站点相对链接补全、社区 downloads/stars、semver 比较含预发布、包名/版本白名单、目录解析与非法条目丢弃、profile 已装插件读取与版本来源、目录与本地状态合并、pnpm 自举、安装参数构造、控制器"安装 → 自动重启 dsh → 版本更新"与失败不重启），**打印与 PDF 导出**（Cmd/Ctrl+P 判定、系统面板调用与回调、用户取消、页面不可用/抛错、PDF 落盘与取消保存、写入失败），以及**dsh 实际位置与 pnpm 依赖**（按环境解析 home：posix `HOME` / Windows `USERPROFILE`/`HOMEDRIVE+HOMEPATH`/`DSH_HOME` 含 `~` 展开、profile 缺失时列出实际存在的 profile、pnpm 纳入检测、启动时自动安装 pnpm 且失败不阻塞、私有安装识别、市场读数与安装使用同一 home）。
+`npm test`（303 项）覆盖：登录环境解析、检测、进度模型、`dsh web: <url>` 解析、安装成功/失败与提示、服务启停生命周期、状态机端到端（未安装 → 安装 → 启动 → 运行 → 重启 → 停止，使用 fixture 注入，不触碰真实 npm/dsh），**模拟 `win32` 的 Windows 代码路径**（`.cmd` 是否走 shell、含空格路径的引号处理、PATH 分号分隔、PATHEXT 解析、Windows 全局目录推断），**运行时自动配置**（发行版地址解析、LTS 选择、下载进度、真实 tar 解压、复用与取消、托管环境 prefix/cache 锁定、控制器"缺 Node → 自动配置 → 进入安装 dsh"流程与失败兜底），**插件市场**（新目录 schema：自身/社区分组、`name`/`package` 兼容、站点相对链接补全、社区 downloads/stars、semver 比较含预发布、包名/版本白名单、目录解析与非法条目丢弃、profile 已装插件读取与版本来源、目录与本地状态合并、pnpm 自举、安装参数构造、控制器"安装 → 自动重启 dsh → 版本更新"与失败不重启），**打印与 PDF 导出**（Cmd/Ctrl+P 判定、系统面板调用与回调、用户取消、页面不可用/抛错、PDF 落盘与取消保存、写入失败），**外壳自更新**（清单解析与非法输入拒绝、按平台/架构/离线变体选择包、版本比较含预发布、各平台替换方案与不可写目录转人工、辅助脚本等待进程退出、SHA-256 校验通过/不符/文件缺失、**本地 HTTP 端到端"检查 → 下载 → 校验 → 计划"**、已是最新、下载 404、未下载拒绝应用、并发检查只请求一次、定期检查与 dispose 后停止、断网优雅失败），以及**dsh 实际位置与 pnpm 依赖**（按环境解析 home：posix `HOME` / Windows `USERPROFILE`/`HOMEDRIVE+HOMEPATH`/`DSH_HOME` 含 `~` 展开、profile 缺失时列出实际存在的 profile、pnpm 纳入检测、启动时自动安装 pnpm 且失败不阻塞、私有安装识别、市场读数与安装使用同一 home）。
 
-`npm run test:network`（12 项）在真实网络上验证：下载 Node.js LTS（约 52 MB）→ 解压校验 → `npm prefix -g` 落在托管目录 → 真实执行 `npm install -g @deepseek-ai/dsh` 并运行托管目录内的 dsh。
+`npm run test:network`（26 项）在真实网络上验证：下载 Node.js LTS（约 52 MB）→ 解压校验 → `npm prefix -g` 落在托管目录 → 真实执行 `npm install -g @deepseek-ai/dsh` 并运行托管目录内的 dsh；并校验线上插件目录与**自更新发布清单**（可解析、覆盖 win/mac/linux 与离线变体、每个包的直链 HEAD 大小与清单一致、不可达时优雅报错）。
 
-`npm run self-test`（55 项）在真实 Electron 中验证：窗口与界面渲染、preload 桥、IPC 往返、剪贴板 API、主进程检测、`WebContentsView` 创建/尺寸/隐藏，工具栏（菜单可展开、不遮挡退出按钮、运行阶段无内联调试按钮、状态区显示机器名与 dsh 版本且不含端口），**顶部 tab 与插件市场**（两个大 tab、切换后阶段面板让位、内嵌视图在市场上隐藏、用本地 fixture 目录渲染卡片与本地已装列表、有更新时出现更新按钮、安装会调用 dsh plugin 并自动重启、切回 DSH tab 恢复），**菜单与打印入口**（菜单项含打印/导出 PDF）、**实际位置与 pnpm 告警**（市场显示 profile 目录与 dsh 路径、pnpm 不可用时给出告警与"自动配置 pnpm"入口、点击后触发配置且告警消失），以及**菜单与层级**（用真实鼠标输入点击 ⋮ 验证可命中/展开/收起，菜单展开时内嵌视图隐藏、关闭后恢复，市场 tab 不显示视图）、**分组与卸载**（自身/社区两个分组、分组计数、已安装项出现卸载按钮、卸载走 dsh plugin remove 并同样重启）。
+`npm run test:update`（12 项）在真实网络上跑完自更新的下载链路：取线上清单 → 为本机选包 → 下载（本次实测 126 MB / 101 秒）→ 比对清单里的 SHA-256 → 解开 `.app` 确认 `CFBundleShortVersionString` 与 `CFBundleIdentifier` → 打印替换计划与辅助脚本。
+
+`npm run self-test`（69 项）在真实 Electron 中验证：窗口与界面渲染、preload 桥、IPC 往返、剪贴板 API、主进程检测、`WebContentsView` 创建/尺寸/隐藏，工具栏（菜单可展开、不遮挡退出按钮、运行阶段无内联调试按钮、状态区显示机器名与 dsh 版本且不含端口），**顶部 tab 与插件市场**（两个大 tab、切换后阶段面板让位、内嵌视图在市场上隐藏、用本地 fixture 目录渲染卡片与本地已装列表、有更新时出现更新按钮、安装会调用 dsh plugin 并自动重启、切回 DSH tab 恢复），**菜单与打印入口**（菜单项含打印/导出 PDF）、**实际位置与 pnpm 告警**（市场显示 profile 目录与 dsh 路径、pnpm 不可用时给出告警与"自动配置 pnpm"入口、点击后触发配置且告警消失），**外壳自更新界面**（默认不显示更新条、菜单含"检查更新"入口、用合成快照渲染出更新条/版本与大小/进度百分比/重启并安装、更新条高度计入内嵌视图内边距、稍后收起、未下载时拒绝应用以免误重启，且自检期间不联网），以及**菜单与层级**（用真实鼠标输入点击 ⋮ 验证可命中/展开/收起，菜单展开时内嵌视图隐藏、关闭后恢复，市场 tab 不显示视图）、**分组与卸载**（自身/社区两个分组、分组计数、已安装项出现卸载按钮、卸载走 dsh plugin remove 并同样重启）。
 
 > 在受限环境（容器、外层的进程沙箱、CI）中，Chromium 自身的沙箱可能无法初始化，此时可加 `--no-sandbox --disable-gpu` 运行自检：
 > ```bash

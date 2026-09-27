@@ -175,6 +175,42 @@ if (liveMarket.ok) {
   }
 }
 
+// --- 外壳自更新：线上发布清单必须可解析、可下载 ---
+{
+  const updater = require('../src/main/updater.js');
+  console.log('\n[外壳自更新] 线上发布清单');
+  const result = await updater.fetchManifest({});
+  check('发布清单可获取并解析', result.ok === true, result.ok ? result.source : result.error);
+  if (result.ok) {
+    const manifest = result.manifest;
+    check('清单版本号合法', updater.isVersion(manifest.version), manifest.version);
+    check('清单至少含 5 个平台产物', manifest.assets.length >= 5, `${manifest.assets.length} 个`);
+    const platforms = [...new Set(manifest.assets.map((asset) => asset.platform))].sort();
+    check(
+      '清单覆盖 win/mac/linux（含离线变体）',
+      ['darwin', 'linux', 'linux-offline', 'win32'].every((p) => platforms.includes(p)),
+      platforms.join(','),
+    );
+    check('每个产物都带 64 位 sha256', manifest.assets.every((asset) => /^[0-9a-f]{64}$/.test(asset.sha256)));
+    // HEAD 只验证可下载性与大小，不真的拉 100MB+ 的包。
+    let headOk = 0;
+    const problems = [];
+    for (const asset of manifest.assets) {
+      try {
+        const response = await fetch(asset.url, { method: 'HEAD' });
+        const length = Number(response.headers.get('content-length'));
+        if (response.ok && length === asset.size) headOk += 1;
+        else problems.push(`${asset.file}: HTTP ${response.status} / ${length}≠${asset.size}`);
+      } catch (error) {
+        problems.push(`${asset.file}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    check('所有产物直链可下载且大小与清单一致', headOk === manifest.assets.length, problems.join('；') || `${headOk}/${manifest.assets.length}`);
+    const speed = await updater.fetchManifest({ url: 'http://127.0.0.1:1/latest.json', timeoutMs: 4000 });
+    check('不可达时优雅返回错误（离线/断网）', speed.ok === false && Boolean(speed.error), speed.error);
+  }
+}
+
 console.log(`\n${'─'.repeat(58)}`);
 console.log(`通过 ${passed} 项，失败 ${failed} 项`);
 console.log(`（回退版本常量：${FALLBACK_NODE_VERSION}，仅在版本索引不可达时使用）`);
