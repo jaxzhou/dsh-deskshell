@@ -542,6 +542,9 @@ function setupOfflinePayload() {
  */
 let updateManager = null;
 
+/** The dsh core catalog is fetched once per run, as soon as dsh is detected. */
+let kernelPrefetched = false;
+
 function updateDownloadDir() {
   return path.join(app.getPath('userData'), 'updates');
 }
@@ -1743,9 +1746,28 @@ async function runUiCapture() {
 
 // ------------------------------------------------------------------ lifecycle
 
+/**
+ * Detect the dsh core version once at startup.
+ *
+ * The kernel tab is lazy like the market, but "which dsh am I running and is
+ * there a newer release?" is the question the tab exists to answer — so the
+ * catalog is fetched on the first successful start instead of waiting for the
+ * user to open the tab. Best-effort: without a network the tab simply offers
+ * its own retry.
+ */
+function prefetchKernelCatalog() {
+  // Tests and captures must stay offline and deterministic.
+  if (kernelPrefetched || SELF_TEST || CAPTURE_UI || !controller || isOfflineBuild()) return;
+  const state = controller.getState();
+  if (!state?.detection?.dsh?.installed) return;
+  kernelPrefetched = true;
+  controller.loadKernel({ refresh: true }).catch((error) => reportError('检测 dsh 内核版本失败', error));
+}
+
 function wireController() {
   controller.on('state', (state) => {
     if (captureFreeze) return;
+    if (!kernelPrefetched) prefetchKernelCatalog();
     if (win && !win.isDestroyed()) win.webContents.send('dsh:state', state);
     syncGuiView(state);
   });
