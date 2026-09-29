@@ -997,7 +997,13 @@ async function runSelfTest() {
         const loaded = await controller.loadKernel({ refresh: true });
         record('内核目录可加载（注入 fixture）', loaded.ok === true, String(loaded.error ?? ''));
         const view = controller.getState().kernel;
-        record('视图含当前版本与推荐', view.version === app.getVersion() ? true : Boolean(view.version), `dsh ${view.version} / ${view.recommendation?.status}`);
+        // The version may legitimately be unknown (no dsh yet, or a payload this
+        // host cannot execute); what must hold is that the view reports it.
+        record(
+          '视图含当前版本与推荐',
+          'version' in view && Boolean(view.recommendation?.status),
+          `dsh ${view.version ?? '未检测'} / ${view.recommendation?.status}`,
+        );
         record('视图列出可选版本并按新→旧', view.rows.length === 3 && view.rows[0].version === '0.2.0-rc.2', view.rows.map((r) => r.version).join(','));
         record('推荐目标为 dist-tag latest', view.recommendation.target === '0.1.7-rc.2', view.recommendation.reason);
         record('默认折叠 Alpha 预发布', view.rows.every((row) => row.type === 'rc') && view.hidden === 1, `rows=${view.rows.length} hidden=${view.hidden}`);
@@ -1040,32 +1046,46 @@ async function runSelfTest() {
         record('渲染版本列表', kernelDom.rows === 3 && kernelDom.versions.join(',') === '0.2.0-rc.2,0.1.7-rc.2,0.1.5-rc.3', kernelDom.versions.join(','));
         record('渲染最新/预览两张头卡', kernelDom.cards === 2 && kernelDom.cardVersions.join('|') === 'v0.1.7-rc.2|v0.2.0-rc.2', kernelDom.cardVersions.join('|'));
         record('每个版本都有安装按钮', kernelDom.installButtons === 3, String(kernelDom.installButtons));
-        record('tab 副标题显示版本与状态', /v?\d+\.\d+\.\d+/.test(kernelDom.sub), kernelDom.sub);
+        record(
+          'tab 副标题显示内核状态',
+          Boolean(kernelDom.sub) && (/\d+\.\d+\.\d+/.test(kernelDom.sub) || /未检测|未加载/.test(kernelDom.sub)),
+          kernelDom.sub,
+        );
 
-        // 两段式确认 + 真实 IPC 调用（安装被注入，不会碰 npm）
+        // The offline self-contained build *must* refuse to move the core (its dsh
+        // comes from the payload), so this part asserts different things there.
+        const lock = controller.kernelLock();
         const confirmFlow = await win.webContents.executeJavaScript(
           `(async () => {
              const row = Array.from(document.querySelectorAll('#kernelList .kernel-row')).find((r) => r.dataset.version === '0.1.7-rc.2');
              const button = row.querySelector('button[data-action="kernel-install"]');
+             const disabled = button.disabled;
              button.click();
              const afterFirst = button.textContent;
              button.click();
              await new Promise((r) => setTimeout(r, 600));
-             return { afterFirst, latest: window.__lastKernelInstall ?? null };
+             return { disabled, afterFirst };
            })()`,
         );
-        record('安装需二次确认', /确认安装 v0\.1\.7-rc\.2/.test(confirmFlow.afterFirst), confirmFlow.afterFirst);
-        let afterInstall = controller.getState().kernelAction;
-        for (let i = 0; i < 60 && afterInstall?.running !== false; i += 1) {
-          await new Promise((resolve) => setTimeout(resolve, 250));
-          afterInstall = controller.getState().kernelAction;
+        if (lock) {
+          record('离线版禁用安装按钮（不进入确认流程）', confirmFlow.disabled === true && confirmFlow.afterFirst === '安装此版本', JSON.stringify(confirmFlow));
+          const refused = await controller.installKernel({ version: '0.1.7-rc.2' });
+          record('离线版 IPC 安装被拒绝且未调用 npm', refused.ok === false && refused.locked === true && installRequests.length === 0, refused.error ?? '');
+          record('离线版不产生内核操作状态', controller.getState().kernelAction === null, JSON.stringify(controller.getState().kernelAction));
+        } else {
+          record('安装需二次确认', /确认安装 v0\.1\.7-rc\.2/.test(confirmFlow.afterFirst), confirmFlow.afterFirst);
+          let afterInstall = controller.getState().kernelAction;
+          for (let i = 0; i < 60 && afterInstall?.running !== false; i += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 250));
+            afterInstall = controller.getState().kernelAction;
+          }
+          record('确认后经 IPC 调用 npm（注入）', installRequests.join() === '0.1.7-rc.2', installRequests.join() || '未调用');
+          record(
+            '内核操作结果写入状态',
+            afterInstall?.ok === true && afterInstall.version === '0.1.7-rc.2' && afterInstall.running === false,
+            JSON.stringify({ ok: afterInstall?.ok, running: afterInstall?.running, version: afterInstall?.version }),
+          );
         }
-        record('确认后经 IPC 调用 npm（注入）', installRequests.join() === '0.1.7-rc.2', installRequests.join() || '未调用');
-        record(
-          '内核操作结果写入状态',
-          afterInstall?.ok === true && afterInstall.version === '0.1.7-rc.2' && afterInstall.running === false,
-          JSON.stringify({ ok: afterInstall?.ok, running: afterInstall?.running, version: afterInstall?.version }),
-        );
 
         // 发布说明折叠与展开
         const notesFlow = await win.webContents.executeJavaScript(
@@ -1080,9 +1100,10 @@ async function runSelfTest() {
         );
         record('发布说明可展开（只含中文段落）', notesFlow.hasToggle && notesFlow.before === true && notesFlow.after === false && notesFlow.text.includes('快捷键'), JSON.stringify(notesFlow));
 
-        // 进行中的更新：进度条与取消（用真实状态做基底，只替换内核部分）
+        // 进行中的更新：进度条与取消（用真实状态做基底，只替换内核部分）。
+        // 离线版的内核横幅由"停用说明"占用，进度条断言留给常规版。
         const renderBase = controller.getState();
-        const runningFixture = controller.getState().kernel;
+        const runningFixture = { ...controller.getState().kernel, locked: null };
         await win.webContents.executeJavaScript(
           `window.render(${JSON.stringify({
             ...renderBase,
