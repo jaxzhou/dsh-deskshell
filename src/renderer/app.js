@@ -48,6 +48,15 @@ const el = {
   tabButtons: [...document.querySelectorAll('.tab[data-tab]')],
   tabDshSub: document.getElementById('tabDshSub'),
   tabMarketSub: document.getElementById('tabMarketSub'),
+  tabKernelSub: document.getElementById('tabKernelSub'),
+  kernelPanel: document.querySelector('.panel-kernel'),
+  kernelMeta: document.getElementById('kernelMeta'),
+  kernelRuntime: document.getElementById('kernelRuntime'),
+  kernelBanner: document.getElementById('kernelBanner'),
+  kernelHighlights: document.getElementById('kernelHighlights'),
+  kernelStats: document.getElementById('kernelStats'),
+  kernelList: document.getElementById('kernelList'),
+  kernelPreToggle: document.getElementById('kernelPreToggle'),
   marketPanel: document.querySelector('.panel-market'),
   marketMeta: document.getElementById('marketMeta'),
   marketRuntime: document.getElementById('marketRuntime'),
@@ -215,6 +224,293 @@ function trackPluginAction(next) {
   if (handledPluginAction === id) return;
   handledPluginAction = id;
   if (action.ok) loadMarket();
+}
+
+// ------------------------------------------------------------------ dsh 内核
+
+/**
+ * Kernel panel state.
+ *
+ * The version list itself arrives in `state.kernel` (main builds it from the
+ * cached catalog), so this module only remembers what the user asked for
+ * (pre-release toggle), the dismissable action result, and whether a fetch has
+ * happened yet.
+ */
+const kernel = { requested: false, handledAction: null, dismissed: null };
+
+const KERNEL_TYPE_BADGE = {
+  release: 'badge-ok',
+  rc: 'badge-rc',
+  alpha: 'badge-warn',
+  prerelease: 'badge-warn',
+};
+
+function kernelTypeLabel(type) {
+  if (type === 'release') return '正式版';
+  if (type === 'rc') return 'RC 候选版';
+  if (type === 'alpha') return 'Alpha 内测版';
+  return '预发布';
+}
+
+function describeKernelTab(next) {
+  const view = next?.kernel;
+  if (!view || !view.loaded) return view?.loading ? '加载中…' : '未加载';
+  const version = view.version ? `v${view.version}` : '未检测';
+  const status = view.recommendation?.status;
+  if (status === 'update') return `${version} · 可更新`;
+  if (status === 'preview') return `${version} · 有预览版`;
+  return version;
+}
+
+/** Load (or re-filter) the published dsh versions. */
+async function loadKernel(options = {}) {
+  kernel.requested = true;
+  try {
+    const next = await api.loadKernel({
+      refresh: options.refresh === true,
+      includePre: Boolean(el.kernelPreToggle.checked),
+    });
+    if (next) render(next);
+  } catch (error) {
+    appendLog({ ts: Date.now(), stream: 'stderr', line: `读取 dsh 版本目录失败：${error?.message ?? error}` });
+  }
+}
+
+function kernelBadge(text, className) {
+  const badge = elWith('span', `badge ${className}`, text);
+  return badge;
+}
+
+/** One published version row. */
+function kernelRow(row, view) {
+  const wrap = elWith('div', 'kernel-row');
+  wrap.dataset.version = row.version;
+  if (row.version === view.version) wrap.classList.add('is-current');
+  if (row.recommended) wrap.classList.add('is-recommended');
+
+  const head = elWith('div', 'kernel-row-head');
+  const version = elWith('b', 'kernel-ver', `v${row.version}`);
+  head.append(version);
+  head.append(kernelBadge(kernelTypeLabel(row.type), KERNEL_TYPE_BADGE[row.type] ?? 'badge-warn'));
+  if (row.version === view.version) head.append(kernelBadge('当前版本', 'badge-ok'));
+  for (const tag of row.tags ?? []) head.append(kernelBadge(tag, 'badge-tag'));
+  if ((row.sources ?? []).includes('git')) head.append(kernelBadge('git 已发布', 'badge-ghost'));
+  if (row.installable === false) head.append(kernelBadge('未发布到 npm', 'badge-warn'));
+  if (row.deprecated) head.append(kernelBadge('已弃用', 'badge-warn'));
+  wrap.append(head);
+
+  const facts = [];
+  if (row.publishedAt) facts.push(`发布于 ${String(row.publishedAt).slice(0, 10)}`);
+  facts.push(row.installable === false ? '来源 git 标签（不可安装）' : 'npm 可安装');
+  if (row.relation === 'newer' && row.version !== view.version) facts.push('比当前新');
+  if (row.relation === 'older') facts.push('比当前旧');
+  wrap.append(elWith('div', 'muted small', facts.join(' · ')));
+
+  const actions = elWith('div', 'kernel-row-actions');
+  const locked = view.locked;
+  const busy = Boolean(view.actionRunning);
+  const install = elWith(
+    'button',
+    row.version === view.version ? 'btn btn-compact' : 'btn btn-primary btn-compact',
+    row.version === view.version ? '重新安装' : row.relation === 'older' ? '切换到该版本' : '安装此版本',
+  );
+  install.dataset.action = 'kernel-install';
+  install.dataset.version = row.version;
+  install.disabled = Boolean(locked) || row.installable === false || busy;
+  if (locked) install.title = locked.reason;
+  if (row.installable === false) install.title = '该版本只出现在 git 标签里，npm 上没有对应包';
+  actions.append(install);
+  if (row.notes) {
+    const toggle = elWith('button', 'btn btn-ghost btn-compact', '发布说明');
+    toggle.dataset.action = 'kernel-notes';
+    actions.append(toggle);
+  }
+  if (row.releaseUrl) {
+    const open = elWith('button', 'btn btn-ghost btn-compact', '官方页面');
+    open.dataset.action = 'kernel-open-release';
+    open.dataset.url = row.releaseUrl;
+    actions.append(open);
+  }
+  wrap.append(actions);
+
+  if (row.notes) {
+    const details = elWith('details', 'kernel-notes');
+    details.hidden = true;
+    const body = elWith('pre', 'kernel-notes-body', row.notes);
+    details.append(body);
+    wrap.append(details);
+  }
+  return wrap;
+}
+
+/** Headline cards: the `latest` and `next` dist-tags. */
+function kernelHighlights(view) {
+  el.kernelHighlights.replaceChildren();
+  const cards = [
+    { key: 'latest', row: view.highlights?.latestRow, title: '最新发布版本', note: 'npm dist-tag latest' },
+    { key: 'next', row: view.highlights?.nextRow, title: '下一版本预览', note: 'npm dist-tag next' },
+  ];
+  for (const card of cards) {
+    if (!card.row) continue;
+    const node = elWith('div', 'kernel-card');
+    const head = elWith('div', 'kernel-card-head');
+    head.append(elWith('span', 'kernel-card-title', card.title));
+    head.append(kernelBadge(kernelTypeLabel(card.row.type), KERNEL_TYPE_BADGE[card.row.type] ?? 'badge-warn'));
+    node.append(head);
+    node.append(elWith('div', 'kernel-card-version', `v${card.row.version}`));
+    const facts = [card.note];
+    if (card.row.publishedAt) facts.push(String(card.row.publishedAt).slice(0, 10));
+    node.append(elWith('div', 'muted small', facts.join(' · ')));
+    const button = elWith(
+      'button',
+      'btn btn-primary btn-compact',
+      card.row.version === view.version ? '重新安装' : '安装',
+    );
+    button.dataset.action = 'kernel-install';
+    button.dataset.version = card.row.version;
+    button.disabled = Boolean(view.locked) || view.actionRunning || card.row.installable === false;
+    if (view.locked) button.title = view.locked.reason;
+    node.append(button);
+    el.kernelHighlights.append(node);
+  }
+}
+
+/** Progress / result banner for the running or last core action. */
+function renderKernelBanner(next) {
+  const view = next?.kernel ?? {};
+  const action = next?.kernelAction ?? null;
+  const running = Boolean(action?.running);
+  const dismissed = action?.finishedAt && kernel.dismissed === action.finishedAt;
+  const locked = view.locked;
+  const error = view.error;
+
+  const show = (running && !dismissed) || (action && !running && !dismissed) || (error && !view.loaded) || Boolean(locked);
+  el.kernelBanner.hidden = !show;
+  el.kernelBanner.className = 'market-banner';
+  el.kernelBanner.replaceChildren();
+  if (!show) return;
+
+  if (locked) {
+    el.kernelBanner.classList.add('is-warn');
+    el.kernelBanner.append(elWith('span', 'market-banner-text', `内核更新已停用：${locked.reason}`));
+    return;
+  }
+
+  if (error && !view.loaded) {
+    el.kernelBanner.classList.add('is-error');
+    const text = elWith('div', 'market-banner-text');
+    text.append(elWith('b', null, '版本目录读取失败'), elWith('span', null, error));
+    el.kernelBanner.append(text);
+    const retry = elWith('button', 'btn btn-compact', '重试');
+    retry.dataset.action = 'kernel-refresh';
+    el.kernelBanner.append(retry);
+    return;
+  }
+
+  if (!action) return;
+  if (running) {
+    const text = elWith('div', 'market-banner-text');
+    text.append(
+      elWith('b', null, `正在安装 dsh ${action.version}`),
+      elWith('span', null, action.step ? `· ${action.step}` : ''),
+    );
+    el.kernelBanner.append(text);
+    const progress = elWith('div', 'market-banner-progress');
+    const bar = elWith('div', 'bar');
+    const fill = elWith('div', 'bar-fill');
+    fill.style.width = `${action.percent ?? 0}%`;
+    bar.append(fill);
+    progress.append(bar, elWith('span', 'muted small', `${action.percent ?? 0}%`));
+    el.kernelBanner.append(progress);
+    const cancel = elWith('button', 'btn btn-compact', '取消');
+    cancel.dataset.action = 'kernel-cancel';
+    el.kernelBanner.append(cancel);
+    return;
+  }
+
+  const ok = action.ok === true;
+  el.kernelBanner.classList.add(ok ? 'is-ok' : 'is-error');
+  const text = elWith('div', 'market-banner-text');
+  if (ok) {
+    const change = action.from && action.installedVersion ? `${action.from} → ${action.installedVersion}` : action.version;
+    text.append(elWith('b', null, '内核已更新'), elWith('span', null, `· ${change} · dsh 已重启`));
+  } else if (action.cancelled) {
+    text.append(elWith('b', null, '已取消'), elWith('span', null, `· 未安装 ${action.version}`));
+  } else {
+    text.append(elWith('b', null, action.step ?? '更新失败'), elWith('span', null, action.error ? `· ${action.error}` : ''));
+  }
+  el.kernelBanner.append(text);
+  if (!ok && action.hint) el.kernelBanner.append(elWith('span', 'muted small', action.hint));
+  if (ok && action.hint) el.kernelBanner.append(elWith('span', 'muted small', action.hint));
+  const close = elWith('button', 'btn btn-ghost btn-compact', '关闭');
+  close.dataset.action = 'kernel-dismiss';
+  close.dataset.stamp = String(action.finishedAt ?? '');
+  el.kernelBanner.append(close);
+}
+
+function renderKernel(next) {
+  const view = next?.kernel ?? {};
+  const action = next?.kernelAction ?? null;
+
+  // The panel needs the catalog once; the first tab switch triggers the fetch.
+  if (kernel.requested && !view.loaded && !view.loading && !view.error) loadKernel();
+
+  renderKernelBanner(next);
+  el.kernelPreToggle.checked = view.includePre === true;
+
+  const meta = [];
+  if (view.loading) meta.push('正在读取 npm / GitHub 官方版本…');
+  else if (view.error) meta.push(`读取失败：${view.error}`);
+  else if (view.loaded) {
+    if (view.fetchedAt) meta.push(`目录更新于 ${new Date(view.fetchedAt).toLocaleString('zh-CN', { hour12: false })}`);
+    meta.push('来源 npm + GitHub 官方发布');
+  } else meta.push('尚未读取版本目录');
+  if (view.notes?.length) meta.push(`部分来源不可用：${view.notes.join('；')}`);
+  setText(el.kernelMeta, meta.join(' · '));
+
+  const runtime = view.runtime ?? {};
+  const runtimeParts = [];
+  runtimeParts.push(view.version ? `当前 dsh v${view.version}` : '未检测到 dsh');
+  if (runtime.command) runtimeParts.push(runtime.command);
+  if (runtime.private) runtimeParts.push('外壳私有安装');
+  if (runtime.bundled) runtimeParts.push('离线内置');
+  if (runtime.home) runtimeParts.push(`DSH_HOME ${runtime.home}`);
+  setText(el.kernelRuntime, runtimeParts.join(' · '));
+
+  // Everything below is about the version list.
+  setText(
+    el.kernelStats,
+    view.loaded
+      ? `${view.rows.length} 个版本${view.hidden ? `（另有 ${view.hidden} 个预发布版本被折叠）` : ''} · ${view.recommendation?.reason ?? ''}`
+      : '',
+  );
+
+  const annotatedView = { ...view, actionRunning: Boolean(action?.running) };
+  kernelHighlights(annotatedView);
+
+  el.kernelList.replaceChildren();
+  if (view.loading && !view.rows.length) {
+    el.kernelList.append(elWith('div', 'market-placeholder', '正在读取官方版本目录…'));
+    return;
+  }
+  if (!view.loaded) {
+    el.kernelList.append(
+      elWith(
+        'div',
+        'market-placeholder',
+        view.error ? `版本目录读取失败：${view.error}` : '点击「重新读取目录」以获取 dsh 官方版本',
+      ),
+    );
+    return;
+  }
+  if (!view.rows.length) {
+    el.kernelList.append(elWith('div', 'market-placeholder', '没有符合当前筛选条件的版本'));
+    return;
+  }
+
+  // Rows carry the target version for the install button; the list itself is
+  // remote input, so it is built with textContent only.
+  for (const row of view.rows) el.kernelList.append(kernelRow(row, annotatedView));
 }
 
 function elWith(tag, className, text) {
@@ -539,14 +835,20 @@ function resetLog(entries = []) {
 // -------------------------------------------------------------------- tabs
 
 /** Switch the top tab and tell main, which shows/hides the embedded dsh view. */
+const TAB_NAMES = ['dsh', 'kernel', 'market'];
+
 function switchTab(tab) {
-  activeTab = tab === 'market' ? 'market' : 'dsh';
+  activeTab = TAB_NAMES.includes(tab) ? tab : 'dsh';
   for (const button of el.tabButtons) {
     const active = button.dataset.tab === activeTab;
     button.classList.toggle('is-active', active);
     button.setAttribute('aria-selected', String(active));
   }
+  // Both panels fetch on first visit only; the dsh tab is the embedded view.
   if (activeTab === 'market' && !market.loaded && !market.loading) loadMarket();
+  // `kernelCaptureSkipFetch` lets the UI capture / self-test render a fixture
+  // instead of hitting the registry.
+  if (activeTab === 'kernel' && !kernel.requested && !window.kernelCaptureSkipFetch) loadKernel();
   api.setActiveTab(activeTab).catch(() => {});
   if (state) render(state);
   reportInset();
@@ -895,11 +1197,14 @@ function render(next) {
     panel.classList.toggle('active', showPhasePanel && name === phase);
   }
   el.marketPanel.classList.toggle('active', activeTab === 'market');
+  el.kernelPanel.classList.toggle('active', activeTab === 'kernel');
 
   // --- status strip: machine name + dsh version (the port stays internal) ---
   setText(el.statusText, next.statusText ?? '');
   setText(el.tabDshSub, describeDshTab(next));
   setText(el.tabMarketSub, describeMarketTab());
+  setText(el.tabKernelSub, describeKernelTab(next));
+  renderKernel(next);
   const meta = [];
   if (next.hostname) meta.push(next.hostname);
   if (next.detection?.dsh?.installed && next.detection.dsh.version) meta.push(`dsh ${next.detection.dsh.version}`);
@@ -1036,6 +1341,51 @@ const ACTIONS = {
     button.disabled = true;
     return api.uninstallPlugin({ packageName: button.dataset.package });
   },
+  // --- dsh 内核 ---
+  'kernel-refresh': async () => {
+    await loadKernel({ refresh: true });
+  },
+  'kernel-install': async (button) => {
+    const version = button.dataset.version;
+    if (!version) return undefined;
+    // Replacing the Harness is a real change to the running stack: confirm once.
+    if (button.dataset.confirm !== '1') {
+      button.dataset.confirm = '1';
+      const original = button.textContent;
+      button.textContent = `确认安装 v${version}`;
+      button.classList.add('btn-danger');
+      setTimeout(() => {
+        if (!button.isConnected) return;
+        button.dataset.confirm = '';
+        button.textContent = original;
+        button.classList.remove('btn-danger');
+      }, 4000);
+      return undefined;
+    }
+    button.disabled = true;
+    kernel.dismissed = null;
+    appendLog({ ts: Date.now(), stream: 'system', line: `开始安装 dsh 内核 v${version}…` });
+    const result = await api.installKernel({ version });
+    if (result && result.ok === false && result.error) {
+      appendLog({ ts: Date.now(), stream: 'stderr', line: `dsh 内核更新失败：${result.error}` });
+    }
+    await loadKernel();
+    return result;
+  },
+  'kernel-cancel': () => api.cancelKernel(),
+  'kernel-dismiss': (button) => {
+    kernel.dismissed = Number(button.dataset.stamp) || Date.now();
+    if (state) render(state);
+  },
+  'kernel-notes': (button) => {
+    const row = button.closest('.kernel-row');
+    const details = row?.querySelector('.kernel-notes');
+    if (details) details.hidden = !details.hidden;
+  },
+  'kernel-open-release': (button) =>
+    api.openExternal(button.dataset.url || 'https://github.com/deepseek-ai/deepseek-harness/releases'),
+  'kernel-open-releases': () => api.openExternal('https://github.com/deepseek-ai/deepseek-harness/releases'),
+  'kernel-tab': () => switchTab('kernel'),
   'market-setup-pnpm': async () => {
     await api.setupPnpm();
     await loadMarket();
@@ -1144,6 +1494,10 @@ el.menuBtn.addEventListener('click', (event) => {
 
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') openMenu(false);
+});
+
+el.kernelPreToggle.addEventListener('change', () => {
+  loadKernel({ includePre: el.kernelPreToggle.checked });
 });
 
 el.tabs.addEventListener('click', (event) => {

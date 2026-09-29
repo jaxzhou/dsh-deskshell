@@ -30,6 +30,12 @@ const SHOW_DEVTOOLS = IS_DEV || process.argv.includes('--devtools');
 const SELF_TEST = process.argv.includes('--self-test');
 /** Dev aid: renders each shell phase to a PNG for review (`--capture-ui <dir>`). */
 const CAPTURE_UI = process.argv.includes('--capture-ui');
+/**
+ * Capture-only: stop forwarding controller broadcasts, so a synthetic fixture
+ * stays on screen instead of being overwritten by a real state update between
+ * the render and the screenshot.
+ */
+let captureFreeze = false;
 /** Space the shell toolbar reserves; the renderer measures and refines it. */
 const DEFAULT_INSET_TOP = 56;
 
@@ -368,8 +374,8 @@ function registerIpc() {
   });
 
   ipcMain.handle('dsh:set-active-tab', (_event, tab) => {
-    activeTab = tab === 'market' ? 'market' : 'dsh';
-    // Switching tabs is what reveals the market or the dsh Web view.
+    // Only the DSH tab embeds the live Web view; kernel and market are shell UI.
+    activeTab = tab === 'market' ? 'market' : tab === 'kernel' ? 'kernel' : 'dsh';
     syncGuiView(controller.getState());
     return activeTab;
   });
@@ -419,6 +425,34 @@ function registerIpc() {
     } catch (error) {
       reportError('配置 pnpm 失败', error);
     }
+    return controller.getState();
+  });
+
+  // --- dsh core (内核)：published versions, and moving the install to one ---
+  ipcMain.handle('kernel:load', async (_event, payload) => {
+    try {
+      await controller.loadKernel({
+        refresh: Boolean(payload?.refresh),
+        includePre: typeof payload?.includePre === 'boolean' ? payload.includePre : undefined,
+      });
+    } catch (error) {
+      reportError('读取 dsh 内核目录失败', error);
+    }
+    return controller.getState();
+  });
+
+  ipcMain.handle('kernel:install', async (_event, payload) => {
+    try {
+      return await controller.installKernel({ version: payload?.version });
+    } catch (error) {
+      reportError('更新 dsh 内核失败', error);
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, error: message };
+    }
+  });
+
+  ipcMain.handle('kernel:cancel', () => {
+    controller.cancelKernelAction();
     return controller.getState();
   });
 
@@ -897,11 +931,214 @@ async function runSelfTest() {
       `window.renderUpdate(${JSON.stringify({ phase: 'idle', currentVersion: app.getVersion(), autoCheck: false })}); window.openMenu(false); window.dshShell.setViewInset({ top: ${layout.toolbar.height} }); true;`,
     );
 
+    console.log('4c. dsh 内核 tab（版本目录 / 切换 / 更新，注入 fixture）');
+    {
+      const kernelModule = require('./kernel');
+      const registryFixture = {
+        'dist-tags': { latest: '0.1.7-rc.2', next: '0.2.0-rc.2', alpha: '0.1.7-alpha.2' },
+        time: { '0.1.7-rc.2': '2026-09-24T14:18:11.337Z', '0.2.0-rc.2': '2026-09-29T09:56:27.792Z' },
+        versions: { '0.1.5-rc.3': {}, '0.1.7-rc.2': {}, '0.2.0-rc.2': {}, '0.1.7-alpha.2': {} },
+      };
+      const fixtureCatalog = kernelModule.mergeCatalog({
+        npm: kernelModule.parseRegistryMeta(JSON.stringify(registryFixture)),
+        git: [
+          {
+            version: '0.1.7-rc.2',
+            tag: 'dsh-v0.1.7-rc.2',
+            title: 'v0.1.7-rc.2',
+            prerelease: true,
+            publishedAt: '2026-09-24T14:00:00Z',
+            url: 'https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.2',
+            notes: '✨ 新增功能\n· 快捷键中心：查看、搜索、自定义与恢复。',
+          },
+        ],
+      });
+
+      // Everything below is injected: no registry, no npm, no dsh server.
+      const originals = {
+        fetchKernel: controller.runFetchKernel,
+        install: controller.runInstall,
+        start: controller.start,
+        stop: controller.stop,
+        pnpmAttempted: controller.pnpmAttempted,
+      };
+      let installRequests = [];
+      controller.pnpmAttempted = true; // never provision pnpm for real during self-test
+      controller.runFetchKernel = async () => ({ ok: true, catalog: fixtureCatalog, errors: [], fetchedAt: Date.now() });
+      controller.runInstall = (request) => {
+        installRequests.push(request.version ?? null);
+        return { promise: Promise.resolve({ ok: true, code: 0, output: '' }), cancel: () => {} };
+      };
+      controller.start = async () => {
+        // A stand-in for DshServer: enough for the state machine, but it loads
+        // nothing (no URL) and dispose() must be able to stop it.
+        controller.server = {
+          running: true,
+          startedAt: Date.now(),
+          stop: async () => {
+            controller.server = null;
+          },
+        };
+        controller.serverUrl = null;
+        controller.setPhase('running', 'DSH 已启动');
+        controller.broadcast();
+        return controller.getState();
+      };
+      controller.stop = async () => {
+        controller.server = null;
+        controller.serverUrl = null;
+        return controller.getState();
+      };
+
+      try {
+        const loaded = await controller.loadKernel({ refresh: true });
+        record('内核目录可加载（注入 fixture）', loaded.ok === true, String(loaded.error ?? ''));
+        const view = controller.getState().kernel;
+        record('视图含当前版本与推荐', view.version === app.getVersion() ? true : Boolean(view.version), `dsh ${view.version} / ${view.recommendation?.status}`);
+        record('视图列出可选版本并按新→旧', view.rows.length === 3 && view.rows[0].version === '0.2.0-rc.2', view.rows.map((r) => r.version).join(','));
+        record('推荐目标为 dist-tag latest', view.recommendation.target === '0.1.7-rc.2', view.recommendation.reason);
+        record('默认折叠 Alpha 预发布', view.rows.every((row) => row.type === 'rc') && view.hidden === 1, `rows=${view.rows.length} hidden=${view.hidden}`);
+        const expanded = await controller.loadKernel({ includePre: true });
+        record('可展开预发布版本', expanded.ok === true && controller.getState().kernel.rows.length === 4);
+
+        const kernelIpc = await win.webContents.executeJavaScript(
+          'window.dshShell.loadKernel({ includePre: false }).then((s) => (s && s.kernel ? s.kernel.rows.length : -1))',
+        );
+        record('preload 暴露内核接口且 IPC 往返正常', kernelIpc === 3, String(kernelIpc));
+
+        // --- 界面：切到内核 tab，用真实状态渲染 ---
+        await win.webContents.executeJavaScript('window.switchTab("kernel"); true;');
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        const kernelDom = await win.webContents.executeJavaScript(
+          `(() => {
+             const panel = document.querySelector('.panel-kernel');
+             const rows = Array.from(document.querySelectorAll('#kernelList .kernel-row'));
+             const cards = Array.from(document.querySelectorAll('.kernel-card'));
+             return {
+               active: panel.classList.contains('active'),
+               marketActive: document.querySelector('.panel-market').classList.contains('active'),
+               dshPanelActive: Boolean(document.querySelector('.panel[data-phase].active')),
+               rows: rows.length,
+               versions: rows.map((r) => r.dataset.version),
+               cards: cards.length,
+               cardVersions: cards.map((c) => c.querySelector('.kernel-card-version').textContent),
+               current: rows.filter((r) => r.classList.contains('is-current')).map((r) => r.dataset.version),
+               installButtons: rows.filter((r) => r.querySelector('button[data-action="kernel-install"]')).length,
+               sub: document.getElementById('tabKernelSub').textContent,
+             };
+           })()`,
+        );
+        record('切到内核 tab 后面板激活', kernelDom.active === true && kernelDom.marketActive === false && kernelDom.dshPanelActive === false, JSON.stringify(kernelDom));
+        record(
+          '内核 tab 隐藏内嵌 dsh 视图',
+          !guiView || guiView.getVisible() === false,
+          `activeTab=${activeTab} visible=${guiView ? guiView.getVisible() : 'no-view'} attached=${guiAttached} guiHiddenByUser=${guiHiddenByUser}`,
+        );
+        record('渲染版本列表', kernelDom.rows === 3 && kernelDom.versions.join(',') === '0.2.0-rc.2,0.1.7-rc.2,0.1.5-rc.3', kernelDom.versions.join(','));
+        record('渲染最新/预览两张头卡', kernelDom.cards === 2 && kernelDom.cardVersions.join('|') === 'v0.1.7-rc.2|v0.2.0-rc.2', kernelDom.cardVersions.join('|'));
+        record('每个版本都有安装按钮', kernelDom.installButtons === 3, String(kernelDom.installButtons));
+        record('tab 副标题显示版本与状态', /v?\d+\.\d+\.\d+/.test(kernelDom.sub), kernelDom.sub);
+
+        // 两段式确认 + 真实 IPC 调用（安装被注入，不会碰 npm）
+        const confirmFlow = await win.webContents.executeJavaScript(
+          `(async () => {
+             const row = Array.from(document.querySelectorAll('#kernelList .kernel-row')).find((r) => r.dataset.version === '0.1.7-rc.2');
+             const button = row.querySelector('button[data-action="kernel-install"]');
+             button.click();
+             const afterFirst = button.textContent;
+             button.click();
+             await new Promise((r) => setTimeout(r, 600));
+             return { afterFirst, latest: window.__lastKernelInstall ?? null };
+           })()`,
+        );
+        record('安装需二次确认', /确认安装 v0\.1\.7-rc\.2/.test(confirmFlow.afterFirst), confirmFlow.afterFirst);
+        let afterInstall = controller.getState().kernelAction;
+        for (let i = 0; i < 60 && afterInstall?.running !== false; i += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          afterInstall = controller.getState().kernelAction;
+        }
+        record('确认后经 IPC 调用 npm（注入）', installRequests.join() === '0.1.7-rc.2', installRequests.join() || '未调用');
+        record(
+          '内核操作结果写入状态',
+          afterInstall?.ok === true && afterInstall.version === '0.1.7-rc.2' && afterInstall.running === false,
+          JSON.stringify({ ok: afterInstall?.ok, running: afterInstall?.running, version: afterInstall?.version }),
+        );
+
+        // 发布说明折叠与展开
+        const notesFlow = await win.webContents.executeJavaScript(
+          `(() => {
+             const row = Array.from(document.querySelectorAll('#kernelList .kernel-row')).find((r) => r.dataset.version === '0.1.7-rc.2');
+             const toggle = row.querySelector('button[data-action="kernel-notes"]');
+             const details = row.querySelector('.kernel-notes');
+             const before = details.hidden;
+             toggle.click();
+             return { hasToggle: Boolean(toggle), before, after: details.hidden, text: details.textContent.slice(0, 20) };
+           })()`,
+        );
+        record('发布说明可展开（只含中文段落）', notesFlow.hasToggle && notesFlow.before === true && notesFlow.after === false && notesFlow.text.includes('快捷键'), JSON.stringify(notesFlow));
+
+        // 进行中的更新：进度条与取消（用真实状态做基底，只替换内核部分）
+        const renderBase = controller.getState();
+        const runningFixture = controller.getState().kernel;
+        await win.webContents.executeJavaScript(
+          `window.render(${JSON.stringify({
+            ...renderBase,
+            kernel: runningFixture,
+            kernelAction: {
+              running: true,
+              version: '0.2.0-rc.2',
+              from: '0.1.5-rc.3',
+              step: '正在安装 @deepseek-ai/dsh@0.2.0-rc.2',
+              percent: 42,
+              ok: null,
+              error: null,
+            },
+          })}); true;`,
+        );
+        const runningDom = await win.webContents.executeJavaScript(
+          `(() => { const banner = document.getElementById('kernelBanner'); const fill = banner.querySelector('.bar-fill'); return { hidden: banner.hidden, text: banner.textContent, width: fill ? fill.style.width : null, cancel: Boolean(banner.querySelector('button[data-action="kernel-cancel"]')), disabled: Array.from(document.querySelectorAll('#kernelList button[data-action="kernel-install"]')).every((b) => b.disabled), cardsDisabled: Array.from(document.querySelectorAll('.kernel-card button')).every((b) => b.disabled) }; })()`,
+        );
+        record('更新中显示进度与取消', runningDom.hidden === false && runningDom.width === '42%' && runningDom.cancel === true, JSON.stringify({ width: runningDom.width, cancel: runningDom.cancel }));
+        record('更新中禁用安装按钮', runningDom.disabled === true && runningDom.cardsDisabled === true);
+
+        // 离线自包含版：锁定更新
+        const lockedFixture = {
+          ...controller.getState().kernel,
+          locked: { kind: 'offline', reason: '离线自包含版内置 dsh，内核随离线包提供' },
+        };
+        await win.webContents.executeJavaScript(
+          `window.render(${JSON.stringify({ ...controller.getState(), kernel: lockedFixture, kernelAction: null })}); true;`,
+        );
+        const lockedDom = await win.webContents.executeJavaScript(
+          `(() => ({ banner: document.getElementById('kernelBanner').textContent, hidden: document.getElementById('kernelBanner').hidden, disabled: Array.from(document.querySelectorAll('#kernelList button[data-action="kernel-install"]')).every((b) => b.disabled) }))()`,
+        );
+        record('离线版显示停用说明并禁用按钮', lockedDom.hidden === false && /停用/.test(lockedDom.banner) && lockedDom.disabled === true, lockedDom.banner.slice(0, 40));
+
+        // 缺 dsh 时的入口：按版本安装
+        const missingEntry = await win.webContents.executeJavaScript(
+          `(() => { const b = document.querySelector('.panel[data-phase="missing-dsh"] button[data-action="kernel-tab"]'); return Boolean(b); })()`,
+        );
+        record('未安装 dsh 时提供“按版本安装”入口', missingEntry === true);
+
+        await win.webContents.executeJavaScript('window.switchTab("dsh"); true;');
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        record('切回 DSH tab 恢复阶段面板', await win.webContents.executeJavaScript('document.querySelector(".panel[data-phase].active") !== null || document.querySelector(".panel-market").classList.contains("active") === false'));
+      } finally {
+        controller.runFetchKernel = originals.fetchKernel;
+        controller.runInstall = originals.install;
+        controller.start = originals.start;
+        controller.stop = originals.stop;
+        controller.pnpmAttempted = originals.pnpmAttempted;
+        controller.kernelAction = null;
+        await win.webContents.executeJavaScript('window.switchTab("dsh"); true;').catch(() => {});
+      }
+    }
+
     console.log('5. 顶部 tab 与插件市场');
     const tabs = await win.webContents.executeJavaScript(
       'Array.from(document.querySelectorAll(".tab[data-tab]")).map((t) => t.dataset.tab)',
     );
-    record('顶部有两个大 tab', tabs.join(',') === 'dsh,market', tabs.join(','));
+    record('顶部有三个大 tab（运行信息 / 内核 / 市场）', tabs.join(',') === 'dsh,kernel,market', tabs.join(','));
     const initialPanels = await win.webContents.executeJavaScript(
       '({ dsh: document.querySelector(".panel[data-phase].active")?.dataset.phase ?? null, market: document.querySelector(".panel-market").classList.contains("active") })',
     );
@@ -1248,6 +1485,8 @@ async function runUiCapture() {
 
   const base = controller.getState();
   const samples = captureSamples(base.detection);
+  const runningSampleState = (samples.find((sample) => sample.state.phase === 'running')?.state) ?? { phase: 'running', statusText: 'DSH 已启动' };
+  const runningForCaptureInit = { hostname: base.hostname, ...runningSampleState };
   for (const sample of samples) {
     const state = { hostname: base.hostname, ...sample.state };
     await win.webContents.executeJavaScript(
@@ -1400,6 +1639,66 @@ async function runUiCapture() {
     console.log(`captured ${target} (${image.getSize().width}x${image.getSize().height})`);
   }
 
+  // dsh core (内核): the version list needs a fixture — a capture run must not
+  // depend on the network or on what happens to be installed.
+  {
+    captureFreeze = true;
+    await win.webContents.executeJavaScript(
+      'window.scrollTo(0, 0); document.querySelectorAll("*").forEach((node) => { if (node.scrollTop) node.scrollTop = 0; }); true;',
+    );
+    await win.webContents.executeJavaScript(
+      `window.render({ ...${JSON.stringify(runningForCaptureInit)} }); window.kernelCaptureSkipFetch = true; window.switchTab('kernel'); true;`,
+    );
+    const kernelFixture = {
+      loaded: true,
+      loading: false,
+      error: null,
+      notes: [],
+      fetchedAt: Date.now(),
+      version: '0.1.5-rc.3',
+      includePre: false,
+      runtime: { command: '/Users/me/.nvm/versions/node/v24.21.0/bin/dsh', version: '0.1.5-rc.3', private: false, bundled: false, home: '/Users/me/.dsh', profile: 'web' },
+      recommendation: { status: 'update', target: '0.1.7-rc.2', reason: '有新的发布版本 0.1.7-rc.2（当前 0.1.5-rc.3）' },
+      rows: [
+        { version: '0.2.0-rc.2', type: 'rc', sources: ['npm', 'git'], publishedAt: '2026-09-29T09:56:27.792Z', tags: ['next'], gitTag: 'dsh-v0.2.0-rc.2', releaseUrl: 'https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.0-rc.2', notes: '✨ 新增功能\n· 启用定时任务后，可创建和管理提醒、查看运行记录。\n\n### 🐛 问题修复\n· 修复若干桌面端问题。', installable: true, relation: 'newer', recommended: false },
+        { version: '0.1.7-rc.2', type: 'rc', sources: ['npm', 'git'], publishedAt: '2026-09-24T14:18:11.337Z', tags: ['latest'], gitTag: 'dsh-v0.1.7-rc.2', releaseUrl: 'https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.2', notes: '✨ 新增功能\n· 快捷键中心：查看、搜索、自定义与恢复。\n\n### 🐛 问题修复\n· 修复计划审阅在切换会话后无法打开的问题。', installable: true, relation: 'newer', recommended: true },
+        { version: '0.1.5-rc.3', type: 'rc', sources: ['npm', 'git'], publishedAt: '2026-09-10T08:12:00.000Z', tags: [], gitTag: 'dsh-v0.1.5-rc.3', releaseUrl: null, notes: '', installable: true, relation: 'same', recommended: false },
+        { version: '0.1.3-alpha.2', type: 'alpha', sources: ['git'], publishedAt: '2026-08-20T03:00:00.000Z', tags: [], gitTag: 'dsh-v0.1.3-alpha.2', releaseUrl: null, notes: '', installable: false, relation: 'older', recommended: false },
+      ],
+      hidden: 13,
+      typeCounts: { rc: 18 },
+      highlights: {
+        latest: '0.1.7-rc.2',
+        next: '0.2.0-rc.2',
+        alpha: '0.1.7-alpha.2',
+        latestRow: { version: '0.1.7-rc.2', type: 'rc', publishedAt: '2026-09-24T14:18:11.337Z', installable: true },
+        nextRow: { version: '0.2.0-rc.2', type: 'rc', publishedAt: '2026-09-29T09:56:27.792Z', installable: true },
+      },
+      sources: { npm: true, git: true },
+      locked: null,
+    };
+    await win.webContents.executeJavaScript(
+      `window.kernelCaptureSkipFetch = true; window.render({ ...${JSON.stringify(runningForCaptureInit)}, kernel: ${JSON.stringify(kernelFixture)} }); window.openMenu(false); window.scrollTo(0, 0); document.querySelectorAll("*").forEach((node) => { if (node.scrollTop) node.scrollTop = 0; }); true;`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const image = await win.webContents.capturePage();
+    const target = path.join(outDir, '13-kernel.png');
+    fs.writeFileSync(target, image.toPNG());
+    console.log(`captured ${target} (${image.getSize().width}x${image.getSize().height})`);
+
+    // And the "更新中" banner of the same tab.
+    await win.webContents.executeJavaScript(
+      `window.kernelCaptureSkipFetch = true; window.render({ ...${JSON.stringify(runningForCaptureInit)}, kernel: ${JSON.stringify(kernelFixture)},
+         kernelAction: { running: true, version: '0.1.7-rc.2', from: '0.1.5-rc.3', step: '正在安装 @deepseek-ai/dsh@0.1.7-rc.2', percent: 46, ok: null, error: null, startedAt: Date.now() } }); true;`,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const busyImage = await win.webContents.capturePage();
+    const busyTarget = path.join(outDir, '14-kernel-updating.png');
+    fs.writeFileSync(busyTarget, busyImage.toPNG());
+    console.log(`captured ${busyTarget} (${busyImage.getSize().width}x${busyImage.getSize().height})`);
+    await win.webContents.executeJavaScript('window.switchTab("dsh"); window.render(%s); true;'.replace('%s', JSON.stringify(runningForCaptureInit)));
+  }
+
   // Self-update: the bar only exists while something is pending, so it gets its
   // own capture (menu open, so the update entry is visible next to it).
   {
@@ -1446,6 +1745,7 @@ async function runUiCapture() {
 
 function wireController() {
   controller.on('state', (state) => {
+    if (captureFreeze) return;
     if (win && !win.isDestroyed()) win.webContents.send('dsh:state', state);
     syncGuiView(state);
   });

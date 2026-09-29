@@ -211,6 +211,57 @@ if (liveMarket.ok) {
   }
 }
 
+// --- dsh 内核：官方 npm + git 版本目录 ---
+{
+  const kernel = require('../src/main/kernel.js');
+  const { resolveShellEnv } = require('../src/main/shell-env.js');
+  console.log('\n[dsh 内核] 官方版本目录（npm + GitHub）');
+
+  const result = await kernel.fetchKernelCatalog({});
+  check('版本目录可获取（npm 必需 / git 可选）', result.ok === true, result.ok ? `git ${result.sources?.git ? 'ok' : '不可用'}` : result.error);
+  if (result.ok) {
+    const { catalog } = result;
+    const tags = catalog.distTags;
+    check('dist-tags 含 latest', kernel.isKernelVersion(tags.latest), JSON.stringify(tags));
+    const latestRow = catalog.versions.find((row) => row.version === tags.latest);
+    check('latest 对应可安装的 npm 版本', latestRow?.installable === true, `${tags.latest} sources=${latestRow?.sources?.join('+')}`);
+    check('目录同时含 npm 与 git 来源', catalog.versions.some((row) => row.sources.includes('npm')) && catalog.versions.some((row) => row.sources.includes('git')));
+    check(
+      'dsh 以 RC/Alpha 预发布为主（列表按发布/RC 筛选即可用）',
+      catalog.versions.filter((row) => row.type === 'rc').length >= 3,
+      `rc=${catalog.versions.filter((r) => r.type === 'rc').length} alpha=${catalog.versions.filter((r) => r.type === 'alpha').length} release=${catalog.versions.filter((r) => r.type === 'release').length}`,
+    );
+    check('git 发布说明可解析出中文摘要', catalog.versions.some((row) => /[\u4e00-\u9fa5]/.test(row.notes ?? '')));
+    check(
+      '安装命令落在官方 npm 包上',
+      kernel.buildKernelInstallArgs({ version: tags.latest }).join(' ') === `install -g @deepseek-ai/dsh@${tags.latest}`,
+    );
+
+    // 与这台机器上真实存在的 dsh 交叉验证：它必须能被这套版本规则识别。
+    try {
+      const resolved = await resolveShellEnv();
+      const found = findExecutable('dsh', resolved.env);
+      if (found) {
+        const version = await runCapture(found, ['--version'], { env: resolved.env, timeoutMs: 60_000 });
+        const raw = `${version.stdout ?? ''}${version.stderr ?? ''}`.trim().split('\n').filter(Boolean)[0] ?? '';
+        const detected = (raw.match(/\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?/) ?? [null])[0];
+        check('本机 dsh 版本可被内核目录规则识别', kernel.isKernelVersion(detected), `${found} → ${raw}`);
+        const view = kernel.kernelRows({ installed: detected, catalog });
+        console.log(`    · 本机 dsh ${detected}；${view.recommendation.reason}`);
+        check(
+          '本机版本出现在目录或比目录更新',
+          view.rows.some((row) => row.version === detected) || view.recommendation.status === 'current',
+          view.recommendation.status,
+        );
+      } else {
+        console.log('    （跳过本机 dsh 交叉验证：未找到 dsh）');
+      }
+    } catch (error) {
+      console.log(`    （跳过本机 dsh 交叉验证：${error instanceof Error ? error.message : String(error)}）`);
+    }
+  }
+}
+
 console.log(`\n${'─'.repeat(58)}`);
 console.log(`通过 ${passed} 项，失败 ${failed} 项`);
 console.log(`（回退版本常量：${FALLBACK_NODE_VERSION}，仅在版本索引不可达时使用）`);

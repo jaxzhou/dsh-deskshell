@@ -106,8 +106,10 @@ if (asset.kind === 'zip') {
     // The published bundle must actually contain this feature, not just the version.
     const asar = readFileSync(path.join(appBundle, 'Contents', 'Resources', 'app.asar'));
     check(
-      '包内 app.asar 含自更新模块',
-      asar.includes(Buffer.from('update-manager.js')) && asar.includes(Buffer.from('updater.js')),
+      '包内 app.asar 含自更新与内核模块',
+      asar.includes(Buffer.from('update-manager.js')) &&
+        asar.includes(Buffer.from('updater.js')) &&
+        asar.includes(Buffer.from('kernel.js')),
       `asar ${(asar.length / 1024 / 1024).toFixed(1)} MB`,
     );
     check(

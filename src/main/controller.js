@@ -40,6 +40,7 @@ const {
   runPluginCommand,
 } = require('./plugin-market');
 const { applyOfflineEnv } = require('./offline');
+const { fetchKernelCatalog, isKernelVersion, kernelRows } = require('./kernel');
 const { resolveShellEnv } = require('./shell-env');
 
 /** How many log lines to keep for a freshly-mounted renderer. */
@@ -82,6 +83,24 @@ class ShellController extends EventEmitter {
     this.runReadInstalled = options.readInstalled ?? readInstalledPlugins;
     this.runEnsurePnpm = options.ensurePnpm ?? ensurePnpm;
     this.runPluginCommand = options.pluginCommand ?? runPluginCommand;
+    /**
+     * dsh core version catalog (npm registry + GitHub releases), injectable so
+     * the kernel flow runs against fixtures without touching the network.
+     */
+    this.runFetchKernel = options.fetchKernel ?? fetchKernelCatalog;
+    /** @type {object|null} merged catalog of published dsh versions. */
+    this.kernelCatalog = null;
+    this.kernelFetchedAt = null;
+    this.kernelLoading = false;
+    this.kernelError = null;
+    /** Source problems that did not stop the catalog (e.g. GitHub unreachable). */
+    this.kernelNotes = [];
+    /** Show alpha/nightly lines too? release + rc are shown by default. */
+    this.kernelIncludePre = options.kernelIncludePre === true;
+    /** @type {object|null} current dsh core install/update, surfaced to the UI. */
+    this.kernelAction = null;
+    /** @type {{cancel: () => void}|null} */
+    this.kernelHandle = null;
     /** @type {object|null} current plugin install/update, surfaced to the UI. */
     this.pluginAction = null;
     /**
@@ -171,6 +190,9 @@ class ShellController extends EventEmitter {
         ? { ...this.detection.pnpm, installing: this.pnpmInstalling, failedReason: this.pnpmError }
         : { available: false, version: null, command: null, error: '尚未检测', installing: this.pnpmInstalling, failedReason: this.pnpmError },
       pluginAction: this.pluginAction,
+      // dsh core ("内核"): what is installed, what is published, what can be done.
+      kernel: this.kernelView(),
+      kernelAction: this.kernelAction,
       logs: this.logs.slice(-LOG_REPLAY),
     };
   }
@@ -334,6 +356,313 @@ class ShellController extends EventEmitter {
 
     if (autostart) await this.start();
     return detection;
+  }
+
+  // ----------------------------------------------------------- dsh core (内核)
+
+  /** Why the core cannot be updated here, when it cannot. */
+  kernelLock() {
+    const runtime = this.describeDshRuntime();
+    if (this.offline?.enabled || runtime.bundled) {
+      return {
+        kind: 'offline',
+        reason: '离线自包含版内置 dsh，内核随离线包提供；请用常规版更新，或手动替换离线包',
+      };
+    }
+    return null;
+  }
+
+  /**
+   * The kernel panel's view model, derived on demand.
+   *
+   * Building it inside the snapshot keeps it in step with detection and with the
+   * offline flags without an explicit "recompute" call anywhere: the cached
+   * catalog is re-filtered against whatever version is installed right now.
+   */
+  kernelView() {
+    const runtime = this.describeDshRuntime();
+    const base = {
+      loaded: Boolean(this.kernelCatalog),
+      loading: this.kernelLoading,
+      error: this.kernelError,
+      notes: this.kernelNotes,
+      fetchedAt: this.kernelFetchedAt,
+      version: runtime.version ?? null,
+      runtime,
+      locked: this.kernelLock(),
+      includePre: this.kernelIncludePre,
+    };
+    if (!this.kernelCatalog) {
+      return {
+        ...base,
+        rows: [],
+        hidden: 0,
+        typeCounts: {},
+        distTags: {},
+        highlights: {},
+        recommendation: { status: 'unknown', target: null, reason: '尚未获取版本目录' },
+        sources: { npm: false, git: false },
+      };
+    }
+    const rows = kernelRows({
+      installed: runtime.version ?? null,
+      catalog: this.kernelCatalog,
+      includePre: this.kernelIncludePre,
+    });
+    return {
+      ...base,
+      ...rows,
+      sources: { npm: Boolean(this.kernelCatalog.npm), git: this.kernelCatalog.gitCount > 0 },
+    };
+  }
+
+  /**
+   * Fetch the published dsh versions (npm + git), or just re-filter the cache.
+   *
+   * @param {{refresh?: boolean, includePre?: boolean, signal?: AbortSignal}} [options]
+   */
+  async loadKernel(options = {}) {
+    if (typeof options.includePre === 'boolean') this.kernelIncludePre = options.includePre;
+    if (options.refresh !== true && this.kernelCatalog) {
+      this.broadcast();
+      return { ok: true, kernel: this.kernelView() };
+    }
+
+    this.kernelLoading = true;
+    this.kernelError = null;
+    this.broadcast();
+
+    let result;
+    try {
+      result = await this.runFetchKernel({ signal: options.signal });
+    } catch (error) {
+      result = { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+    this.kernelLoading = false;
+
+    if (!result?.ok) {
+      this.kernelError = result?.error ?? '无法获取 dsh 版本目录';
+      this.kernelNotes = result?.errors ?? [];
+      this.pushLog({ stream: 'stderr', line: `dsh 内核目录获取失败：${this.kernelError}` });
+      this.broadcast();
+      return { ok: false, error: this.kernelError };
+    }
+
+    this.kernelCatalog = result.catalog;
+    this.kernelFetchedAt = result.fetchedAt ?? Date.now();
+    this.kernelNotes = result.errors ?? [];
+    this.kernelError = null;
+    const view = this.kernelView();
+    this.pushLog({
+      stream: 'system',
+      line: `dsh 内核目录已就绪：${view.rows.length} 个可选版本（当前 ${view.version ?? '未安装'}；${view.recommendation?.reason ?? ''}）`,
+    });
+    if (this.kernelNotes.length) {
+      this.pushLog({ stream: 'system', line: `部分来源不可用：${this.kernelNotes.join('；')}` });
+    }
+    this.broadcast();
+    return { ok: true, kernel: view };
+  }
+
+  /**
+   * Install a published dsh version, then restart the Harness on it.
+   *
+   * The version comes from the catalog (npm registry / GitHub releases) and is
+   * installed with the very same npm that dsh is detected through, so a private
+   * (shell-provisioned) runtime and a system install both work — and a globally
+   * unwritable prefix fails with npm's own message rather than a half-install.
+   *
+   * @param {{version: string}} options
+   */
+  async installKernel(options = {}) {
+    const version = String(options.version ?? '').trim();
+    if (this.kernelAction?.running) return { ok: false, error: '已有内核操作正在进行' };
+    if (this.installHandle) return { ok: false, error: '正在安装 dsh，请稍候' };
+    if (!isKernelVersion(version)) {
+      return { ok: false, error: `不支持的 dsh 版本：${version || '(空)'}` };
+    }
+    const lock = this.kernelLock();
+    if (lock) {
+      this.pushLog({ stream: 'stderr', line: `无法更新 dsh 内核：${lock.reason}` });
+      return { ok: false, error: lock.reason, locked: true };
+    }
+
+    const detection = this.detection ?? (await this.check({ autostart: false }));
+    if (!detection?.npm?.available) {
+      const error = 'npm 不可用，无法更新 dsh 内核';
+      this.pushLog({ stream: 'stderr', line: error });
+      return { ok: false, error };
+    }
+    // With no dsh at all this doubles as a version-pinned first install.
+    const runtime = this.describeDshRuntime();
+    const from = runtime.version ?? null;
+    const started = Date.now();
+    this.error = null;
+    this.kernelAction = {
+      running: true,
+      version,
+      from,
+      step: `准备安装 @deepseek-ai/dsh@${version}`,
+      ok: null,
+      error: null,
+      hint: null,
+      percent: 0,
+      command: detection.npm.command,
+      startedAt: started,
+    };
+    // The shared install progress drives both this tab and the DSH tab panel.
+    this.installSnapshot = {
+      percent: 0,
+      phase: `准备安装 dsh ${version}`,
+      detail: '',
+      fetched: 0,
+      packages: 0,
+      done: false,
+      failed: false,
+    };
+    this.setPhase('installing', `正在把 dsh 内核更新到 ${version}…`);
+    this.broadcast();
+
+    // Stop the running Harness first: npm is about to replace the very files it
+    // is executing from.
+    if (this.server?.running) {
+      this.pushLog({ stream: 'system', line: '正在停止 dsh 以便替换内核文件…' });
+      await this.stop().catch(() => {});
+    }
+
+    const handle = this.runInstall({
+      npmCommand: detection.npm.command,
+      env: this.env,
+      cwd: this.cwd,
+      version,
+      onLog: (entry) => this.pushLog(entry),
+      onProgress: (snapshot) => {
+        this.installSnapshot = snapshot;
+        if (this.kernelAction) this.kernelAction = { ...this.kernelAction, percent: snapshot.percent ?? null };
+        this.scheduleBroadcast();
+      },
+    });
+    this.installHandle = handle;
+    this.kernelHandle = handle;
+
+    let result;
+    try {
+      result = await handle.promise;
+    } catch (error) {
+      result = { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+    this.installHandle = null;
+    this.kernelHandle = null;
+    this.installSnapshot = {
+      ...(this.installSnapshot ?? { percent: 0, phase: '安装完成', detail: '' }),
+      ...(result.ok ? { percent: 100, phase: '安装完成' } : result.cancelled ? { phase: '已取消' } : { phase: '安装失败' }),
+      done: Boolean(result.ok),
+      failed: !result.ok && !result.cancelled,
+    };
+
+    /** Bring the Harness back on whatever is installed now (old or new). */
+    const recover = async () => {
+      this.env = null; // a new binary may sit in a different directory
+      try {
+        await this.check({ autostart: true });
+      } catch (error) {
+        this.pushLog({
+          stream: 'stderr',
+          line: `内核操作后重新检测/启动失败：${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+    };
+
+    if (result.cancelled) {
+      this.kernelAction = {
+        running: false,
+        version,
+        from,
+        step: '已取消',
+        ok: false,
+        cancelled: true,
+        error: '已取消',
+        hint: null,
+        percent: this.installSnapshot.percent ?? 0,
+        startedAt: started,
+        finishedAt: Date.now(),
+      };
+      this.pushLog({ stream: 'system', line: `已取消 dsh 内核安装：${version}` });
+      await recover();
+      this.broadcast();
+      return { ok: false, cancelled: true };
+    }
+
+    if (!result.ok) {
+      const output = String(result.output ?? '');
+      const permission = /EACCES|EPERM|permission denied/i.test(output);
+      const message = `dsh 内核更新失败（npm 退出码 ${result.code ?? '未知'}）`;
+      const hint = permission
+        ? 'npm 的全局目录不可写。可改为让外壳自动配置运行时（“DSH 运行信息”里的自动配置），或以管理员权限手动执行安装命令。'
+        : result.hint ?? '请查看日志中的 npm 输出了解详情。';
+      this.kernelAction = {
+        running: false,
+        version,
+        from,
+        step: '更新失败',
+        ok: false,
+        error: message,
+        hint,
+        output: output.trim().split('\n').slice(-4).join('\n'),
+        percent: this.installSnapshot.percent ?? 0,
+        startedAt: started,
+        finishedAt: Date.now(),
+      };
+      this.pushLog({ stream: 'stderr', line: `${message} — ${hint}` });
+      // The previous version is usually still installed: restart it.
+      await recover();
+      this.broadcast();
+      return { ok: false, error: message, hint };
+    }
+
+    this.pushLog({ stream: 'system', line: `@deepseek-ai/dsh@${version} 安装完成，正在重新检测并启动…` });
+    this.kernelAction = {
+      ...this.kernelAction,
+      running: true,
+      step: `已安装 ${version}，正在重启 dsh`,
+      percent: 100,
+    };
+    this.broadcast();
+
+    await recover();
+
+    const after = this.describeDshRuntime();
+    const moved = Boolean(runtime.command && after.command && runtime.command !== after.command);
+    this.kernelAction = {
+      running: false,
+      version,
+      from,
+      installedVersion: after.version ?? null,
+      step: '完成',
+      ok: true,
+      error: null,
+      hint: moved ? `dsh 现在位于 ${after.command}（之前是 ${runtime.command}）` : null,
+      movedCommand: moved,
+      percent: 100,
+      startedAt: started,
+      finishedAt: Date.now(),
+    };
+    this.pushLog({
+      stream: 'system',
+      line: `dsh 内核已更新：${from ?? '未安装'} → ${after.version ?? version}` +
+        (moved ? `（可执行文件变为 ${after.command}）` : '') + '，界面已刷新',
+    });
+    this.broadcast();
+    return { ok: true, version: after.version ?? version, command: after.command, moved };
+  }
+
+  /** Cancel an in-flight core install. */
+  cancelKernelAction() {
+    if (!this.kernelHandle) return false;
+    this.pushLog({ stream: 'system', line: '用户取消了 dsh 内核安装' });
+    this.kernelHandle.cancel();
+    this.broadcast();
+    return true;
   }
 
   // ------------------------------------------------------------ plugin market

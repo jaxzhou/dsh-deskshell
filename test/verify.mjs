@@ -1933,6 +1933,268 @@ section('18. 外壳自更新 (updater / update-manager)');
   rmSync(hashDir, { recursive: true, force: true });
 }
 
+section('19. dsh 内核版本目录 (kernel)');
+{
+  const kernel = require('../src/main/kernel.js');
+
+  // --- 版本分类：dsh 官方只发布 rc/alpha，rc 为主线 ---
+  check('正式版识别', kernel.classifyVersion('0.2.0') === 'release');
+  check('RC 识别', kernel.classifyVersion('0.1.7-rc.2') === 'rc');
+  check('Alpha 识别', kernel.classifyVersion('0.1.7-alpha.2') === 'alpha');
+  check('其他预发布识别', kernel.classifyVersion('0.2.0-beta.1') === 'prerelease');
+  check('非版本字符串被拒绝', kernel.classifyVersion('latest') === null && kernel.classifyVersion('1.2') === null);
+  check('可安装版本白名单', kernel.isKernelVersion('0.1.7-rc.2') === true && kernel.isKernelVersion('0.1.7; rm -rf /') === false);
+  check(
+    'git 标签解析为版本',
+    kernel.versionFromTag('dsh-v0.2.0-rc.2') === '0.2.0-rc.2' && kernel.versionFromTag('v0.1.7') === '0.1.7' && kernel.versionFromTag('nightly') === null,
+  );
+
+  // --- npm 元数据 ---
+  const registry = {
+    name: '@deepseek-ai/dsh',
+    'dist-tags': { latest: '0.1.7-rc.2', next: '0.2.0-rc.2', alpha: '0.1.7-alpha.2', broken: 'not-a-version' },
+    time: { '0.1.7-rc.2': '2026-09-24T14:18:11.337Z', '0.2.0-rc.2': '2026-09-29T09:56:27.792Z', modified: '2026-09-29T09:56:27.792Z' },
+    versions: {
+      '0.1.7-rc.2': { dist: { tarball: 'https://registry.npmjs.org/@deepseek-ai/dsh/-/dsh-0.1.7-rc.2.tgz' } },
+      '0.2.0-rc.2': {},
+      '0.1.5-rc.3': {},
+      '0.1.7-alpha.2': {},
+      'not-a-version': {},
+    },
+  };
+  const npmMeta = kernel.parseRegistryMeta(JSON.stringify(registry));
+  check('解析 dist-tags 并丢弃非法标签', npmMeta.distTags.latest === '0.1.7-rc.2' && !npmMeta.distTags.broken, JSON.stringify(npmMeta.distTags));
+  check('解析版本列表（非法项被丢弃）', npmMeta.versions.length === 4, String(npmMeta.versions.length));
+  check('版本按新→旧排序', npmMeta.versions[0].version === '0.2.0-rc.2' && npmMeta.versions.at(-1).version === '0.1.5-rc.3');
+  check('带上发布时间', npmMeta.versions[0].publishedAt === '2026-09-29T09:56:27.792Z', String(npmMeta.versions[0].publishedAt));
+  let registryThrew = false;
+  try {
+    kernel.parseRegistryMeta('{}');
+  } catch {
+    registryThrew = true;
+  }
+  check('没有版本的 npm 元数据被拒绝', registryThrew === true);
+
+  // --- git 发布 ---
+  const releases = [
+    {
+      tag_name: 'dsh-v0.1.7-rc.2',
+      name: 'v0.1.7-rc.2',
+      prerelease: true,
+      published_at: '2026-09-24T14:00:00Z',
+      html_url: 'https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.1.7-rc.2',
+      body: '[中文](#cn) | [English](#en)\r\n\r\n<h3 id="cn">✨ 新增功能</h3>\r\n\r\n- 快捷键中心：查看、搜索、自定义与恢复。\r\n- 文件页支持用本地应用打开。\r\n\r\n<h3 id="en">New Features</h3>\r\n\r\n- Shortcut centre.',
+    },
+    { tag_name: 'not-a-release', name: 'x', body: '' },
+  ];
+  const gitRows = kernel.parseGitReleases(JSON.stringify(releases));
+  check('解析 git 发布并丢弃非版本标签', gitRows.length === 1 && gitRows[0].version === '0.1.7-rc.2', JSON.stringify(gitRows.map((r) => r.version)));
+  check(
+    '发布说明只取中文段落',
+    gitRows[0].notes.includes('快捷键中心') && !gitRows[0].notes.includes('Shortcut centre') && !gitRows[0].notes.includes('<h3'),
+    JSON.stringify(gitRows[0].notes),
+  );
+  let gitThrew = false;
+  try {
+    kernel.parseGitReleases(JSON.stringify({ message: 'API rate limit exceeded' }));
+  } catch (error) {
+    gitThrew = /rate limit/.test(error.message);
+  }
+  check('GitHub 限流给出可读错误', gitThrew === true);
+
+  // --- 合并与筛选 ---
+  const catalog = kernel.mergeCatalog({ npm: npmMeta, git: gitRows });
+  check('合并后版本数为并集', catalog.versions.length === 4, String(catalog.versions.length));
+  const rc = catalog.versions.find((row) => row.version === '0.1.7-rc.2');
+  check('同一版本标注两个来源', rc.sources.includes('npm') && rc.sources.includes('git'), JSON.stringify(rc.sources));
+  check('dist-tag 落到对应版本行', rc.tags.join(',') === 'latest', JSON.stringify(rc.tags));
+  check('npm 与 git 的发布时间互补', Boolean(rc.publishedAt) && Boolean(rc.gitTag), `${rc.publishedAt} / ${rc.gitTag}`);
+  const gitOnly = kernel.mergeCatalog({ npm: npmMeta, git: [{ version: '0.1.3-alpha.1', tag: 'dsh-v0.1.3-alpha.1', notes: 'x', url: 'u', publishedAt: null }] });
+  const alphaOnly = gitOnly.versions.find((row) => row.version === '0.1.3-alpha.1');
+  check('仅 git 有的版本标注不可安装', alphaOnly.installable === false && alphaOnly.sources.join() === 'git');
+  const primary = kernel.filterCatalog(catalog, { includePre: false });
+  check('默认只显示正式版与 RC', primary.versions.every((row) => ['release', 'rc'].includes(row.type)) && primary.versions.length === 3, String(primary.versions.length));
+  const withPre = kernel.filterCatalog(catalog, { includePre: true });
+  check('可展开显示 Alpha 等预发布', withPre.versions.length === 4 && withPre.hidden === 0);
+  check('默认视图记录被折叠的数量', primary.hidden === 1, String(primary.hidden));
+
+  // --- 推荐策略：以发布版本/RC 为主线 ---
+  const tags = npmMeta.distTags;
+  check('落后于发布线 → 建议更新', kernel.recommendUpdate({ installed: '0.1.5-rc.3', distTags: tags }).status === 'update');
+  check('已跟上发布线 → 提示预览版本', kernel.recommendUpdate({ installed: '0.1.7-rc.2', distTags: tags }).status === 'preview');
+  check('已在预览线 → 视为最新', kernel.recommendUpdate({ installed: '0.2.0-rc.2', distTags: tags }).status === 'current');
+  check('未安装时给出可选目标', kernel.recommendUpdate({ installed: null, distTags: tags }).status === 'unknown');
+  const rows = kernel.kernelRows({ installed: '0.1.5-rc.3', catalog });
+  check('行关系标注正确', rows.rows.find((r) => r.version === '0.1.5-rc.3').relation === 'same' && rows.rows[0].relation === 'newer');
+  check('推荐目标被标记', rows.rows.find((r) => r.recommended)?.version === '0.1.7-rc.2');
+  check('高亮 latest/next 均带行数据', rows.highlights.latestRow.version === '0.1.7-rc.2' && rows.highlights.nextRow.version === '0.2.0-rc.2');
+  check('安装参数只接受白名单版本', kernel.buildKernelInstallArgs({ version: '0.1.7-rc.2' }).join(' ') === 'install -g @deepseek-ai/dsh@0.1.7-rc.2');
+  let argsThrew = false;
+  try {
+    kernel.buildKernelInstallArgs({ version: '0.1.7 && whoami' });
+  } catch {
+    argsThrew = true;
+  }
+  check('注入式版本号被拒绝', argsThrew === true);
+
+  // --- 抓取：npm 必需，git 可选 ---
+  const okFetch = async (url) => (url.includes('registry') ? JSON.stringify(registry) : JSON.stringify(releases));
+  const live = await kernel.fetchKernelCatalog({ fetchText: okFetch });
+  check('两个来源都成功', live.ok === true && live.sources.git === true && live.errors.length === 0, JSON.stringify(live.sources));
+  const gitDown = await kernel.fetchKernelCatalog({ fetchText: async (url) => { if (url.includes('registry')) return JSON.stringify(registry); throw new Error('HTTP 403'); } });
+  check('git 不可用时仍返回 npm 目录', gitDown.ok === true && gitDown.catalog.versions.length === 4 && gitDown.errors.length === 1, gitDown.errors.join('；'));
+  const npmDown = await kernel.fetchKernelCatalog({ fetchText: async () => { throw new Error('ENOTFOUND'); } });
+  check('npm 不可用时整体失败并说明原因', npmDown.ok === false && /ENOTFOUND/.test(npmDown.error), npmDown.error);
+}
+
+section('20. 内核更新流程 (controller，注入协作者)');
+{
+  const { ShellController } = require('../src/main/controller.js');
+  const kernel = require('../src/main/kernel.js');
+
+  const registryPayload = {
+    'dist-tags': { latest: '0.1.7-rc.2', next: '0.2.0-rc.2' },
+    time: {},
+    versions: { '0.1.5-rc.3': {}, '0.1.7-rc.2': {}, '0.2.0-rc.2': {} },
+  };
+  const fixtureCatalog = kernel.mergeCatalog({
+    npm: kernel.parseRegistryMeta(JSON.stringify(registryPayload)),
+    git: [],
+  });
+
+  /** A controller whose detection flips after a "successful" install. */
+  function makeController(options = {}) {
+    let installedVersion = options.installed ?? '0.1.5-rc.3';
+    const calls = { installs: [], restarts: 0, fetch: 0 };
+    const controller = new ShellController({
+      detect: async () => ({
+        node: { available: true, version: 'v24.21.0', command: '/usr/bin/node' },
+        npm: { available: true, version: '11.19.0', command: '/usr/bin/npm' },
+        pnpm: { available: true, version: '12.6.0', command: '/usr/bin/pnpm' },
+        dsh: {
+          installed: true,
+          version: installedVersion,
+          command: `/usr/local/bin/dsh`,
+          error: null,
+        },
+      }),
+      install: (request) => {
+        calls.installs.push(request.version ?? null);
+        return {
+          promise: Promise.resolve(options.installResult ?? { ok: true, code: 0, output: '' }).then((result) => {
+            if (result.ok && request.version) installedVersion = request.version;
+            return result;
+          }),
+          cancel: () => {},
+        };
+      },
+      provisionRuntime: async () => null,
+      fetchKernel: async () => {
+        calls.fetch += 1;
+        return { ok: true, catalog: fixtureCatalog, errors: [], fetchedAt: Date.now() };
+      },
+      startDelayMs: 0,
+    });
+    // Never actually spawn a dsh server in this test.
+    controller.start = async () => {
+      calls.restarts += 1;
+      controller.server = { running: true, startedAt: Date.now() };
+      controller.serverUrl = 'http://127.0.0.1:1/?token=t';
+      controller.setPhase('running', 'DSH 已启动');
+      controller.broadcast();
+      return controller.getState();
+    };
+    controller.stop = async () => {
+      controller.server = null;
+      controller.serverUrl = null;
+      return controller.getState();
+    };
+    return { controller, calls };
+  }
+
+  const { controller, calls } = makeController();
+  await controller.check({ autostart: false });
+  check('检测到已安装版本', controller.getState().kernel.version === '0.1.5-rc.3', String(controller.getState().kernel.version));
+  check('未加载目录时视图为空', controller.getState().kernel.loaded === false);
+
+  const loaded = await controller.loadKernel();
+  check('加载内核目录', loaded.ok === true && calls.fetch === 1, String(calls.fetch));
+  const view = controller.getState().kernel;
+  check('视图给出可更新建议', view.recommendation.status === 'update' && view.recommendation.target === '0.1.7-rc.2', view.recommendation.reason);
+  check('视图列出可选版本', view.rows.length === 3, String(view.rows.length));
+  check('缓存后再次加载不再抓取', (await controller.loadKernel()).ok === true && calls.fetch === 1, String(calls.fetch));
+  const filtered = await controller.loadKernel({ includePre: true });
+  check('切换预发布筛选不重新抓取', filtered.ok === true && calls.fetch === 1 && controller.getState().kernel.includePre === true);
+  await controller.loadKernel({ includePre: false });
+
+  // 非法版本不会触达 npm
+  const badVersion = await controller.installKernel({ version: '0.1.7-rc.2; rm -rf /' });
+  check('非法版本被拒绝（未调用 npm）', badVersion.ok === false && calls.installs.length === 0, badVersion.error);
+
+  // 正常运行中升级
+  await controller.start();
+  const result = await controller.installKernel({ version: '0.1.7-rc.2' });
+  check('更新成功', result.ok === true && result.version === '0.1.7-rc.2', JSON.stringify(result));
+  check('npm 收到指定版本', calls.installs.join() === '0.1.7-rc.2', calls.installs.join());
+  check('更新后重启了 dsh', calls.restarts >= 2, String(calls.restarts));
+  const after = controller.getState();
+  check('状态里的内核版本已刷新', after.kernel.version === '0.1.7-rc.2' && after.kernel.recommendation.status === 'preview', `${after.kernel.version}/${after.kernel.recommendation.status}`);
+  check('kernelAction 记录成功与版本变化', after.kernelAction.ok === true && after.kernelAction.from === '0.1.5-rc.3' && after.kernelAction.installedVersion === '0.1.7-rc.2', JSON.stringify(after.kernelAction));
+  check('更新日志可读', after.logs.some((line) => /dsh 内核已更新：0\.1\.5-rc\.3 → 0\.1\.7-rc\.2/.test(line.line)), '');
+
+  // 失败：恢复旧版本并给出权限提示
+  const failing = makeController({ installResult: { ok: false, code: 243, output: 'npm ERR! code EACCES\nnpm ERR! permission denied' } });
+  await failing.controller.check({ autostart: false });
+  await failing.controller.loadKernel();
+  const failed = await failing.controller.installKernel({ version: '0.1.7-rc.2' });
+  check('安装失败时返回错误', failed.ok === false, failed.error ?? '');
+  check('权限错误给出可执行提示', /全局目录不可写/.test(failed.hint ?? ''), failed.hint ?? '');
+  const failedState = failing.controller.getState();
+  check('失败后 kernelAction 记录原因', failedState.kernelAction.ok === false && /更新失败/.test(failedState.kernelAction.step), JSON.stringify(failedState.kernelAction.step));
+  check('失败后仍回到可运行状态（旧版本继续可用）', failedState.phase === 'running' && failedState.kernel.version === '0.1.5-rc.3', `${failedState.phase}/${failedState.kernel.version}`);
+
+  // 取消
+  const cancelling = makeController();
+  await cancelling.controller.check({ autostart: false });
+  await cancelling.controller.loadKernel();
+  cancelling.controller.runInstall = (request) => ({
+    promise: Promise.resolve({ ok: false, cancelled: true, output: '', code: null }).then((r) => {
+      cancelling.calls.installs.push(request.version ?? null);
+      return r;
+    }),
+    cancel: () => {},
+  });
+  const cancelled = await cancelling.controller.installKernel({ version: '0.2.0-rc.2' });
+  check('取消安装被如实上报', cancelled.ok === false && cancelled.cancelled === true, JSON.stringify(cancelled));
+  check('取消后状态回到运行', cancelling.controller.getState().phase === 'running', cancelling.controller.getState().phase);
+  check('取消后版本未变化', cancelling.controller.getState().kernel.version === '0.1.5-rc.3');
+
+  // 离线自包含版：锁定
+  const offline = makeController();
+  await offline.controller.check({ autostart: false });
+  await offline.controller.loadKernel();
+  offline.controller.offline = {
+    enabled: true,
+    vendor: { dir: '/opt/DSH-D Offline/resources/vendor', nodeBinDir: '/opt/vendor/node/bin', manifest: { dsh: '0.1.5-rc.3' } },
+    homeDir: '/tmp/home',
+    storeDir: null,
+  };
+  offline.controller.detection.dsh.command = '/opt/DSH-D Offline/resources/vendor/node/bin/dsh';
+  const lockedView = offline.controller.getState().kernel;
+  check('离线版标记内核更新为停用', lockedView.locked?.kind === 'offline', JSON.stringify(lockedView.locked));
+  const lockedInstall = await offline.controller.installKernel({ version: '0.1.7-rc.2' });
+  check('离线版拒绝更新内核', lockedInstall.ok === false && lockedInstall.locked === true, lockedInstall.error ?? '');
+  check('离线版未调用 npm', offline.calls.installs.length === 0, offline.calls.installs.join());
+
+  // 未安装 dsh 时，也能按版本完成首次安装
+  const fresh = makeController({ installed: null });
+  fresh.controller.detection = null;
+  await fresh.controller.check({ autostart: false });
+  await fresh.controller.loadKernel();
+  const freshResult = await fresh.controller.installKernel({ version: '0.1.7-rc.2' });
+  check('未安装 dsh 时可按指定版本安装', fresh.calls.installs.join() === '0.1.7-rc.2', fresh.calls.installs.join() || String(freshResult.error));
+}
+
 // --------------------------------------------------------------------- summary
 
 console.log(`\n${'─'.repeat(58)}`);

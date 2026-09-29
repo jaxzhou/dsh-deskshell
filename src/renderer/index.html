@@ -24,6 +24,10 @@
             <span class="tab-title">DSH 运行信息</span>
             <span class="tab-sub" id="tabDshSub">未启动</span>
           </button>
+          <button class="tab" id="tab-kernel" data-tab="kernel" role="tab" aria-selected="false" title="检测并切换 dsh 内核版本">
+            <span class="tab-title">dsh 内核</span>
+            <span class="tab-sub" id="tabKernelSub">未检测</span>
+          </button>
           <button class="tab" id="tab-market" data-tab="market" role="tab" aria-selected="false" title="外壳自带的插件市场">
             <span class="tab-title">插件市场</span>
             <span class="tab-sub" id="tabMarketSub">未加载</span>
@@ -155,6 +159,7 @@
 
             <div class="actions">
               <button class="btn btn-primary btn-lg" data-action="install">安装 dsh</button>
+              <button class="btn" data-action="kernel-tab">按版本安装…</button>
               <button class="btn" data-action="detect">重新检测</button>
             </div>
 
@@ -257,6 +262,46 @@
               <div class="local-list" id="localList"></div>
               <p class="muted small" id="profileHint"></p>
             </details>
+          </div>
+        </section>
+
+        <!-- dsh 内核：检测已装版本 + 从官方 npm/git 已发布版本里切换 -->
+        <section class="panel panel-kernel" data-kernel-panel="kernel">
+          <div class="market">
+            <header class="market-head">
+              <div class="market-title">
+                <h2>dsh 内核</h2>
+                <p class="muted small" id="kernelMeta">正在读取官方版本目录…</p>
+                <p class="muted small market-runtime" id="kernelRuntime"></p>
+              </div>
+              <div class="market-head-actions">
+                <button class="btn" data-action="kernel-refresh">重新读取目录</button>
+                <button class="btn" data-action="kernel-open-releases">官方发布页</button>
+              </div>
+            </header>
+
+            <div class="market-banner" id="kernelBanner" hidden></div>
+
+            <div class="kernel-highlights" id="kernelHighlights"></div>
+
+            <div class="kernel-toolbar">
+              <label class="kernel-toggle">
+                <input type="checkbox" id="kernelPreToggle" />
+                <span>显示 Alpha 等预发布版本</span>
+              </label>
+              <span class="muted small" id="kernelStats"></span>
+            </div>
+
+            <div class="kernel-list" id="kernelList">
+              <div class="market-placeholder">正在加载 dsh 版本目录…</div>
+            </div>
+
+            <p class="muted small kernel-foot">
+              版本来自 npm 官方包 <code>@deepseek-ai/dsh</code>（可安装）与 GitHub 官方发布
+              <code>deepseek-ai/deepseek-harness</code>（发布说明与标签）；dsh 目前只发布 RC 与 Alpha
+              预发布版本，因此列表以 <strong>RC 候选版</strong> 为主线。安装使用检测到的 npm，
+              完成后会自动重启 dsh 并刷新界面。
+            </p>
           </div>
         </section>
 

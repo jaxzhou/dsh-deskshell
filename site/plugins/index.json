@@ -9,13 +9,13 @@
     {
       "name": "dsh-file-explorer",
       "package": "@jaxzhou/dsh-file-explorer",
-      "version": "0.1.8",
-      "summary": "给 Harness 增加一个与「对话」「轨迹」并列的「文件」标签：左侧是会话工作区的目录树，右侧按文件类型决定预览形态 —— 渲染 Markdown（含 Mermaid 图表）、JSON 折叠树、24 种语法高亮、图片、沙箱 HTML，以及 PDF 与解包后的 Word / Excel / PowerPoint（保留 run 的粗体、斜体、下划线、上下标、颜色、高亮与段落对齐）；单一「导出」菜单可下载不限大小的原文件，或导出 PDF / Word。只读、无需配置、不落任何数据。",
-      "description": "给 Harness 增加一个与「对话」「轨迹」并列的「文件」标签：左侧是会话工作区的目录树，右侧按文件类型决定预览形态 —— 渲染 Markdown（含 Mermaid 图表）、JSON 折叠树、24 种语法高亮、图片、沙箱 HTML，以及 PDF 与解包后的 Word / Excel / PowerPoint（保留 run 的粗体、斜体、下划线、上下标、颜色、高亮与段落对齐）；单一「导出」菜单可下载不限大小的原文件，或导出 PDF / Word。只读、无需配置、不落任何数据。",
+      "version": "0.1.9",
+      "summary": "给 Harness 增加一个与「对话」「轨迹」并列的「文件」标签：左侧是会话工作区的目录树，右侧按文件类型决定预览形态 —— 渲染 Markdown（含 Mermaid 图表）、JSON 折叠树、24 种语法高亮、图片、沙箱 HTML，以及 PDF 与解包后的 Word / Excel / PowerPoint（沿文档样式链还原字体、字号、字符格式与段落的对齐 / 缩进 / 行距）；单一「导出」菜单可下载不限大小的原文件，或导出 PDF / Word。只读、无需配置、不落任何数据。",
+      "description": "给 Harness 增加一个与「对话」「轨迹」并列的「文件」标签：左侧是会话工作区的目录树，右侧按文件类型决定预览形态 —— 渲染 Markdown（含 Mermaid 图表）、JSON 折叠树、24 种语法高亮、图片、沙箱 HTML，以及 PDF 与解包后的 Word / Excel / PowerPoint（沿文档样式链还原字体、字号、字符格式与段落的对齐 / 缩进 / 行距）；单一「导出」菜单可下载不限大小的原文件，或导出 PDF / Word。只读、无需配置、不落任何数据。",
       "highlights": [
         "Markdown（含 Mermaid 图表）、JSON 折叠树、24 种语法高亮、图片、沙箱 HTML",
-        "PDF 预览（文字可选中）+ Word / Excel / PowerPoint 解包预览，保留 run 基本格式",
-        "「导出」菜单：下载不限大小的原文件，或导出 PDF / Word；只读、无需配置、不落数据"
+        "PDF 预览（文字可选中）+ Word / Excel / PowerPoint 解包预览，沿样式链还原字体与段落格式",
+        "「导出」菜单：下载不限大小的原文件，或导出保留文档格式的 PDF / Word；只读、无需配置、不落数据"
       ],
       "tags": [
         "文件浏览",

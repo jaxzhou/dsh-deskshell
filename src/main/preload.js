@@ -60,6 +60,14 @@ contextBridge.exposeInMainWorld('dshShell', {
   cancelPlugin: () => ipcRenderer.invoke('market:cancel'),
   /** Check for pnpm and install it when missing (market dependency). */
   setupPnpm: () => ipcRenderer.invoke('market:setup-pnpm'),
+  // --- dsh core (内核): detect the installed Harness version, move it to any
+  // published version (npm registry + official GitHub releases) ---
+  /** Load the published version catalog; `refresh` re-fetches it. */
+  loadKernel: (payload) => ipcRenderer.invoke('kernel:load', payload),
+  /** Install one published dsh version and restart the Harness on it. */
+  installKernel: (payload) => ipcRenderer.invoke('kernel:install', payload),
+  /** Cancel an in-flight core install. */
+  cancelKernel: () => ipcRenderer.invoke('kernel:cancel'),
   /** Open a URL (or the current GUI URL) in the system browser. */
   openExternal: (url) => ipcRenderer.invoke('dsh:open-external', url),
   /** Tell main where the shell's own toolbar ends, so the GUI view sits below it. */
