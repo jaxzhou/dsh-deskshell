@@ -40,8 +40,22 @@ const {
   runPluginCommand,
 } = require('./plugin-market');
 const { applyOfflineEnv } = require('./offline');
+const { delay } = require('./process-tree');
 const { fetchKernelCatalog, isKernelVersion, kernelRows } = require('./kernel');
 const { resolveShellEnv } = require('./shell-env');
+
+/**
+ * Does the installer output look like a locked/occupied file?
+ *
+ * Windows reports these as EBUSY/EPERM ("resource busy or locked",
+ * "being used by another process"); pnpm also surfaces EEXIST failures when it
+ * cannot replace a directory that is in use.
+ */
+function isFileLockError(text) {
+  return /EBUSY|EPERM|resource busy|being used by another process|另一进程|拒绝访问|operation not permitted/i.test(
+    String(text ?? ''),
+  );
+}
 
 /** How many log lines to keep for a freshly-mounted renderer. */
 const LOG_LIMIT = 600;
@@ -358,6 +372,29 @@ class ShellController extends EventEmitter {
     return detection;
   }
 
+  // ------------------------------------------------------- 互斥（避免进程冲突）
+
+  /**
+   * The mutating operation currently in flight, if any.
+   *
+   * npm/pnpm both rewrite files inside the same dsh home, and on Windows those
+   * files are locked while the running dsh has them open — so two of these must
+   * never overlap, and neither may overlap a restart.
+   *
+   * @param {string[]} [exclude] operation names this caller owns.
+   * @returns {string|null} a human-readable reason, or null when free.
+   */
+  busyReason(exclude = []) {
+    const busy = [
+      ['install', Boolean(this.installHandle), '正在安装 dsh'],
+      ['runtime', Boolean(this.runtimeHandle), '正在配置 Node.js 运行时'],
+      ['plugin', Boolean(this.pluginHandle), '正在安装/更新插件'],
+      ['kernel', Boolean(this.kernelHandle), '正在更新 dsh 内核'],
+    ];
+    const hit = busy.find(([name, active, label]) => active && !exclude.includes(name));
+    return hit ? hit[2] : null;
+  }
+
   // ----------------------------------------------------------- dsh core (内核)
 
   /** Why the core cannot be updated here, when it cannot. */
@@ -477,7 +514,11 @@ class ShellController extends EventEmitter {
   async installKernel(options = {}) {
     const version = String(options.version ?? '').trim();
     if (this.kernelAction?.running) return { ok: false, error: '已有内核操作正在进行' };
-    if (this.installHandle) return { ok: false, error: '正在安装 dsh，请稍候' };
+    const busy = this.busyReason(['kernel']);
+    if (busy) {
+      this.pushLog({ stream: 'stderr', line: `${busy}，暂不能更新内核（避免同时改写 dsh 安装目录）` });
+      return { ok: false, error: `${busy}，请稍候再试` };
+    }
     if (!isKernelVersion(version)) {
       return { ok: false, error: `不支持的 dsh 版本：${version || '(空)'}` };
     }
@@ -524,35 +565,62 @@ class ShellController extends EventEmitter {
     this.broadcast();
 
     // Stop the running Harness first: npm is about to replace the very files it
-    // is executing from.
+    // is executing from. On Windows this is not optional — a running dsh keeps
+    // its own native modules open, and `npm install -g` then fails with
+    // EPERM/EBUSY ("resource busy or locked").
     if (this.server?.running) {
       this.pushLog({ stream: 'system', line: '正在停止 dsh 以便替换内核文件…' });
-      await this.stop().catch(() => {});
+      const stopped = await this.stopServer({ silent: true, force: true });
+      if (!stopped.exited) {
+        this.pushLog({
+          stream: 'stderr',
+          line: '警告：dsh 未确认退出，内核文件可能仍被占用（Windows 上会表现为 EBUSY/EPERM）',
+        });
+      } else {
+        this.pushLog({ stream: 'system', line: 'dsh 已停止（进程已确认退出），开始安装内核文件' });
+      }
     }
 
-    const handle = this.runInstall({
-      npmCommand: detection.npm.command,
-      env: this.env,
-      cwd: this.cwd,
-      version,
-      onLog: (entry) => this.pushLog(entry),
-      onProgress: (snapshot) => {
-        this.installSnapshot = snapshot;
-        if (this.kernelAction) this.kernelAction = { ...this.kernelAction, percent: snapshot.percent ?? null };
-        this.scheduleBroadcast();
-      },
-    });
-    this.installHandle = handle;
-    this.kernelHandle = handle;
+    /** One npm run; the caller decides whether to retry. */
+    const runOnce = async () => {
+      const handle = this.runInstall({
+        npmCommand: detection.npm.command,
+        env: this.env,
+        cwd: this.cwd,
+        version,
+        onLog: (entry) => this.pushLog(entry),
+        onProgress: (snapshot) => {
+          this.installSnapshot = snapshot;
+          if (this.kernelAction) this.kernelAction = { ...this.kernelAction, percent: snapshot.percent ?? null };
+          this.scheduleBroadcast();
+        },
+      });
+      this.installHandle = handle;
+      this.kernelHandle = handle;
+      try {
+        return await handle.promise;
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
+      } finally {
+        this.installHandle = null;
+        this.kernelHandle = null;
+      }
+    };
 
-    let result;
-    try {
-      result = await handle.promise;
-    } catch (error) {
-      result = { ok: false, error: error instanceof Error ? error.message : String(error) };
+    let result = await runOnce();
+    // A just-exited process (or an antivirus scan) can hold the freshly written
+    // files for a moment: one retry turns that into a success instead of a
+    // half-updated install.
+    if (!result.ok && isFileLockError(result.output ?? result.error)) {
+      this.kernelAction = { ...this.kernelAction, step: '文件被占用，稍候重试', percent: 0 };
+      this.pushLog({
+        stream: 'system',
+        line: 'npm 报告文件被占用（EBUSY/EPERM），等待 2 秒后重试一次…',
+      });
+      this.broadcast();
+      await delay(2000);
+      result = await runOnce();
     }
-    this.installHandle = null;
-    this.kernelHandle = null;
     this.installSnapshot = {
       ...(this.installSnapshot ?? { percent: 0, phase: '安装完成', detail: '' }),
       ...(result.ok ? { percent: 100, phase: '安装完成' } : result.cancelled ? { phase: '已取消' } : { phase: '安装失败' }),
@@ -903,6 +971,11 @@ class ShellController extends EventEmitter {
     const removing = kind === 'uninstall';
 
     if (this.pluginAction?.running) return { ok: false, error: '已有插件操作正在进行' };
+    const busy = this.busyReason(['plugin']);
+    if (busy) {
+      this.pushLog({ stream: 'stderr', line: `${busy}，暂不能改动插件（避免同时改写同一批文件）` });
+      return { ok: false, error: `${busy}，请稍候再试` };
+    }
     if (!isSafePackageName(packageName)) {
       return { ok: false, error: `非法的包名：${packageName || '(空)'}` };
     }
@@ -958,36 +1031,82 @@ class ShellController extends EventEmitter {
       return this.#failPlugin(kind, pnpm.error ?? 'pnpm 不可用', started);
     }
 
+    // pnpm rewrites the profile's node_modules. On Windows those files are
+    // locked as long as the running dsh has them open (native addons cannot be
+    // replaced at all), which shows up as EBUSY/EPERM mid-install. So the
+    // Harness is stopped first and started again afterwards — the same order the
+    // core update uses. `stop()` only returns once the process is really gone.
+    const wasRunning = Boolean(this.server?.running);
+    if (wasRunning) {
+      setStep('先停止 dsh（避免插件文件被占用）');
+      this.pushLog({
+        stream: 'system',
+        line: '先停止正在运行的 dsh：Windows 上被占用的插件文件无法替换（EBUSY/EPERM），其它平台也避免装到一半的半成品状态。',
+      });
+      const stopped = await this.stopServer({ silent: true, force: true });
+      if (!stopped.exited) {
+        this.pushLog({ stream: 'stderr', line: '警告：dsh 未确认退出，插件安装可能仍会碰到被占用的文件' });
+      }
+    }
+
     const spec = version ? `${packageName}@${version}` : packageName;
     setStep(removing ? `正在卸载 ${packageName}` : `正在安装 ${spec}`);
-    const handle = this.runPluginCommand({
-      dshCommand: this.detection.dsh.command,
-      args,
-      env: this.env ?? process.env,
-      cwd: this.cwd,
-      onLog,
-    });
-    this.pluginHandle = handle;
 
-    let result;
-    try {
-      result = await handle.promise;
-    } catch (error) {
-      result = { ok: false, error: error instanceof Error ? error.message : String(error), output: '' };
+    /** One plugin command run; returns the raw result. */
+    const runOnce = async () => {
+      const handle = this.runPluginCommand({
+        dshCommand: this.detection.dsh.command,
+        args,
+        env: this.env ?? process.env,
+        cwd: this.cwd,
+        onLog,
+      });
+      this.pluginHandle = handle;
+      try {
+        return await handle.promise;
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error), output: '' };
+      } finally {
+        this.pluginHandle = null;
+      }
+    };
+
+    let result = await runOnce();
+    // A file lock can outlive the process for a moment (Windows, or an
+    // antivirus scanner holding the freshly written files): one retry.
+    if (!result.ok && isFileLockError(result.output ?? result.error)) {
+      setStep('文件被占用，稍候重试');
+      this.pushLog({
+        stream: 'system',
+        line: 'pnpm 报告文件被占用（EBUSY/EPERM），等待 1.5 秒后重试一次…',
+      });
+      await delay(1500);
+      result = await runOnce();
     }
-    this.pluginHandle = null;
 
     if (!result.ok) {
+      // dsh was stopped for this: put the previous state back on screen.
       const tail = String(result.output ?? '').trim().split('\n').slice(-3).join(' / ');
-      return this.#failPlugin(
+      const failure = this.#failPlugin(
         kind,
         [result.error, tail].filter(Boolean).join(' — ') || (removing ? '卸载失败' : '安装失败'),
         started,
       );
+      if (wasRunning) {
+        this.pushLog({ stream: 'system', line: '插件操作失败，重新启动原来那套 dsh…' });
+        await this.start().catch((error) =>
+          this.pushLog({
+            stream: 'stderr',
+            line: `重新启动 dsh 失败：${error instanceof Error ? error.message : String(error)}`,
+          }),
+        );
+      }
+      return failure;
     }
 
-    // The profile layer list only changes at boot: restart dsh, which also
-    // reloads the embedded DSH Web view.
+    // The profile layer list only changes at boot: start dsh again (it was
+    // stopped above when it had been running), which also reloads the embedded
+    // DSH Web view.
     setStep(removing ? '重启 dsh 以移除插件' : '重启 dsh 以加载插件');
     this.pushLog({
       stream: 'system',
@@ -995,7 +1114,7 @@ class ShellController extends EventEmitter {
         ? '插件已从 profile 移除，正在重启 dsh 使改动生效…'
         : '插件已写入 profile，正在重启 dsh 使插件生效…',
     });
-    await this.restart();
+    await this.start();
 
     const installed = this.getInstalledPlugins();
     const entry = installed.plugins.find((plugin) => plugin.package === packageName) ?? null;
@@ -1207,6 +1326,11 @@ class ShellController extends EventEmitter {
   /** Run `npm install -g @deepseek-ai/dsh`, then re-detect and start it. */
   async install() {
     if (this.installHandle) return;
+    const busy = this.busyReason(['install', 'runtime']);
+    if (busy) {
+      this.pushLog({ stream: 'stderr', line: `${busy}，暂不能安装 dsh` });
+      return;
+    }
 
     const detection = this.detection ?? (await this.check({ autostart: false }));
     if (ShellController.runtimeGap(detection)) {
@@ -1362,23 +1486,45 @@ class ShellController extends EventEmitter {
 
   /** Stop the `dsh web` child. */
   async stopServer(options = {}) {
-    const { silent = false } = options;
+    const { silent = false, force = false } = options;
+    if (!force) {
+      // Stopping mid-install would leave npm/pnpm writing into a half-stopped
+      // profile; internal callers (plugin/core flows) pass force.
+      const busy = this.busyReason();
+      if (busy) {
+        this.pushLog({ stream: 'stderr', line: `${busy}，暂不能停止 dsh` });
+        return { exited: false, refused: true, error: `${busy}，请稍候再试` };
+      }
+    }
     const server = this.server;
     this.server = null;
     this.serverUrl = null;
     this.serverPort = null;
-    if (server) await server.stop();
+    const result = server ? await server.stop() : { exited: true, forced: false };
     if (!silent) {
-      this.setPhase('ready-to-start', 'dsh 已停止');
+      this.setPhase('ready-to-start', result.exited ? 'dsh 已停止' : 'dsh 可能仍在退出');
       this.broadcast();
     }
+    return result;
   }
 
   /** Stop and start again (used by the toolbar's 重启 button). */
   async restart() {
-    await this.stopServer({ silent: true });
+    // Restarting while an installer is rewriting dsh/profile files is the other
+    // half of the Windows conflict: the new process starts on files that are
+    // still being replaced.
+    const busy = this.busyReason();
+    if (busy) {
+      this.pushLog({ stream: 'stderr', line: `${busy}，暂不能重启 dsh` });
+      return { ok: false, error: `${busy}，请稍候再试` };
+    }
+    const stopped = await this.stopServer({ silent: true, force: true });
+    if (!stopped.exited) {
+      this.pushLog({ stream: 'stderr', line: '警告：上一个 dsh 未确认退出，仍继续启动（端口由系统分配，不会冲突）' });
+    }
     this.pushLog({ stream: 'system', line: '正在重启 dsh…' });
     await this.start();
+    return { ok: true };
   }
 
   /**
@@ -1399,7 +1545,14 @@ class ShellController extends EventEmitter {
     await this.start();
   }
 
-  /** Release every resource; called on app quit. */
+  /**
+   * Release every resource; called on app quit.
+   *
+   * Cancelling is not enough: an npm/pnpm child that outlives the window keeps
+   * writing into the dsh prefix/profile and holds the very files the next launch
+   * needs (on Windows that surfaces as EBUSY/EPERM on the first plugin install).
+   * So their promises are awaited — with a bound, because quitting must not hang.
+   */
   async dispose() {
     this.disposed = true;
     this.checkToken += 1;
@@ -1407,33 +1560,38 @@ class ShellController extends EventEmitter {
       clearTimeout(this.broadcastTimer);
       this.broadcastTimer = null;
     }
-    if (this.installHandle) {
+
+    const handles = [...new Set([this.installHandle, this.kernelHandle, this.runtimeHandle, this.pluginHandle].filter(Boolean))];
+    this.installHandle = null;
+    this.kernelHandle = null;
+    this.runtimeHandle = null;
+    this.pluginHandle = null;
+    for (const handle of handles) {
       try {
-        this.installHandle.cancel();
+        handle.cancel?.();
       } catch {
         /* already gone */
       }
-      this.installHandle = null;
     }
-    if (this.runtimeHandle) {
-      try {
-        this.runtimeHandle.cancel();
-      } catch {
-        /* already gone */
-      }
-      this.runtimeHandle = null;
+    const pending = handles.map((handle) => handle.promise).filter((promise) => promise && typeof promise.then === 'function');
+    if (pending.length) {
+      await Promise.race([
+        Promise.allSettled(pending),
+        // A hung installer must not block quitting; terminate() already escalates.
+        delay(8_000),
+      ]);
     }
-    if (this.pluginHandle) {
-      try {
-        this.pluginHandle.cancel();
-      } catch {
-        /* already gone */
-      }
-      this.pluginHandle = null;
-    }
+
     const server = this.server;
     this.server = null;
-    if (server) await server.stop();
+    this.serverUrl = null;
+    this.serverPort = null;
+    if (server) {
+      const stopped = await server.stop();
+      if (!stopped?.exited) {
+        this.pushLog({ stream: 'stderr', line: '退出前未能确认 dsh 进程结束（下次启动可能遇到文件占用）' });
+      }
+    }
     this.removeAllListeners();
   }
 }

@@ -1063,12 +1063,23 @@ section('13. 插件安装流程（控制器，注入协作者）');
   const before = await waitForPhase(controller, 'running');
   check('插件操作前 dsh 处于运行中', before.phase === 'running', before.phase);
 
-  // Stub the restart so the test does not spawn a second dsh, but record it.
-  let restarts = 0;
-  const realRestart = controller.restart.bind(controller);
-  controller.restart = async () => {
-    restarts += 1;
-    return realRestart();
+  // Record the side effects in order (stop → pnpm/dsh plugin → start): the whole
+  // point of stopping first is that the profile's files are not in use.
+  const events = [];
+  const realStart = controller.start.bind(controller);
+  controller.start = async () => {
+    events.push('start');
+    return realStart();
+  };
+  const originalStopServer = controller.stopServer.bind(controller);
+  controller.stopServer = async (options) => {
+    events.push('stop');
+    return originalStopServer(options);
+  };
+  const originalPluginCommand = controller.runPluginCommand.bind(controller);
+  controller.runPluginCommand = (options) => {
+    events.push('plugin');
+    return originalPluginCommand(options);
   };
 
   const steps = [];
@@ -1080,7 +1091,11 @@ section('13. 插件安装流程（控制器，注入协作者）');
   const result = await controller.installPlugin({ packageName: '@jaxzhou/dsh-file-explorer', version: '0.1.5' });
   installedVersion = '0.1.5';
   check('安装返回成功', result.ok === true, result.error ?? '');
-  check('安装后自动重启 dsh（刷新 DSH Web）', restarts === 1, `restarts=${restarts}`);
+  check(
+    '先停 dsh → 装插件 → 再启动（Windows 上避免文件占用）',
+    events.join(' → ') === 'stop → plugin → start',
+    events.join(' → '),
+  );
   check('过程步骤可见（含重启）', steps.includes('检查 pnpm') && steps.some((s) => s.includes('正在安装')) && steps.includes('重启 dsh 以加载插件'), steps.join(' → '));
   const action = controller.getState().pluginAction;
   check('动作状态收敛为完成', action.running === false && action.ok === true && action.step === '完成', JSON.stringify(action));
@@ -1093,16 +1108,73 @@ section('13. 插件安装流程（控制器，注入协作者）');
   const rejected = await controller.installPlugin({ packageName: '../../etc/passwd' });
   check('拒绝非法包名', rejected.ok === false && /非法/.test(rejected.error ?? ''), String(rejected.error));
 
-  // Failure path: no restart, error surfaced.
-  controller.runPluginCommand = () => ({
-    promise: Promise.resolve({ ok: false, code: 1, output: 'ERR_PNPM_FETCH_404  Not found', error: 'dsh plugin 退出码 1' }),
-    cancel: () => {},
-  });
-  const restartsBefore = restarts;
+  // Failure path: the previously running dsh is put back, error surfaced.
+  controller.runPluginCommand = () => {
+    events.push('plugin');
+    return {
+      promise: Promise.resolve({ ok: false, code: 1, output: 'ERR_PNPM_FETCH_404  Not found', error: 'dsh plugin 退出码 1' }),
+      cancel: () => {},
+    };
+  };
+  const eventsBefore = events.length;
   const failed = await controller.installPlugin({ packageName: '@jaxzhou/dsh-mathmatic-symbol', version: '0.1.2' });
   check('安装失败时返回错误', failed.ok === false && /404|退出码/.test(failed.error ?? ''), String(failed.error));
-  check('安装失败时不会重启 dsh', restarts === restartsBefore, `restarts=${restarts}`);
+  check(
+    '安装失败后重新启动原来的 dsh（不停留在停止状态）',
+    events.slice(eventsBefore).join(' → ') === 'stop → plugin → start',
+    events.slice(eventsBefore).join(' → '),
+  );
   check('失败状态暴露给界面', controller.getState().pluginAction.ok === false);
+
+  // Windows-style lock conflict: one EBUSY, then success on the retry.
+  let lockAttempts = 0;
+  controller.runPluginCommand = () => {
+    lockAttempts += 1;
+    events.push('plugin');
+    if (lockAttempts === 1) {
+      return {
+        promise: Promise.resolve({
+          ok: false,
+          code: 1,
+          output: 'ERR_PNPM_EBUSY: resource busy or locked, unlink node_modules\\node-pty\\build\\Release\\conpty.node',
+          error: 'dsh plugin 退出码 1',
+        }),
+        cancel: () => {},
+      };
+    }
+    return { promise: Promise.resolve({ ok: true, code: 0, output: 'added 1 package', error: null }), cancel: () => {} };
+  };
+  const retried = await controller.installPlugin({ packageName: '@jaxzhou/dsh-file-explorer', version: '0.1.5' });
+  check('文件被占用时自动重试一次并成功', retried.ok === true && lockAttempts === 2, `attempts=${lockAttempts}`);
+  check(
+    '重试发生在 dsh 已停止之后（顺序不变）',
+    events.slice(-4).join(' → ') === 'stop → plugin → plugin → start',
+    events.slice(-4).join(' → '),
+  );
+
+  // Concurrency: nothing else may mutate the same tree while a plugin op runs.
+  // The guard keys on the in-flight handles, so they are set directly here
+  // instead of racing a real stop/start cycle.
+  controller.pluginHandle = { cancel: () => {} };
+  controller.pluginAction = { running: true, kind: 'install', packages: '@jaxzhou/dsh-file-explorer', step: '正在安装' };
+  try {
+    check('忙碌原因指向插件操作', /插件/.test(controller.busyReason() ?? ''), String(controller.busyReason()));
+    const busyRestart = await controller.restart();
+    check('插件操作进行中拒绝重启 dsh', busyRestart.ok === false && /插件/.test(busyRestart.error ?? ''), busyRestart.error ?? '');
+    const busyStop = await controller.stopServer();
+    check('插件操作进行中拒绝停止 dsh', busyStop.refused === true, JSON.stringify(busyStop));
+    const busyKernel = await controller.installKernel({ version: '0.1.7-rc.2' });
+    check(
+      '插件操作进行中拒绝更新内核',
+      busyKernel.ok === false && /插件/.test(busyKernel.error ?? ''),
+      busyKernel.error ?? '',
+    );
+    const busyPlugin2 = await controller.installPlugin({ packageName: 'dsh-better-sidebar' });
+    check('插件操作进行中拒绝第二个插件操作', busyPlugin2.ok === false, busyPlugin2.error ?? '');
+  } finally {
+    controller.pluginHandle = null;
+    controller.pluginAction = null;
+  }
 
   await controller.dispose();
 }
@@ -2062,10 +2134,15 @@ section('20. 内核更新流程 (controller，注入协作者)');
     git: [],
   });
 
-  /** A controller whose detection flips after a "successful" install. */
+  /**
+   * A controller whose detection flips after a "successful" install.
+   *
+   * `calls.events` records the order of the side effects (stop / install / start)
+   * — a kernel update that forgets to stop the running dsh must fail here.
+   */
   function makeController(options = {}) {
     let installedVersion = options.installed ?? '0.1.5-rc.3';
-    const calls = { installs: [], restarts: 0, fetch: 0 };
+    const calls = { events: [], installs: [], starts: 0, fetch: 0 };
     const controller = new ShellController({
       detect: async () => ({
         node: { available: true, version: 'v24.21.0', command: '/usr/bin/node' },
@@ -2080,6 +2157,7 @@ section('20. 内核更新流程 (controller，注入协作者)');
       }),
       install: (request) => {
         calls.installs.push(request.version ?? null);
+        calls.events.push(`install:${request.version ?? 'latest'}`);
         return {
           promise: Promise.resolve(options.installResult ?? { ok: true, code: 0, output: '' }).then((result) => {
             if (result.ok && request.version) installedVersion = request.version;
@@ -2095,18 +2173,23 @@ section('20. 内核更新流程 (controller，注入协作者)');
       },
       startDelayMs: 0,
     });
-    // Never actually spawn a dsh server in this test.
+    // Never actually spawn a dsh server, but let the *real* stopServer run: it
+    // must reach the (fake) server object, and `stop` must be recorded so the
+    // "stop before touching dsh's files" ordering can be asserted.
     controller.start = async () => {
-      calls.restarts += 1;
-      controller.server = { running: true, startedAt: Date.now() };
-      controller.serverUrl = 'http://127.0.0.1:1/?token=t';
+      calls.events.push('start');
+      calls.starts += 1;
+      controller.server = {
+        running: true,
+        startedAt: Date.now(),
+        stop: async () => {
+          calls.events.push('stop');
+          return { exited: true, forced: false };
+        },
+      };
+      controller.serverUrl = null;
       controller.setPhase('running', 'DSH 已启动');
       controller.broadcast();
-      return controller.getState();
-    };
-    controller.stop = async () => {
-      controller.server = null;
-      controller.serverUrl = null;
       return controller.getState();
     };
     return { controller, calls };
@@ -2136,7 +2219,12 @@ section('20. 内核更新流程 (controller，注入协作者)');
   const result = await controller.installKernel({ version: '0.1.7-rc.2' });
   check('更新成功', result.ok === true && result.version === '0.1.7-rc.2', JSON.stringify(result));
   check('npm 收到指定版本', calls.installs.join() === '0.1.7-rc.2', calls.installs.join());
-  check('更新后重启了 dsh', calls.restarts >= 2, String(calls.restarts));
+  check('更新后重启了 dsh', calls.starts >= 2, String(calls.starts));
+  check(
+    '更新内核前先停 dsh、装完再启动（顺序固定）',
+    calls.events.join(' → ') === 'start → stop → install:0.1.7-rc.2 → start',
+    calls.events.join(' → '),
+  );
   const after = controller.getState();
   check('状态里的内核版本已刷新', after.kernel.version === '0.1.7-rc.2' && after.kernel.recommendation.status === 'preview', `${after.kernel.version}/${after.kernel.recommendation.status}`);
   check('kernelAction 记录成功与版本变化', after.kernelAction.ok === true && after.kernelAction.from === '0.1.5-rc.3' && after.kernelAction.installedVersion === '0.1.7-rc.2', JSON.stringify(after.kernelAction));
@@ -2193,6 +2281,214 @@ section('20. 内核更新流程 (controller，注入协作者)');
   await fresh.controller.loadKernel();
   const freshResult = await fresh.controller.installKernel({ version: '0.1.7-rc.2' });
   check('未安装 dsh 时可按指定版本安装', fresh.calls.installs.join() === '0.1.7-rc.2', fresh.calls.installs.join() || String(freshResult.error));
+
+  // Windows-style lock conflict on the core install: retry once, then succeed.
+  {
+    let attempts = 0;
+    const locked = makeController();
+    locked.controller.runInstall = (request) => {
+      attempts += 1;
+      locked.calls.events.push(`install:${request.version ?? 'latest'}`);
+      const result =
+        attempts === 1
+          ? { ok: false, code: 1, output: 'npm ERR! code EPERM\nnpm ERR! resource busy or locked', hint: null }
+          : { ok: true, code: 0, output: '' };
+      return {
+        promise: Promise.resolve(result).then((value) => {
+          if (value.ok && request.version) return value;
+          return value;
+        }),
+        cancel: () => {},
+      };
+    };
+    await locked.controller.check({ autostart: false });
+    await locked.controller.loadKernel();
+    await locked.controller.start();
+    const outcome = await locked.controller.installKernel({ version: '0.1.7-rc.2' });
+    check('内核文件被占用时重试一次并成功', outcome.ok === true && attempts === 2, `attempts=${attempts}`);
+    check(
+      '内核重试路径仍保持 先停 → 装 → 启动',
+      locked.calls.events.join(' → ') === 'start → stop → install:0.1.7-rc.2 → install:0.1.7-rc.2 → start',
+      locked.calls.events.join(' → '),
+    );
+  }
+
+}
+
+section('21. 退出时等待安装子进程 (controller.dispose)');
+{
+  const { ShellController } = require('../src/main/controller.js');
+
+  // A handle that resolves only when told to, so dispose() must be the one waiting.
+  let release = null;
+  let settled = false;
+  const controller = new ShellController({ detect: async () => ({ node: {}, npm: {}, dsh: { installed: false } }), startDelayMs: 0 });
+  controller.pluginHandle = {
+    cancel: () => {},
+    promise: new Promise((resolve) => {
+      release = () => {
+        settled = true;
+        resolve({ ok: false, cancelled: true, output: '' });
+      };
+    }),
+  };
+  let disposed = false;
+  const disposing = controller.dispose().then(() => {
+    disposed = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  const waitedForChild = disposed === false;
+  release();
+  await disposing;
+  check('dispose 等待安装子进程结束才返回', waitedForChild === true && settled === true && disposed === true, `waitedForChild=${waitedForChild}`);
+
+  // A hung installer must not block quitting forever.
+  const hung = new ShellController({ detect: async () => ({ node: {}, npm: {}, dsh: { installed: false } }), startDelayMs: 0 });
+  hung.pluginHandle = { cancel: () => {}, promise: new Promise(() => {}) };
+  const started = Date.now();
+  await hung.dispose();
+  check('子进程卡住时退出仍能在限时内完成', Date.now() - started < 9_000, `${Date.now() - started}ms`);
+}
+
+section('22. 子进程终止语义 (process-tree)');
+{
+  const { EventEmitter } = await import('node:events');
+  const tree = require('../src/main/process-tree.js');
+  const { terminate, waitForExit, delay } = tree;
+
+  /** A stand-in for a spawned child, with controllable exit behaviour. */
+  function fakeChild(pid = 4242) {
+    const child = new EventEmitter();
+    child.pid = pid;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.signals = [];
+    child.kill = (signal) => {
+      child.signals.push(signal);
+      return true;
+    };
+    return child;
+  }
+
+  check('未提供子进程时视为已退出', (await terminate(null)).exited === true);
+
+  const dead = fakeChild();
+  dead.exitCode = 0;
+  const already = await terminate(dead);
+  check('已退出的进程不再发信号', already.exited === true && already.forced === false && dead.signals.length === 0);
+
+  // POSIX graceful: the signal arrives, the process exits a moment later.
+  const graceful = fakeChild();
+  setTimeout(() => graceful.emit('exit', 0, 'SIGTERM'), 25);
+  const quiet = await terminate(graceful, { timeoutMs: 500 });
+  check(
+    'POSIX：先礼貌结束并等待进程真正退出',
+    quiet.exited === true && quiet.forced === false && graceful.signals.join() === 'SIGTERM',
+    graceful.signals.join(),
+  );
+
+  // POSIX escalation: ignores SIGTERM, must be SIGKILLed — and still awaited.
+  const stubborn = fakeChild();
+  stubborn.kill = (signal) => {
+    stubborn.signals.push(signal);
+    if (signal === 'SIGKILL') setTimeout(() => stubborn.emit('exit', null, 'SIGKILL'), 10);
+    return true;
+  };
+  const escalated = await terminate(stubborn, { timeoutMs: 60, forceTimeoutMs: 300 });
+  check(
+    'POSIX：超时后升级 SIGKILL 并等到退出',
+    escalated.forced === true && escalated.exited === true && stubborn.signals.join() === 'SIGTERM,SIGKILL',
+    stubborn.signals.join(),
+  );
+
+  // Unkillable process: the result must say so instead of pretending.
+  const zombie = fakeChild();
+  zombie.kill = (signal) => {
+    zombie.signals.push(signal);
+    return true;
+  };
+  const stuck = await terminate(zombie, { timeoutMs: 40, forceTimeoutMs: 40 });
+  check('杀不掉时如实上报 exited=false（不谎报已停止）', stuck.exited === false && stuck.forced === true, JSON.stringify(stuck));
+
+  // waitForExit is the primitive the whole thing rests on.
+  const slow = fakeChild();
+  const waiting = waitForExit(slow, 500);
+  setTimeout(() => slow.emit('exit', 0, null), 20);
+  check('waitForExit 等到 exit 事件', (await waiting) === true);
+  check('waitForExit 超时返回 false', (await waitForExit(fakeChild(), 30)) === false);
+
+  // Windows: `taskkill /T /F` (console children cannot be closed politely) and
+  // the caller must still wait for the exit — this is the bug that made plugin
+  // installs and restarts race a dying dsh.
+  const originalPlatform = process.platform;
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+  let windowsResult = null;
+  try {
+    for (const file of ['../src/main/shell-env.js', '../src/main/process-tree.js']) delete require.cache[require.resolve(file)];
+    const winTree = require('../src/main/process-tree.js');
+    const child = fakeChild(9999);
+    const logs = [];
+    let resolved = false;
+    const promise = winTree
+      .terminate(child, { timeoutMs: 400, onLog: (line) => logs.push(line) })
+      .then((result) => {
+        resolved = true;
+        windowsResult = result;
+        return result;
+      });
+    await delay(80);
+    const resolvedBeforeExit = resolved;
+    child.emit('exit', 0, null);
+    const result = await promise;
+    check('Windows：走 taskkill 强制结束进程树', logs.some((line) => line.includes('taskkill')), logs.join(' / '));
+    check('Windows：发完 taskkill 仍等待 exit 事件才返回', resolvedBeforeExit === false && result.exited === true, `resolvedBeforeExit=${resolvedBeforeExit}`);
+    check('Windows：结果标记为强制结束', windowsResult?.forced === true, JSON.stringify(windowsResult));
+
+    // Unconfirmed exit must be reported, not assumed.
+    const ghost = fakeChild(9998);
+    const ghostResult = await winTree.terminate(ghost, { timeoutMs: 60, onLog: () => {} });
+    check('Windows：进程未退出时如实上报', ghostResult.exited === false, JSON.stringify(ghostResult));
+  } finally {
+    Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+    for (const file of ['../src/main/shell-env.js', '../src/main/process-tree.js']) delete require.cache[require.resolve(file)];
+  }
+}
+
+section('23. 静态审计：不存在的方法调用 / 常量 misuse');
+{
+  // A swallowed `this.stop()` (the method is called `stopServer`) once made the
+  // core update skip stopping dsh entirely — exactly the Windows file-lock
+  // conflict. This audit fails the build for that whole class of mistake.
+  const { readFileSync } = await import('node:fs');
+  const EVENT_EMITTER_METHODS = new Set(['emit', 'on', 'once', 'off', 'addListener', 'removeListener', 'removeAllListeners', 'listenerCount']);
+  const files = ['../src/main/controller.js', '../src/main/main.js', '../src/main/dsh-server.js', '../src/main/plugin-market.js'];
+  for (const file of files) {
+    const source = readFileSync(new URL(file, import.meta.url), 'utf8');
+    const defined = new Set();
+    for (const match of source.matchAll(/^\s*(?:async\s+)?(?:static\s+)?#?([A-Za-z_$][\w$]*)\s*\(/gm)) defined.add(match[1]);
+    for (const match of source.matchAll(/^(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/gm)) defined.add(match[1]);
+    for (const match of source.matchAll(/this\.([A-Za-z_$][\w$]*)\s*=/g)) defined.add(match[1]);
+    const missing = new Set();
+    for (const match of source.matchAll(/this\.([A-Za-z_$][\w$]*)\s*\(/g)) {
+      const name = match[1];
+      if (!defined.has(name) && !EVENT_EMITTER_METHODS.has(name)) missing.add(name);
+    }
+    check(
+      `${path.basename(file)} 没有调用未定义的方法`,
+      missing.size === 0,
+      missing.size ? `未定义：${[...missing].join(', ')}` : '',
+    );
+  }
+  const server = readFileSync(new URL('../src/main/dsh-server.js', import.meta.url), 'utf8');
+  check('dsh-server 在强制结束 Windows 进程后留出释放句柄的间隔', /delay\(350\)/.test(server));
+
+  const controller = readFileSync(new URL('../src/main/controller.js', import.meta.url), 'utf8');
+  check(
+    '内核更新走的是真实存在的 stopServer（先停后装）',
+    /stopServer\(\{ silent: true, force: true \}\)/.test(controller) && !/this\.stop\(\)/.test(controller),
+  );
+  check('插件流程也是先停 dsh 再改 profile', /先停止 dsh（避免插件文件被占用）/.test(controller));
+  check('互斥守卫在重启/停止/内核/插件四处都接上了', (controller.match(/busyReason\(/g) ?? []).length >= 4);
 }
 
 // --------------------------------------------------------------------- summary

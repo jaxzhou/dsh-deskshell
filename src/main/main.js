@@ -962,7 +962,6 @@ async function runSelfTest() {
         fetchKernel: controller.runFetchKernel,
         install: controller.runInstall,
         start: controller.start,
-        stop: controller.stop,
         pnpmAttempted: controller.pnpmAttempted,
       };
       let installRequests = [];
@@ -985,11 +984,6 @@ async function runSelfTest() {
         controller.serverUrl = null;
         controller.setPhase('running', 'DSH 已启动');
         controller.broadcast();
-        return controller.getState();
-      };
-      controller.stop = async () => {
-        controller.server = null;
-        controller.serverUrl = null;
         return controller.getState();
       };
 
@@ -1151,9 +1145,13 @@ async function runSelfTest() {
         controller.runFetchKernel = originals.fetchKernel;
         controller.runInstall = originals.install;
         controller.start = originals.start;
-        controller.stop = originals.stop;
         controller.pnpmAttempted = originals.pnpmAttempted;
         controller.kernelAction = null;
+        // The stub above started a fake server: leaving it behind would make the
+        // plugin section believe dsh is running and try to restart the real one.
+        controller.server = null;
+        controller.serverUrl = null;
+        controller.serverPort = null;
         await win.webContents.executeJavaScript('window.switchTab("dsh"); true;').catch(() => {});
       }
     }
@@ -1273,12 +1271,41 @@ async function runSelfTest() {
       ],
       error: null,
     });
-    let restartCalls = 0;
-    const originalRestart = controller.restart.bind(controller);
-    controller.restart = async () => {
-      restartCalls += 1;
-      return undefined;
+    // The plugin flow stops the running dsh before touching the profile and
+    // starts it again afterwards (Windows file locks), so record that order.
+    const pluginEvents = [];
+    /** A server stand-in: records the stop, spawns nothing. */
+    const fakeServer = () => ({
+      running: true,
+      startedAt: Date.now(),
+      stop: async () => {
+        pluginEvents.push('server-stop');
+        return { exited: true, forced: false };
+      },
+    });
+    const stubbedStart = controller.start;
+    controller.start = async () => {
+      pluginEvents.push('start');
+      controller.server = fakeServer();
+      controller.serverUrl = null;
+      controller.setPhase('running', 'DSH 已启动');
+      controller.broadcast();
+      return controller.getState();
     };
+    controller.stopServer = async (options) => {
+      pluginEvents.push('stop');
+      const server = controller.server;
+      controller.server = null;
+      if (server) await server.stop();
+      return { exited: true, forced: false };
+    };
+    const stubbedPluginCommand = controller.runPluginCommand;
+    controller.runPluginCommand = (options) => {
+      pluginEvents.push('plugin');
+      return stubbedPluginCommand(options);
+    };
+    // Pretend dsh is running so the stop-before-install path is exercised.
+    controller.server = fakeServer();
 
     const installResult = await controller.installPlugin({ packageName: '@jaxzhou/dsh-file-explorer', version: '0.1.5' });
     installedFixtureVersion = '0.1.5';
@@ -1286,8 +1313,12 @@ async function runSelfTest() {
     record('安装参数为 add <pkg>@<version>', pluginArgs.at(-1) === 'plugin --profile web add @jaxzhou/dsh-file-explorer@0.1.5', String(pluginArgs.at(-1)));
     const uninstall = await controller.uninstallPlugin({ packageName: 'dsh-better-sidebar' });
     record('市场卸载调用 dsh plugin remove', uninstall.ok === true && pluginArgs.at(-1) === 'plugin --profile web remove dsh-better-sidebar', String(pluginArgs.at(-1)));
-    record('卸载后同样自动重启 dsh', restartCalls === 2, `restartCalls=${restartCalls}`);
-    record('安装后自动重启 dsh（刷新 DSH Web）', restartCalls >= 1, `restartCalls=${restartCalls}`);
+    record(
+      '每次插件变更都是 停 dsh → 改 profile → 启 dsh',
+      pluginEvents.join(' → ') === 'stop → server-stop → plugin → start → stop → server-stop → plugin → start',
+      pluginEvents.join(' → '),
+    );
+    record('安装/卸载后 dsh 都被重新启动（刷新 DSH Web）', pluginEvents.filter((e) => e === 'start').length === 2, String(pluginEvents.filter((e) => e === 'start').length));
     record('安装完成后状态收敛', controller.getState().pluginAction?.ok === true);
 
     // Market identifies the dsh it acts on (path + profile dir + pnpm).
@@ -1379,7 +1410,9 @@ async function runSelfTest() {
       );
     }
 
-    controller.restart = originalRestart;
+    controller.start = stubbedStart;
+    controller.runPluginCommand = stubbedPluginCommand;
+    controller.server = null;
     await new Promise((resolve) => marketServer.close(resolve));
 
     await controller.dispose();

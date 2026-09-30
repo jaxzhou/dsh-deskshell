@@ -18,7 +18,7 @@ const { EventEmitter } = require('node:events');
 const net = require('node:net');
 const os = require('node:os');
 
-const { createLineSplitter, terminate } = require('./process-tree');
+const { createLineSplitter, delay, terminate } = require('./process-tree');
 const { IS_WINDOWS, shellCommandFor } = require('./shell-env');
 
 /** The canonical readiness line printed by `dsh web`. */
@@ -210,7 +210,14 @@ class DshServer extends EventEmitter {
   }
 
   /**
-   * Stop the server: graceful signal first, SIGKILL after `stopTimeoutMs`.
+   * Stop the server and wait until the process is really gone.
+   *
+   * The caller usually installs something right afterwards (a plugin through
+   * pnpm, or a new dsh core through npm), and on Windows those files stay
+   * locked until the old process has fully exited — so `terminate()` waits for
+   * the exit event, and a forced kill is followed by a short settle pause
+   * before we report the server as stopped.
+   *
    * @returns {Promise<{exited: boolean, forced: boolean}>}
    */
   async stop() {
@@ -227,6 +234,17 @@ class DshServer extends EventEmitter {
       timeoutMs: this.stopTimeoutMs,
       onLog: (line) => this.emit('log', { stream: 'system', line }),
     });
+    if (result.forced && process.platform === 'win32') {
+      // Windows releases the process's file handles as it terminates; a brief
+      // pause keeps a following npm/pnpm run from racing that teardown.
+      await delay(350);
+    }
+    if (!result.exited) {
+      this.emit('log', {
+        stream: 'stderr',
+        line: '警告：dsh 进程未确认退出，后续安装/启动可能与它抢占同一批文件',
+      });
+    }
     this.child = null;
     this.url = null;
     this.resolvedPort = null;
