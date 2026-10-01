@@ -440,7 +440,7 @@ function renderKernelBanner(next) {
     text.append(elWith('b', null, action.step ?? '更新失败'), elWith('span', null, action.error ? `· ${action.error}` : ''));
   }
   el.kernelBanner.append(text);
-  if (!ok && action.hint) el.kernelBanner.append(elWith('span', 'muted small', action.hint));
+  if (!ok) appendFailureDiagnostics(el.kernelBanner, action);
   if (ok && action.hint) el.kernelBanner.append(elWith('span', 'muted small', action.hint));
   const close = elWith('button', 'btn btn-ghost btn-compact', '关闭');
   close.dataset.action = 'kernel-dismiss';
@@ -679,9 +679,31 @@ function renderPluginBanner(next) {
         : `${action.packages}${version} 已就绪，DSH 已重启并刷新界面`
       : `插件操作失败：${action.error ?? '未知错误'}`),
   );
+  if (!action.ok) appendFailureDiagnostics(el.marketBanner, action);
   const dismiss = elWith('button', 'btn btn-ghost', '知道了');
   dismiss.dataset.action = 'plugin-dismiss';
   el.marketBanner.append(dismiss);
+}
+
+/**
+ * Show *why* an npm/pnpm operation failed: the npm error code, the registry it
+ * used, the actionable hint, and the interesting output lines.
+ *
+ * A 403 tells the user nothing on its own; `npm E403 · https://…mirror` plus
+ * "private scope mapping / expired token / proxy" is what makes it fixable
+ * without digging through the log panel.
+ */
+function appendFailureDiagnostics(banner, action) {
+  const facts = [];
+  if (action.npmCode) facts.push(`npm ${action.npmCode}`);
+  if (action.registry) facts.push(action.registry);
+  if (facts.length) banner.append(elWith('span', 'muted small', facts.join(' · ')));
+  if (action.hint) banner.append(elWith('span', 'muted small', action.hint));
+  if (action.output) {
+    const details = elWith('details', 'failure-output');
+    details.append(elWith('summary', null, 'npm 输出'), elWith('pre', 'kernel-notes-body', action.output));
+    banner.append(details);
+  }
 }
 
 /** Render the whole market tab from the cached catalog + live shell state. */

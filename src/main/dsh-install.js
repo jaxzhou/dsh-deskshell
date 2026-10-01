@@ -8,12 +8,25 @@ const { spawn } = require('node:child_process');
 const os = require('node:os');
 
 const { DSH_PACKAGE } = require('./dsh-detect');
+const { npmErrorCode } = require('./kernel');
 const { createInstallProgress } = require('./progress');
 const { createLineSplitter, terminate } = require('./process-tree');
 const { IS_WINDOWS, shellCommandFor } = require('./shell-env');
 
-/** npm flags that give us a progress signal without drowning the log. */
-const NPM_FLAGS = ['--no-fund', '--no-audit', '--loglevel=http'];
+/**
+ * npm flags: a progress signal without drowning the log, plus bounded fetch
+ * retries. A mirror that answers 403 is retried by npm with long backoffs
+ * (default up to 60s each), which delays the official-registry fallback the
+ * caller performs — so the ceiling is lowered here.
+ */
+const NPM_FLAGS = [
+  '--no-fund',
+  '--no-audit',
+  '--loglevel=http',
+  '--fetch-retries=2',
+  '--fetch-retry-mintimeout=2000',
+  '--fetch-retry-maxtimeout=15000',
+];
 
 /**
  * Map a failed install's output to an actionable hint.
@@ -27,8 +40,15 @@ function diagnoseFailure(log) {
   if (/EBADENGINE|Unsupported engine|required.*node/i.test(log)) {
     return '当前 Node.js 版本不满足 dsh 的要求，请升级 Node.js 后重试。';
   }
+  if (/E403|403 Forbidden|E401|401 Unauthorized|ENEEDAUTH/i.test(log)) {
+    return [
+      `npm 拒绝了安装请求（403/401）：当前源可能没有该版本的权限。`,
+      '请检查 npm config get registry、npm config get @deepseek-ai:registry，',
+      '以及 ~/.npmrc 中的 _authToken 是否过期；企业网络还需确认代理设置。',
+    ].join('');
+  }
   if (/E404|404 Not Found|is not in this registry/i.test(log)) {
-    return `registry 中找不到 ${DSH_PACKAGE}。请检查 npm config get registry 是否指向可用的镜像源。`;
+    return `registry 中找不到 ${DSH_PACKAGE}。请检查 npm config get registry 是否指向可用的镜像源（镜像可能尚未同步该版本）。`;
   }
   if (/ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|ECONNREFUSED|network|socket hang up/i.test(log)) {
     return '网络异常：无法访问 npm registry。请检查网络、代理或镜像源设置后重试。';
@@ -126,6 +146,8 @@ function installDsh(options) {
       resolve({
         ok,
         code: code ?? null,
+        // npm's own error code (E403/E404/…) is what makes a failure actionable.
+        npmCode: ok || cancelled ? null : npmErrorCode(output),
         cancelled,
         hint: ok || cancelled ? null : diagnoseFailure(output),
         command: `${npmCommand} ${args.join(' ')}`,

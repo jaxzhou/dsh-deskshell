@@ -1389,3 +1389,24 @@ code {
 .market-banner-progress .bar {
   width: 140px;
 }
+
+/* A failed install banner wraps its diagnostics onto their own lines. */
+.market-banner.is-error {
+  flex-wrap: wrap;
+}
+
+.market-banner.is-error .failure-output,
+.market-banner.is-error .muted.small {
+  flex-basis: 100%;
+}
+
+.failure-output summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.failure-output .kernel-notes-body {
+  margin-top: 6px;
+  max-height: 180px;
+}

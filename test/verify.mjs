@@ -1179,6 +1179,170 @@ section('13. 插件安装流程（控制器，注入协作者）');
   await controller.dispose();
 }
 
+section('13b. 插件安装的源回退（403）');
+{
+  const { ShellController: Controller } = require('../src/main/controller.js');
+  const kernelModule = require('../src/main/kernel.js');
+  const mirror = 'https://registry.example-mirror.com';
+  const envs = [];
+  const steps = [];
+  const controller = new Controller({
+    profile: 'web',
+    startDelayMs: 0,
+    detect: async () => ({
+      node: { available: true, version: 'v24.21.0', command: '/usr/bin/node' },
+      npm: { available: true, version: '11.19.0', command: '/usr/bin/npm' },
+      pnpm: { available: true, version: '12.6.0', command: '/usr/bin/pnpm' },
+      dsh: { installed: true, version: '0.1.5-rc.3', command: '/usr/local/bin/dsh', error: null },
+    }),
+    ensurePnpm: async () => ({ ok: true, command: '/usr/bin/pnpm', installed: false, error: null }),
+    readRegistry: async () => mirror,
+    readInstalled: () => ({
+      profile: 'web',
+      dir: '/tmp/profiles/web',
+      home: '/tmp',
+      exists: true,
+      bundles: ['@jaxzhou/dsh-file-explorer'],
+      plugins: [{ package: '@jaxzhou/dsh-file-explorer', name: 'dsh-file-explorer', spec: '0.1.5', source: 'registry', version: '0.1.5', bundle: true }],
+      error: null,
+    }),
+    pluginCommand: (options) => {
+      envs.push(options.env?.npm_config_registry ?? null);
+      const first = envs.length === 1;
+      return {
+        promise: Promise.resolve(
+          first
+            ? {
+                ok: false,
+                code: 1,
+                output: `ERR_PNPM_FETCH_403  403 Forbidden - GET ${mirror}/@jaxzhou%2fdsh-file-explorer`,
+                error: 'dsh plugin 退出码 1',
+              }
+            : { ok: true, code: 0, output: 'added 1 package', error: null },
+        ),
+        cancel: () => {},
+      };
+    },
+  });
+  controller.start = async () => {
+    controller.server = { running: true, startedAt: Date.now(), stop: async () => ({ exited: true, forced: false }) };
+    controller.setPhase('running', 'DSH 已启动');
+    controller.broadcast();
+    return controller.getState();
+  };
+  controller.on('state', (snapshot) => {
+    const step = snapshot.pluginAction?.step;
+    if (step && steps.at(-1) !== step) steps.push(step);
+  });
+
+  await controller.check({ autostart: false });
+  const result = await controller.installPlugin({ packageName: '@jaxzhou/dsh-file-explorer', version: '0.1.5' });
+  check('插件安装遇到镜像 403 时改用官方源并成功', result.ok === true && envs.length === 2, `envs=${envs.length}`);
+  check(
+    '只有重试那次把 npm_config_registry 指向官方源',
+    envs[0] !== kernelModule.OFFICIAL_REGISTRY && envs[1] === kernelModule.OFFICIAL_REGISTRY,
+    envs.join(' | '),
+  );
+  check('过程里显示了换源步骤', steps.some((step) => /官方源重试/.test(step)), steps.join(' → '));
+  check('日志标注用的是哪个源', controller.getState().logs.some((line) => /npm 源：https:\/\/registry\.example-mirror\.com/.test(line.line)));
+
+  // Both refuse → the plugin action carries the code/registry/hint for the UI.
+  controller.runPluginCommand = () => ({
+    promise: Promise.resolve({
+      ok: false,
+      code: 1,
+      output: `ERR_PNPM_FETCH_403  403 Forbidden - GET ${mirror}/@jaxzhou%2fdsh-mathmatic-symbol`,
+      error: 'dsh plugin 退出码 1',
+    }),
+    cancel: () => {},
+  });
+  const failed = await controller.installPlugin({ packageName: '@jaxzhou/dsh-mathmatic-symbol', version: '0.1.2' });
+  const action = controller.getState().pluginAction;
+  check('两次都被拒绝时插件失败信息带错误码与源', failed.ok === false && action.npmCode === 'E403' && action.registry === mirror, `${action.npmCode} / ${action.registry}`);
+  check('插件失败提示可执行排查', /_authToken|scope|proxy/.test(action.hint ?? ''), action.hint ?? '');
+  await controller.dispose();
+}
+
+section('13c. 初始安装的源回退（403）');
+{
+  const { ShellController: Controller } = require('../src/main/controller.js');
+  const kernelModule = require('../src/main/kernel.js');
+  const mirror = 'https://registry.example-mirror.com';
+  const envs = [];
+  let installed = false;
+  const controller = new Controller({
+    startDelayMs: 0,
+    detect: async () => ({
+      node: { available: true, version: 'v24.21.0', command: '/usr/bin/node' },
+      npm: { available: true, version: '11.19.0', command: '/usr/bin/npm' },
+      pnpm: { available: true, version: '12.6.0', command: '/usr/bin/pnpm' },
+      dsh: { installed, version: installed ? '0.1.7-rc.2' : null, command: installed ? '/usr/local/bin/dsh' : null, error: null },
+    }),
+    install: (request) => {
+      envs.push(request.env?.npm_config_registry ?? null);
+      const first = envs.length === 1;
+      if (!first) installed = true;
+      return {
+        promise: Promise.resolve(
+          first
+            ? {
+                ok: false,
+                code: 1,
+                output: `npm error code E403\nnpm error 403 Forbidden - GET ${mirror}/@deepseek-ai%2fdsh - Forbidden`,
+                hint: null,
+              }
+            : { ok: true, code: 0, output: '' },
+        ),
+        cancel: () => {},
+      };
+    },
+    readRegistry: async () => mirror,
+  });
+  controller.start = async () => {
+    controller.server = { running: true, startedAt: Date.now(), stop: async () => ({ exited: true, forced: false }) };
+    controller.setPhase('running', 'DSH 已启动');
+    controller.broadcast();
+    return controller.getState();
+  };
+
+  await controller.check({ autostart: false });
+  await controller.install();
+  const state = controller.getState();
+  check('初始安装遇到镜像 403 时改用官方源并成功', envs.length === 2 && state.phase === 'running', `envs=${envs.length} phase=${state.phase}`);
+  check('重试那次才指向官方源', envs[0] !== kernelModule.OFFICIAL_REGISTRY && envs[1] === kernelModule.OFFICIAL_REGISTRY, envs.join(' | '));
+  check('日志记录 npm 源与回退结果', state.logs.some((line) => /npm 源：https:\/\/registry\.example-mirror\.com/.test(line.line)) && state.logs.some((line) => /官方源安装成功/.test(line.line)));
+
+  // Both refuse: the error panel must name the code and list what to check.
+  const failing = new Controller({
+    startDelayMs: 0,
+    detect: async () => ({
+      node: { available: true, version: 'v24.21.0', command: '/usr/bin/node' },
+      npm: { available: true, version: '11.19.0', command: '/usr/bin/npm' },
+      pnpm: { available: true },
+      dsh: { installed: false, version: null, command: null, error: null },
+    }),
+    install: () => ({
+      promise: Promise.resolve({
+        ok: false,
+        code: 1,
+        output: `npm error code E403\nnpm error 403 Forbidden - GET ${mirror}/@deepseek-ai%2fdsh - Forbidden`,
+        hint: null,
+      }),
+      cancel: () => {},
+    }),
+    readRegistry: async () => mirror,
+  });
+  await failing.check({ autostart: false });
+  await failing.install();
+  const failedState = failing.getState();
+  check('两次都 403 时进入错误阶段', failedState.phase === 'error', failedState.phase);
+  check(
+    '错误信息带错误码且提示可执行排查',
+    /E403/.test(failedState.error?.message ?? '') && /npm config get registry/.test(failedState.error?.hint ?? ''),
+    `${failedState.error?.message} — ${failedState.error?.hint}`,
+  );
+}
+
 section('14. dsh 实际位置与 pnpm 依赖');
 {
   // --- harness home resolution mirrors dsh's own rules --------------------
@@ -2109,6 +2273,53 @@ section('19. dsh 内核版本目录 (kernel)');
   }
   check('注入式版本号被拒绝', argsThrew === true);
 
+  // --- 安装失败的源诊断（403/404/授权/网络） ---
+  const forbidden = [
+    'npm error code E403',
+    'npm error 403 Forbidden - GET https://registry.example-mirror.com/@deepseek-ai%2fdsh - Forbidden',
+    'npm error A complete log of this run can be found in: C:\\Users\\me\\AppData\\Local\\npm-cache\\_logs\\x.log',
+  ].join('\n');
+  check('识别 npm 403 错误码', kernel.npmErrorCode(forbidden) === 'E403', String(kernel.npmErrorCode(forbidden)));
+  check('从输出里取出出错的源', kernel.registryFromOutput(forbidden) === 'https://registry.example-mirror.com/@deepseek-ai%2fdsh', String(kernel.registryFromOutput(forbidden)));
+  const mirror403 = kernel.diagnoseKernelInstall({ output: forbidden, registry: 'https://registry.example-mirror.com', version: '0.2.0-rc.2' });
+  check(
+    '镜像 403 → 建议改用官方源重试，并说明可能原因',
+    mirror403.retryWithOfficial === true && /registry\.example-mirror\.com/.test(mirror403.hint) && /_authToken|镜像/.test(mirror403.hint),
+    mirror403.hint,
+  );
+  const official403 = kernel.diagnoseKernelInstall({ output: forbidden, registry: 'https://registry.npmjs.org/', version: '0.2.0-rc.2' });
+  check(
+    '官方源也 403 → 不再重试，给出可执行的检查清单',
+    official403.retryWithOfficial === false && /npm config get registry/.test(official403.hint) && /proxy/.test(official403.hint),
+    official403.hint,
+  );
+  check('识别 404（镜像未同步）', kernel.npmErrorCode('npm error code E404\nnpm error 404 Not Found') === 'E404');
+  check(
+    '镜像 ETARGET 也走官方源重试',
+    kernel.diagnoseKernelInstall({ output: 'npm error code ETARGET\nnpm error No matching version found for @deepseek-ai/dsh@0.2.0-rc.2', registry: 'https://registry.npmmirror.com' }).retryWithOfficial === true,
+  );
+  check(
+    '权限问题不会被误判为源问题',
+    kernel.diagnoseKernelInstall({ output: 'npm error code EPERM\nnpm error EPERM: operation not permitted', registry: 'https://registry.npmmirror.com' }).retryWithOfficial === false,
+  );
+  const netOut = 'npm error code ENOTFOUND\nnpm error request to https://registry.npmjs.org/@deepseek-ai%2fdsh failed, reason: getaddrinfo ENOTFOUND';
+  check('保留 npm 原始错误码（便于排查）', kernel.npmErrorCode(netOut) === 'ENOTFOUND', String(kernel.npmErrorCode(netOut)));
+  const netDiagnosis = kernel.diagnoseKernelInstall({ output: netOut, registry: 'https://registry.npmjs.org/' });
+  check(
+    '网络错误单独分类且不触发换源重试',
+    /网络/.test(netDiagnosis.hint ?? '') && netDiagnosis.retryWithOfficial === false,
+    netDiagnosis.hint,
+  );
+  check('官方源判断（含尾斜杠）', kernel.isOfficialRegistry('https://registry.npmjs.org/') === true && kernel.isOfficialRegistry('https://registry.npmjs.org') === true && kernel.isOfficialRegistry('https://registry.npmmirror.com') === false);
+  check(
+    'withRegistry 只覆盖 registry，其它环境保持',
+    (() => {
+      const next = kernel.withRegistry({ PATH: '/usr/bin', npm_config_cache: '/tmp/c' }, kernel.OFFICIAL_REGISTRY);
+      return next.npm_config_registry === kernel.OFFICIAL_REGISTRY && next.PATH === '/usr/bin' && next.npm_config_cache === '/tmp/c';
+    })(),
+  );
+  check('OFFICIAL_REGISTRY 指向 npm 官方', kernel.OFFICIAL_REGISTRY === 'https://registry.npmjs.org/');
+
   // --- 抓取：npm 必需，git 可选 ---
   const okFetch = async (url) => (url.includes('registry') ? JSON.stringify(registry) : JSON.stringify(releases));
   const live = await kernel.fetchKernelCatalog({ fetchText: okFetch });
@@ -2171,6 +2382,7 @@ section('20. 内核更新流程 (controller，注入协作者)');
         calls.fetch += 1;
         return { ok: true, catalog: fixtureCatalog, errors: [], fetchedAt: Date.now() };
       },
+      readRegistry: async () => options.registry ?? 'https://registry.example-mirror.com',
       startDelayMs: 0,
     });
     // Never actually spawn a dsh server, but let the *real* stopServer run: it
@@ -2281,6 +2493,116 @@ section('20. 内核更新流程 (controller，注入协作者)');
   await fresh.controller.loadKernel();
   const freshResult = await fresh.controller.installKernel({ version: '0.1.7-rc.2' });
   check('未安装 dsh 时可按指定版本安装', fresh.calls.installs.join() === '0.1.7-rc.2', fresh.calls.installs.join() || String(freshResult.error));
+
+  // A mirror that answers 403 (not synced / private scope / expired token):
+  // the retry against the official registry must happen, with the env pinned.
+  {
+    const calls = { installs: [], envs: [] };
+    const mirror = 'https://registry.example-mirror.com';
+    const c = new ShellController({
+      detect: async () => ({
+        node: { available: true, version: 'v24.21.0', command: '/usr/bin/node' },
+        npm: { available: true, version: '11.19.0', command: '/usr/bin/npm' },
+        pnpm: { available: true, version: '12.6.0', command: '/usr/bin/pnpm' },
+        dsh: { installed: true, version: '0.1.5-rc.3', command: '/usr/local/bin/dsh', error: null },
+      }),
+      install: (request) => {
+        calls.installs.push(request.version ?? null);
+        calls.envs.push(request.env?.npm_config_registry ?? null);
+        const first = calls.installs.length === 1;
+        return {
+          promise: Promise.resolve(
+            first
+              ? {
+                  ok: false,
+                  code: 1,
+                  npmCode: 'E403',
+                  output: `npm error code E403\nnpm error 403 Forbidden - GET ${mirror}/@deepseek-ai%2fdsh - Forbidden`,
+                  hint: null,
+                }
+              : { ok: true, code: 0, output: '' },
+          ),
+          cancel: () => {},
+        };
+      },
+      provisionRuntime: async () => null,
+      fetchKernel: async () => ({ ok: true, catalog: fixtureCatalog, errors: [], fetchedAt: Date.now() }),
+      readRegistry: async () => mirror,
+      startDelayMs: 0,
+    });
+    c.start = async () => {
+      c.server = { running: true, startedAt: Date.now(), stop: async () => ({ exited: true, forced: false }) };
+      c.setPhase('running', 'DSH 已启动');
+      c.broadcast();
+      return c.getState();
+    };
+    await c.check({ autostart: false });
+    await c.loadKernel();
+    await c.start();
+    const outcome = await c.installKernel({ version: '0.1.7-rc.2' });
+    check('镜像 403 时自动改用官方源并成功', outcome.ok === true && calls.installs.length === 2, `installs=${calls.installs.length}`);
+    // npm exports its own config to lifecycle scripts, so the first attempt
+    // legitimately inherits whatever registry the machine is configured with;
+    // what matters is that only the retry is forced onto the official one.
+    check(
+      '第一次用机器上的源，重试才换成官方源',
+      calls.envs[0] !== 'https://registry.npmjs.org/' && calls.envs[1] === 'https://registry.npmjs.org/',
+      calls.envs.join(' | '),
+    );
+    const st = c.getState();
+    check('状态里记录实际使用的 npm 源', st.kernelAction?.registry === mirror, String(st.kernelAction?.registry));
+    check('日志说明用的是哪个源', st.logs.some((line) => /npm 源：https:\/\/registry\.example-mirror\.com/.test(line.line)), '');
+    check('日志标注官方源成功', st.logs.some((line) => /官方源安装成功/.test(line.line)), '');
+    await c.dispose();
+  }
+
+  // Both registries refuse: the failure must name the code, the registry and the
+  // checks to perform — not a generic "see the logs".
+  {
+    const mirror = 'https://registry.example-mirror.com';
+    const c = new ShellController({
+      detect: async () => ({
+        node: { available: true, version: 'v24.21.0', command: '/usr/bin/node' },
+        npm: { available: true, version: '11.19.0', command: '/usr/bin/npm' },
+        pnpm: { available: true, version: '12.6.0', command: '/usr/bin/pnpm' },
+        dsh: { installed: true, version: '0.1.5-rc.3', command: '/usr/local/bin/dsh', error: null },
+      }),
+      install: () => ({
+        promise: Promise.resolve({
+          ok: false,
+          code: 1,
+          npmCode: 'E403',
+          output: `npm error code E403\nnpm error 403 Forbidden - GET ${mirror}/@deepseek-ai%2fdsh - Forbidden`,
+          hint: null,
+        }),
+        cancel: () => {},
+      }),
+      provisionRuntime: async () => null,
+      fetchKernel: async () => ({ ok: true, catalog: fixtureCatalog, errors: [], fetchedAt: Date.now() }),
+      readRegistry: async () => mirror,
+      startDelayMs: 0,
+    });
+    c.start = async () => {
+      c.server = { running: true, startedAt: Date.now(), stop: async () => ({ exited: true, forced: false }) };
+      c.setPhase('running', 'DSH 已启动');
+      c.broadcast();
+      return c.getState();
+    };
+    await c.check({ autostart: false });
+    await c.loadKernel();
+    await c.start();
+    const failed = await c.installKernel({ version: '0.1.7-rc.2' });
+    const action = c.getState().kernelAction;
+    check('两次都被拒绝时如实失败', failed.ok === false && action.ok === false, failed.error ?? '');
+    check('失败里带 npm 错误码与源', action.npmCode === 'E403' && action.registry === mirror, `${action.npmCode} / ${action.registry}`);
+    check(
+      '提示给出可执行的排查清单',
+      /npm config get registry/.test(action.hint ?? '') && /_authToken/.test(action.hint ?? '') && /proxy/.test(action.hint ?? ''),
+      action.hint ?? '',
+    );
+    check('保留 npm 关键输出行', /E403/.test(action.output ?? '') && /Forbidden/.test(action.output ?? ''), String(action.output).split('\n')[0]);
+    await c.dispose();
+  }
 
   // Windows-style lock conflict on the core install: retry once, then succeed.
   {

@@ -41,7 +41,15 @@ const {
 } = require('./plugin-market');
 const { applyOfflineEnv } = require('./offline');
 const { delay } = require('./process-tree');
-const { fetchKernelCatalog, isKernelVersion, kernelRows } = require('./kernel');
+const {
+  OFFICIAL_REGISTRY,
+  diagnoseKernelInstall,
+  fetchKernelCatalog,
+  isKernelVersion,
+  kernelRows,
+  readNpmRegistry,
+  withRegistry,
+} = require('./kernel');
 const { resolveShellEnv } = require('./shell-env');
 
 /**
@@ -102,6 +110,8 @@ class ShellController extends EventEmitter {
      * the kernel flow runs against fixtures without touching the network.
      */
     this.runFetchKernel = options.fetchKernel ?? fetchKernelCatalog;
+    /** Reads the registry the machine's npm actually uses (diagnostics/fallback). */
+    this.runReadRegistry = options.readRegistry ?? readNpmRegistry;
     /** @type {object|null} merged catalog of published dsh versions. */
     this.kernelCatalog = null;
     this.kernelFetchedAt = null;
@@ -581,11 +591,30 @@ class ShellController extends EventEmitter {
       }
     }
 
+    // The catalog is fetched from the official registry, but the install runs
+    // through *this machine's* npm config (mirror / proxy / scope mapping). Log
+    // which one that is: a mirror that has not synced the release answers 403,
+    // and that is otherwise invisible in the UI.
+    let registry = null;
+    try {
+      registry = await this.runReadRegistry({ npmCommand: detection.npm.command, env: this.env });
+    } catch {
+      registry = null;
+    }
+    if (registry) {
+      this.pushLog({ stream: 'system', line: `npm 源：${registry}` });
+      if (this.kernelAction) this.kernelAction = { ...this.kernelAction, registry };
+      if (!this.kernelAction?.registry) this.broadcast();
+    } else {
+      this.pushLog({ stream: 'system', line: '未能读取 npm 源（npm config get registry 无输出），按环境默认源安装' });
+    }
+
     /** One npm run; the caller decides whether to retry. */
-    const runOnce = async () => {
+    const runOnce = async (env, label) => {
+      if (label) this.pushLog({ stream: 'system', line: `使用 npm 源重试：${label}` });
       const handle = this.runInstall({
         npmCommand: detection.npm.command,
-        env: this.env,
+        env,
         cwd: this.cwd,
         version,
         onLog: (entry) => this.pushLog(entry),
@@ -607,7 +636,7 @@ class ShellController extends EventEmitter {
       }
     };
 
-    let result = await runOnce();
+    let result = await runOnce(this.env);
     // A just-exited process (or an antivirus scan) can hold the freshly written
     // files for a moment: one retry turns that into a success instead of a
     // half-updated install.
@@ -619,7 +648,29 @@ class ShellController extends EventEmitter {
       });
       this.broadcast();
       await delay(2000);
-      result = await runOnce();
+      result = await runOnce(this.env);
+    }
+    // Mirror / private-registry / expired-token failures surface as 403 (or 404
+    // for a version the mirror has not synced). The catalog came from the
+    // official registry, so retry there once — this is what makes the update
+    // work on a machine whose npm points at a lagging mirror.
+    let diagnosis = diagnoseKernelInstall({ output: result.output ?? result.error, registry, version });
+    if (!result.ok && diagnosis.retryWithOfficial) {
+      this.kernelAction = { ...this.kernelAction, step: `当前源返回 ${diagnosis.code}，改用官方源重试`, percent: 0 };
+      this.broadcast();
+      this.pushLog({ stream: 'system', line: diagnosis.hint ?? '改用官方 npm 源重试一次…' });
+      result = await runOnce(withRegistry(this.env, OFFICIAL_REGISTRY), OFFICIAL_REGISTRY);
+      diagnosis = diagnoseKernelInstall({
+        output: result.output ?? result.error,
+        registry: OFFICIAL_REGISTRY,
+        version,
+      });
+      if (result.ok) {
+        this.pushLog({
+          stream: 'system',
+          line: `官方源安装成功（原 npm 源 ${registry ?? '未知'} 无法提供该版本）——建议执行 npm config set registry https://registry.npmjs.org/ 或等待镜像同步`,
+        });
+      }
     }
     this.installSnapshot = {
       ...(this.installSnapshot ?? { percent: 0, phase: '安装完成', detail: '' }),
@@ -651,6 +702,8 @@ class ShellController extends EventEmitter {
         cancelled: true,
         error: '已取消',
         hint: null,
+        registry,
+        npmCode: null,
         percent: this.installSnapshot.percent ?? 0,
         startedAt: started,
         finishedAt: Date.now(),
@@ -664,10 +717,18 @@ class ShellController extends EventEmitter {
     if (!result.ok) {
       const output = String(result.output ?? '');
       const permission = /EACCES|EPERM|permission denied/i.test(output);
-      const message = `dsh 内核更新失败（npm 退出码 ${result.code ?? '未知'}）`;
+      const code = diagnosis.code ?? null;
+      const message = `dsh 内核更新失败（npm 退出码 ${result.code ?? '未知'}${code ? ` · ${code}` : ''}）`;
       const hint = permission
         ? 'npm 的全局目录不可写。可改为让外壳自动配置运行时（“DSH 运行信息”里的自动配置），或以管理员权限手动执行安装命令。'
-        : result.hint ?? '请查看日志中的 npm 输出了解详情。';
+        : diagnosis.hint ?? result.hint ?? '请查看日志中的 npm 输出了解详情。';
+      // The interesting lines for a 403 are the code and the URL, which are not
+      // necessarily the last ones npm prints.
+      const interesting = output
+        .split('\n')
+        .filter((line) => /npm (?:error|ERR!)/i.test(line) && /E403|E404|E401|ETARGET|Forbidden|Not Found|registry|_authToken|EBADENGINE|EPERM/i.test(line))
+        .slice(0, 4)
+        .join('\n');
       this.kernelAction = {
         running: false,
         version,
@@ -676,7 +737,9 @@ class ShellController extends EventEmitter {
         ok: false,
         error: message,
         hint,
-        output: output.trim().split('\n').slice(-4).join('\n'),
+        npmCode: code,
+        registry,
+        output: (interesting || output.trim().split('\n').slice(-4).join('\n')).slice(0, 1200),
         percent: this.installSnapshot.percent ?? 0,
         startedAt: started,
         finishedAt: Date.now(),
@@ -711,6 +774,9 @@ class ShellController extends EventEmitter {
       error: null,
       hint: moved ? `dsh 现在位于 ${after.command}（之前是 ${runtime.command}）` : null,
       movedCommand: moved,
+      // Which registry the successful install actually used (mirror or fallback).
+      registry,
+      npmCode: null,
       percent: 100,
       startedAt: started,
       finishedAt: Date.now(),
@@ -1052,12 +1118,26 @@ class ShellController extends EventEmitter {
     const spec = version ? `${packageName}@${version}` : packageName;
     setStep(removing ? `正在卸载 ${packageName}` : `正在安装 ${spec}`);
 
+    // Which registry is in play is the first thing to know when an install
+    // fails with 403/404: plugins come from npm too.
+    let registry = null;
+    try {
+      registry = await this.runReadRegistry({
+        npmCommand: this.detection.npm?.command ?? null,
+        env: this.env ?? process.env,
+      });
+    } catch {
+      registry = null;
+    }
+    if (registry) this.pushLog({ stream: 'system', line: `npm 源：${registry}` });
+
     /** One plugin command run; returns the raw result. */
-    const runOnce = async () => {
+    const runOnce = async (env, label) => {
+      if (label) this.pushLog({ stream: 'system', line: `使用 npm 源重试：${label}` });
       const handle = this.runPluginCommand({
         dshCommand: this.detection.dsh.command,
         args,
-        env: this.env ?? process.env,
+        env,
         cwd: this.cwd,
         onLog,
       });
@@ -1071,7 +1151,8 @@ class ShellController extends EventEmitter {
       }
     };
 
-    let result = await runOnce();
+    const pluginEnv = this.env ?? process.env;
+    let result = await runOnce(pluginEnv);
     // A file lock can outlive the process for a moment (Windows, or an
     // antivirus scanner holding the freshly written files): one retry.
     if (!result.ok && isFileLockError(result.output ?? result.error)) {
@@ -1081,7 +1162,33 @@ class ShellController extends EventEmitter {
         line: 'pnpm 报告文件被占用（EBUSY/EPERM），等待 1.5 秒后重试一次…',
       });
       await delay(1500);
-      result = await runOnce();
+      result = await runOnce(pluginEnv);
+    }
+    // A mirror that has not synced the plugin, a private scope mapping or an
+    // expired token all answer 403/404 — retry once against the official
+    // registry (pnpm honours npm_config_registry, so no CLI flags are needed).
+    let pluginDiagnosis = diagnoseKernelInstall({
+      output: result.output ?? result.error,
+      registry,
+      version,
+      packageName,
+    });
+    if (!result.ok && pluginDiagnosis.retryWithOfficial) {
+      setStep(`当前源返回 ${pluginDiagnosis.code}，改用官方源重试`);
+      this.pushLog({ stream: 'system', line: pluginDiagnosis.hint ?? '改用官方 npm 源重试一次…' });
+      result = await runOnce(withRegistry(pluginEnv, OFFICIAL_REGISTRY), OFFICIAL_REGISTRY);
+      pluginDiagnosis = diagnoseKernelInstall({
+        output: result.output ?? result.error,
+        registry: OFFICIAL_REGISTRY,
+        version,
+        packageName,
+      });
+      if (result.ok) {
+        this.pushLog({
+          stream: 'system',
+          line: `官方源安装插件成功（原 npm 源 ${registry ?? '未知'} 无法提供该包）`,
+        });
+      }
     }
 
     if (!result.ok) {
@@ -1091,6 +1198,7 @@ class ShellController extends EventEmitter {
         kind,
         [result.error, tail].filter(Boolean).join(' — ') || (removing ? '卸载失败' : '安装失败'),
         started,
+        { npmCode: pluginDiagnosis.code ?? null, registry, hint: pluginDiagnosis.hint ?? null },
       );
       if (wasRunning) {
         this.pushLog({ stream: 'system', line: '插件操作失败，重新启动原来那套 dsh…' });
@@ -1141,9 +1249,10 @@ class ShellController extends EventEmitter {
   }
 
   /** @private Record a plugin failure and surface it to the UI. */
-  #failPlugin(kind, message, started) {
+  #failPlugin(kind, message, started, extra = {}) {
     this.pluginAction = {
       ...(this.pluginAction ?? { packages: '', profile: this.profile }),
+      ...extra,
       running: false,
       kind, 
       step: '失败',
@@ -1351,20 +1460,52 @@ class ShellController extends EventEmitter {
     this.setPhase('installing', `正在安装 ${DSH_PACKAGE}…`);
     this.broadcast();
 
-    const handle = this.runInstall({
-      npmCommand: detection.npm.command,
-      env: this.env,
-      cwd: this.cwd,
-      onLog: (entry) => this.pushLog(entry),
-      onProgress: (snapshot) => {
-        this.installSnapshot = snapshot;
-        this.scheduleBroadcast();
-      },
-    });
-    this.installHandle = handle;
+    // The same mirror/token problem that breaks a core update breaks the first
+    // install: know which registry is in use, and fall back to the official one
+    // when it answers 403/404 for a package that is published there.
+    let registry = null;
+    try {
+      registry = await this.runReadRegistry({ npmCommand: detection.npm.command, env: this.env });
+    } catch {
+      registry = null;
+    }
+    if (registry) this.pushLog({ stream: 'system', line: `npm 源：${registry}` });
 
-    const result = await handle.promise;
-    this.installHandle = null;
+    /** One npm run; the caller decides whether to retry. */
+    const runOnce = async (env) => {
+      const handle = this.runInstall({
+        npmCommand: detection.npm.command,
+        env,
+        cwd: this.cwd,
+        onLog: (entry) => this.pushLog(entry),
+        onProgress: (snapshot) => {
+          this.installSnapshot = snapshot;
+          this.scheduleBroadcast();
+        },
+      });
+      this.installHandle = handle;
+      try {
+        return await handle.promise;
+      } finally {
+        this.installHandle = null;
+      }
+    };
+
+    let result = await runOnce(this.env);
+    let diagnosis = diagnoseKernelInstall({ output: result.output ?? result.error, registry });
+    if (!result.ok && diagnosis.retryWithOfficial) {
+      this.installSnapshot = { ...(this.installSnapshot ?? {}), phase: `当前源返回 ${diagnosis.code}，改用官方源重试`, percent: 0 };
+      this.pushLog({ stream: 'system', line: diagnosis.hint ?? '改用官方 npm 源重试一次…' });
+      this.broadcast();
+      result = await runOnce(withRegistry(this.env, OFFICIAL_REGISTRY));
+      diagnosis = diagnoseKernelInstall({ output: result.output ?? result.error, registry: OFFICIAL_REGISTRY });
+      if (result.ok) {
+        this.pushLog({
+          stream: 'system',
+          line: `官方源安装成功（原 npm 源 ${registry ?? '未知'} 无法提供该包）——建议检查 npm config get registry`,
+        });
+      }
+    }
     this.installSnapshot = {
       ...(this.installSnapshot ?? { percent: 0, phase: '安装完成', detail: '' }),
       ...(result.ok
@@ -1384,8 +1525,8 @@ class ShellController extends EventEmitter {
 
     if (!result.ok) {
       this.error = {
-        message: `dsh 安装失败（npm 退出码 ${result.code ?? '未知'}）`,
-        hint: result.hint ?? '请查看安装日志了解详情。',
+        message: `dsh 安装失败（npm 退出码 ${result.code ?? '未知'}${diagnosis.code ? ` · ${diagnosis.code}` : ''}）`,
+        hint: diagnosis.hint ?? result.hint ?? '请查看安装日志了解详情。',
       };
       this.setPhase('error', '安装失败');
       this.broadcast();

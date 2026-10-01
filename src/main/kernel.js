@@ -384,8 +384,149 @@ async function fetchKernelCatalog(options = {}) {
   };
 }
 
+/** The canonical npm registry, used as the fallback when a mirror says 403/404. */
+const OFFICIAL_REGISTRY = 'https://registry.npmjs.org/';
+
+/** npm error codes that mean "the network could not reach the registry". */
+const NETWORK_CODES = new Set([
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ETIMEDOUT',
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'ENETWORK',
+]);
+
+/** `E403` / `E404` / `ETARGET` … straight out of npm's output. */
+function npmErrorCode(output) {
+  const text = String(output ?? '');
+  const explicit = text.match(/npm (?:error|ERR!|WARN) code (E[A-Z0-9_]+)/);
+  if (explicit) return explicit[1];
+  if (/403 Forbidden|E403/i.test(text)) return 'E403';
+  if (/401 Unauthorized|ENEEDAUTH|E401/i.test(text)) return 'E401';
+  if (/404 Not Found|E404|is not in this registry/i.test(text)) return 'E404';
+  if (/No matching version found|ETARGET/i.test(text)) return 'ETARGET';
+  if (/EACCES|EPERM|resource busy|being used by another process/i.test(text)) return 'EPERM';
+  if (/ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|ECONNREFUSED|socket hang up/i.test(text)) return 'ENETWORK';
+  return null;
+}
+
+/** The registry npm mentioned while failing (`403 Forbidden - GET <url>`). */
+function registryFromOutput(output) {
+  const text = String(output ?? '');
+  const viaGet = text.match(/GET\s+(https?:\/\/[^\s'"]+)/i);
+  if (viaGet) return viaGet[1];
+  const anyUrl = text.match(/https?:\/\/(?:registry\.[^\s'"/]+|npm\.[^\s'"/]+)/i);
+  return anyUrl ? anyUrl[0] : null;
+}
+
+/** True for the canonical registry (any trailing slash / path differences aside). */
+function isOfficialRegistry(url) {
+  const normalized = String(url ?? '').trim().replace(/\/+$/, '');
+  return /^https?:\/\/registry\.npmjs\.(org|com)$/i.test(normalized);
+}
+
+/**
+ * A copy of `env` that pins the npm registry for one command.
+ *
+ * Used to fall back to the official registry without teaching the shell how to
+ * pass flags through `dsh plugin`/npm — both npm and pnpm honour
+ * `npm_config_registry`.
+ */
+function withRegistry(env, registry) {
+  const next = { ...(env ?? {}) };
+  next.npm_config_registry = registry;
+  return next;
+}
+
+/** Read the registry the machine's npm would actually use (best effort). */
+async function readNpmRegistry(options = {}) {
+  const { npmCommand, env, runCapture } = options;
+  if (!npmCommand) return null;
+  const capture = runCapture ?? require('./shell-env').runCapture;
+  try {
+    const result = await capture(npmCommand, ['config', 'get', 'registry'], { env, timeoutMs: options.timeoutMs ?? 15_000 });
+    const value = String(result?.stdout ?? '').trim().split('\n')[0].trim();
+    return /^https?:\/\//.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Turn a failed dsh install into something the user can act on.
+ *
+ * The catalog always comes from the *official* registry, but the install runs
+ * through whatever registry the machine's npm is configured with — a mirror that
+ * has not synced the release, a private scope mapping, or an expired
+ * `_authToken` all show up as `403`. Those are worth one retry against the
+ * official registry, which is exactly what the caller does when this returns
+ * `retryWithOfficial`.
+ *
+ * @param {{output?: string, registry?: string|null, version?: string|null, packageName?: string}} options
+ * @returns {{code: string|null, registry: string|null, retryWithOfficial: boolean, hint: string|null}}
+ */
+function diagnoseKernelInstall(options = {}) {
+  const output = String(options.output ?? '');
+  const packageName = options.packageName ?? DSH_PACKAGE;
+  const spec = options.version ? `${packageName}@${options.version}` : packageName;
+  const code = npmErrorCode(output);
+  const registry = options.registry ?? registryFromOutput(output);
+  const official = isOfficialRegistry(registry);
+  const accessCodes = ['E403', 'E404', 'E401', 'ETARGET'];
+
+  if (code && accessCodes.includes(code) && registry && !official) {
+    return {
+      code,
+      registry,
+      retryWithOfficial: true,
+      hint: `当前 npm 源（${registry}）拒绝了 ${spec}（npm ${code}）：可能是镜像尚未同步该版本、私有源无权限，或 ~/.npmrc 里 @deepseek-ai 的 scope 映射/_authToken 过期。正在改用官方源重试…`,
+    };
+  }
+  if (code && accessCodes.includes(code)) {
+    return {
+      code,
+      registry,
+      retryWithOfficial: false,
+      hint:
+        `npm ${code}：${spec} 在 ${registry ?? '当前源'} 上不可用。` +
+        '请依次检查：npm config get registry、npm config get @deepseek-ai:registry、~/.npmrc 中的 _authToken 是否过期；' +
+        '若在公司网络内，还需确认 npm config get proxy / https-proxy 指向的代理允许访问 registry.npmjs.org。',
+    };
+  }
+  if (code === 'EPERM' || /resource busy|EBUSY/i.test(output)) {
+    return {
+      code: 'EPERM',
+      registry,
+      retryWithOfficial: false,
+      hint: 'npm 无法写入全局目录或文件被占用：请确认 dsh 已完全退出（可在插件市场/内核页重试），或以管理员权限手动执行安装命令。',
+    };
+  }
+  if (code && NETWORK_CODES.has(code)) {
+    return {
+      code,
+      registry,
+      retryWithOfficial: false,
+      hint: `网络异常：无法访问 ${registry ?? 'npm 源'}。请检查网络、代理或镜像设置后重试。`,
+    };
+  }
+  if (/EBADENGINE|Unsupported engine/i.test(output)) {
+    return {
+      code: 'EBADENGINE',
+      registry,
+      retryWithOfficial: false,
+      hint: '当前 Node.js 版本不满足 dsh 的要求，请升级 Node.js（或让外壳自动配置运行时）后重试。',
+    };
+  }
+  return { code, registry, retryWithOfficial: false, hint: null };
+}
+
 module.exports = {
   DSH_PACKAGE,
+  NETWORK_CODES,
+  OFFICIAL_REGISTRY,
   GIT_RELEASES_URL,
   GIT_REPO_URL,
   NPM_REGISTRY_URL,
@@ -396,6 +537,12 @@ module.exports = {
   TYPE_LABELS,
   buildKernelInstallArgs,
   classifyVersion,
+  diagnoseKernelInstall,
+  isOfficialRegistry,
+  npmErrorCode,
+  readNpmRegistry,
+  registryFromOutput,
+  withRegistry,
   fetchKernelCatalog,
   filterCatalog,
   isKernelVersion,

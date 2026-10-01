@@ -54,6 +54,29 @@
 > 构建在 Linux 容器内完成（`scripts/build-offline-linux.sh`）——macOS 上跨装依赖树会挑到 darwin 二进制，而 dsh 的依赖里有原生模块（node-pty）。
 > 两个可复跑的验证脚本：`scripts/verify-offline-linux.sh`（断网容器里验证 payload：版本可用、插件就位、`dsh web` 能起并服务 Web UI、客户端逻辑零下载）与 `scripts/verify-offline-app.sh`（把打包好的离线应用放进容器，在只保留 loopback 的命名空间里跑它自己的 `--self-test`）。
 
+### npm 403 / 源不匹配（内核更新、插件安装、首次安装）
+
+内核目录**始终取自官方 registry**（`registry.npmjs.org`），但安装走的是**这台机器 npm 配置的源**（`npm config get registry`、`@deepseek-ai:registry` scope 映射、`~/.npmrc` 的 `_authToken`、企业代理……）。两者不一致时典型症状就是：
+
+```
+npm error code E403
+npm error 403 Forbidden - GET https://<你的镜像>/@deepseek-ai%2fdsh - Forbidden
+```
+
+常见原因：镜像尚未同步该版本、私有源没有这个 scope 的权限、`_authToken` 过期、代理拦了 `registry.npmjs.org`。
+
+现在外壳会：
+
+1. **先把源写进日志**（`npm 源：https://…`）——以前失败时根本不知道用的是哪个源；
+2. **识别错误码**（`E403`/`E404`/`E401`/`ETARGET`/`EPERM`/网络类）并按类给出可执行提示；
+3. **自动改用官方源重试一次**：403/404/ETARGET 且当前源不是官方源时，用 `npm_config_registry=https://registry.npmjs.org/` 重跑一次（npm 与 pnpm 都认这个环境变量，因此不需要给 `dsh plugin` 传额外参数），成功后日志会写明"官方源安装成功（原 npm 源 X 无法提供该包）"，并建议把源改成官方或等镜像同步；
+4. **两条都失败时给出精确提示**：错误码 + 源 + `npm config get registry` / `npm config get @deepseek-ai:registry` / `_authToken` / `proxy` 的检查清单；
+5. **界面上直接显示**：失败横幅列出 `npm E403 · <源>`、提示与关键 npm 输出（可展开），不用再去日志面板翻；
+6. **官方源也压过用户 `~/.npmrc`**：`npm_config_registry` 的优先级高于用户配置（实测：`.npmrc` 指向 npmmirror 时，设该变量后 `npm config get registry` 变为官方源），所以这一步是真的绕开坏源；
+7. **失败更快**：npm 对 403 的重试退避默认最长 60 秒，现在把上限压到 15 秒（`--fetch-retries=2 --fetch-retry-maxtimeout=15000`），让回退更早发生。
+
+同样的处理也用在**插件安装**（`dsh plugin` → pnpm，pnpm 也认 `npm_config_registry`）和**首次安装 dsh** 上。
+
 ### Windows 上的进程与文件占用（插件 / 内核 / 重启）
 
 Windows 不允许替换或删除**正被进程打开**的文件：dsh 的原生模块（`node-pty` 的 `*.node`）、它自己的安装目录、profile 里的插件目录都是如此。因此"装插件"和"换内核"都不是纯文件操作，而是**进程操作**：
@@ -324,7 +347,7 @@ test/              验证脚本与 fixture（伪 npm、伪 dsh）
 
 ## 已验证内容
 
-`npm test`（397 项）覆盖：登录环境解析、检测、进度模型、`dsh web: <url>` 解析、安装成功/失败与提示、服务启停生命周期、状态机端到端（未安装 → 安装 → 启动 → 运行 → 重启 → 停止，使用 fixture 注入，不触碰真实 npm/dsh），**模拟 `win32` 的 Windows 代码路径**（`.cmd` 是否走 shell、含空格路径的引号处理、PATH 分号分隔、PATHEXT 解析、Windows 全局目录推断），**运行时自动配置**（发行版地址解析、LTS 选择、下载进度、真实 tar 解压、复用与取消、托管环境 prefix/cache 锁定、控制器"缺 Node → 自动配置 → 进入安装 dsh"流程与失败兜底），**插件市场**（新目录 schema：自身/社区分组、`name`/`package` 兼容、站点相对链接补全、社区 downloads/stars、semver 比较含预发布、包名/版本白名单、目录解析与非法条目丢弃、profile 已装插件读取与版本来源、目录与本地状态合并、pnpm 自举、安装参数构造、控制器"先停 dsh → dsh plugin → 再启动 dsh → 版本更新"与失败后恢复运行），**打印与 PDF 导出**（Cmd/Ctrl+P 判定、系统面板调用与回调、用户取消、页面不可用/抛错、PDF 落盘与取消保存、写入失败），**进程冲突防护**（`terminate()`：已退出短路、POSIX 礼貌结束并等待、超时升级 SIGKILL 且等到退出、杀不掉时如实上报 `exited:false`、Windows 走 `taskkill /T /F` 且**发完仍等 exit 事件**、`waitForExit` 语义；控制器顺序：内核更新 `start → stop → install → start`、插件 `stop → dsh plugin → start`、失败后重新启动原版本、锁冲突重试一次、插件/内核/重启/停止四向互斥、`dispose()` 等待安装子进程且卡住时限时返回；静态审计：controller/main/dsh-server/plugin-market **没有调用未定义的方法**，以及"内核更新必须走真实存在的 `stopServer`"这类回归护栏），**dsh 内核版本目录**（正式/RC/Alpha/其他预发布分类、非法版本与注入式版本号拒绝、git 标签 `dsh-v…` 解析、npm dist-tags 与发布时间解析、合并两个来源并标注「仅 git 未发布到 npm」、默认只列正式版+RC 且可展开预发布、推荐策略四态、行关系与推荐标记、安装参数白名单、npm 必需/git 可选的优雅降级、GitHub 限流错误），**内核更新流程**（加载目录与缓存复用、切换筛选不重复抓取、非法版本不触达 npm、更新成功后重启 dsh 且状态里的版本刷新、失败时给出权限提示并恢复旧版本运行、取消、离线自包含版锁定且不调用 npm、未安装 dsh 时按指定版本首次安装），**外壳自更新**（清单解析与非法输入拒绝、按平台/架构/离线变体选择包、版本比较含预发布、各平台替换方案与不可写目录转人工、辅助脚本等待进程退出、SHA-256 校验通过/不符/文件缺失、**本地 HTTP 端到端"检查 → 下载 → 校验 → 计划"**、已是最新、下载 404、未下载拒绝应用、并发检查只请求一次、定期检查与 dispose 后停止、断网优雅失败），以及**dsh 实际位置与 pnpm 依赖**（按环境解析 home：posix `HOME` / Windows `USERPROFILE`/`HOMEDRIVE+HOMEPATH`/`DSH_HOME` 含 `~` 展开、profile 缺失时列出实际存在的 profile、pnpm 纳入检测、启动时自动安装 pnpm 且失败不阻塞、私有安装识别、市场读数与安装使用同一 home）。
+`npm test`（429 项）覆盖：登录环境解析、检测、进度模型、`dsh web: <url>` 解析、安装成功/失败与提示、服务启停生命周期、状态机端到端（未安装 → 安装 → 启动 → 运行 → 重启 → 停止，使用 fixture 注入，不触碰真实 npm/dsh），**模拟 `win32` 的 Windows 代码路径**（`.cmd` 是否走 shell、含空格路径的引号处理、PATH 分号分隔、PATHEXT 解析、Windows 全局目录推断），**运行时自动配置**（发行版地址解析、LTS 选择、下载进度、真实 tar 解压、复用与取消、托管环境 prefix/cache 锁定、控制器"缺 Node → 自动配置 → 进入安装 dsh"流程与失败兜底），**插件市场**（新目录 schema：自身/社区分组、`name`/`package` 兼容、站点相对链接补全、社区 downloads/stars、semver 比较含预发布、包名/版本白名单、目录解析与非法条目丢弃、profile 已装插件读取与版本来源、目录与本地状态合并、pnpm 自举、安装参数构造、控制器"先停 dsh → dsh plugin → 再启动 dsh → 版本更新"与失败后恢复运行），**打印与 PDF 导出**（Cmd/Ctrl+P 判定、系统面板调用与回调、用户取消、页面不可用/抛错、PDF 落盘与取消保存、写入失败），**源/权限失败的处理**（npm 错误码识别 `E403`/`E404`/`E401`/`ETARGET`/`EPERM`/网络类、从 `403 Forbidden - GET <url>` 里取出出错的源、镜像 403 判定为"值得换官方源重试"、官方源也失败时给出检查清单且不再重试、权限与网络错误不被误判、`withRegistry` 只改 registry 不影响其它环境变量、`isOfficialRegistry` 归一化；控制器：内核/插件/首次安装三条路径都"先记源 → 镜像 403 → 只对重试那次设官方源 → 成功并写明原因"、两次都被拒时 `kernelAction`/`pluginAction`/错误面板带 `npmCode`+`registry`+提示+关键输出行），**进程冲突防护**（`terminate()`：已退出短路、POSIX 礼貌结束并等待、超时升级 SIGKILL 且等到退出、杀不掉时如实上报 `exited:false`、Windows 走 `taskkill /T /F` 且**发完仍等 exit 事件**、`waitForExit` 语义；控制器顺序：内核更新 `start → stop → install → start`、插件 `stop → dsh plugin → start`、失败后重新启动原版本、锁冲突重试一次、插件/内核/重启/停止四向互斥、`dispose()` 等待安装子进程且卡住时限时返回；静态审计：controller/main/dsh-server/plugin-market **没有调用未定义的方法**，以及"内核更新必须走真实存在的 `stopServer`"这类回归护栏），**dsh 内核版本目录**（正式/RC/Alpha/其他预发布分类、非法版本与注入式版本号拒绝、git 标签 `dsh-v…` 解析、npm dist-tags 与发布时间解析、合并两个来源并标注「仅 git 未发布到 npm」、默认只列正式版+RC 且可展开预发布、推荐策略四态、行关系与推荐标记、安装参数白名单、npm 必需/git 可选的优雅降级、GitHub 限流错误），**内核更新流程**（加载目录与缓存复用、切换筛选不重复抓取、非法版本不触达 npm、更新成功后重启 dsh 且状态里的版本刷新、失败时给出权限提示并恢复旧版本运行、取消、离线自包含版锁定且不调用 npm、未安装 dsh 时按指定版本首次安装），**外壳自更新**（清单解析与非法输入拒绝、按平台/架构/离线变体选择包、版本比较含预发布、各平台替换方案与不可写目录转人工、辅助脚本等待进程退出、SHA-256 校验通过/不符/文件缺失、**本地 HTTP 端到端"检查 → 下载 → 校验 → 计划"**、已是最新、下载 404、未下载拒绝应用、并发检查只请求一次、定期检查与 dispose 后停止、断网优雅失败），以及**dsh 实际位置与 pnpm 依赖**（按环境解析 home：posix `HOME` / Windows `USERPROFILE`/`HOMEDRIVE+HOMEPATH`/`DSH_HOME` 含 `~` 展开、profile 缺失时列出实际存在的 profile、pnpm 纳入检测、启动时自动安装 pnpm 且失败不阻塞、私有安装识别、市场读数与安装使用同一 home）。
 
 `npm run test:network`（35 项）在真实网络上验证：下载 Node.js LTS（约 52 MB）→ 解压校验 → `npm prefix -g` 落在托管目录 → 真实执行 `npm install -g @deepseek-ai/dsh` 并运行托管目录内的 dsh；校验线上插件目录与**自更新发布清单**（可解析、覆盖 win/mac/linux 与离线变体、每个包的直链 HEAD 大小与清单一致、不可达时优雅报错），并校验 **dsh 内核目录**（npm+git 两来源、dist-tags 合法、latest 可安装、git 发布说明可截取中文、安装命令指向官方包，以及与本机真实 dsh 版本交叉验证）。
 
